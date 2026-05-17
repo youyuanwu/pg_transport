@@ -1,15 +1,15 @@
 # `pg_transport` — Deferred Transports
 
 > Status: **deferred** — not in scope for the current build phase.
-> Owning design doc: [design/README.md](design/README.md)
+> Owning design doc: [design/README.md](../README.md)
 
 The transports listed here are interesting experimental targets but are
 **out of scope for the current iteration** of `pg_transport`. The framework's
 plugin trait is shaped so these can be added later without changes to the
-core dispatcher; this document keeps the notes, library choices, risks, and
+core frontend; this document keeps the notes, library choices, risks, and
 open questions so we don't lose them.
 
-**Currently in scope** (see [design/README.md](design/README.md)): TCP, Unix domain
+**Currently in scope** (see [design/README.md](../README.md)): TCP, Unix domain
 sockets, TLS (over TCP/UDS via `tokio-rustls`).
 
 **Deferred** (this doc): QUIC, io_uring, AF_XDP, DPDK, RDMA,
@@ -47,7 +47,7 @@ Tentative order, once we re-enter this work:
 
 Library-of-record recommendations and integration sketches. Driver column
 indicates how the transport plugs into the tokio current-thread runtime
-(see [design/README.md §2 C-1](design/README.md) for context).
+(see [design/README.md §2 C-1](../README.md) for context).
 
 | Transport          | Crate(s)                                            | Driver           | Notes                                                                |
 | ------------------ | --------------------------------------------------- | ---------------- | -------------------------------------------------------------------- |
@@ -60,7 +60,7 @@ indicates how the transport plugs into the tokio current-thread runtime
 
 ### 2.1 QUIC specifics
 
-- `quinn` slots in natively under the dispatcher's tokio current-thread
+- `quinn` slots in natively under the frontend's tokio current-thread
   runtime. Pairs with `rustls`.
 - Stream-to-connection mapping needs a small protocol-layer adapter. FE/BE
   v3 is byte-stream oriented; we treat one QUIC bidirectional stream as
@@ -73,7 +73,7 @@ indicates how the transport plugs into the tokio current-thread runtime
 ### 2.2 io_uring specifics
 
 - Prefer `tokio-uring` because it's current-thread by design — no
-  multi-thread runtime to fight with. The dispatcher's existing
+  multi-thread runtime to fight with. The frontend's existing
   `LocalSet` cohabits with `tokio-uring`'s `Runtime` cleanly.
 - The raw `io-uring` crate is the escape hatch when we need
   features `tokio-uring` doesn't expose (e.g. multi-shot accept,
@@ -109,9 +109,9 @@ DPDK poll thread (pinned core, no PG access)
         ▼
    AsyncFd(eventfd).readable().await ─► main thread drains ring,
                                          hands bytes to the `Protocol` impl,
-                                         dispatches to ExecutorPool
+                                         dispatches to BackendPool
                                                      │
-                              executor result frames ▼
+                              backend result frames ▼
                                          encode → SPSC ring (Tx)
                                                      │
                               DPDK poll thread tx-bursts
@@ -132,7 +132,7 @@ implementations don't each reinvent it.
 
 ## 4. Phased plan (continues after the in-scope phases)
 
-Numbering continues from [design/roadmap.md §1](design/roadmap.md). The in-scope plan ends
+Numbering continues from [design/roadmap.md §1](../roadmap.md). The in-scope plan ends
 at the HTTP/2 protocol experiment; everything below is what comes after.
 
 | Phase  | Deliverable                                           | Gate / done criterion                                                |
@@ -145,7 +145,7 @@ at the HTTP/2 protocol experiment; everything below is what comes after.
 | **F6** | `transport-shmem-loopback`                            | "Lower bound on latency" reference baseline for local clients        |
 
 Each picks up the same trait surface as the in-scope transports — no
-dispatcher changes expected. Cargo features `iouring`, `quic-quinn`,
+frontend changes expected. Cargo features `iouring`, `quic-quinn`,
 `quic-quiche`, `afxdp`, `dpdk`, `rdma`, `shmem-loopback` are added to
 `crates/core/Cargo.toml` as those phases begin.
 
@@ -165,7 +165,7 @@ defensible answer.
 ### 5.2 Connection migration
 
 QUIC connection migration across client IPs is interesting for mobile /
-roaming clients but conflicts with the executor-pinning model (per-conn
+roaming clients but conflicts with the backend-pinning model (per-conn
 state lives in a specific bgworker). Worth exploring but not before basic
 QUIC works.
 
@@ -208,7 +208,7 @@ before we ship.
 - `rdma-core`: <https://github.com/linux-rdma/rdma-core>
 - `AsyncFd` (the integration primitive for non-tokio-native fds): <https://docs.rs/tokio/latest/tokio/io/unix/struct.AsyncFd.html>
 - Companion docs:
-  - [design/README.md](design/README.md) — current-scope framework design (index)
-  - [design/executor-pool.md](design/executor-pool.md) — dispatcher ↔ executor mechanics
-  - [background/pg_background.md](background/pg_background.md)
-  - [background/omnigres.md](background/omnigres.md)
+  - [design/README.md](../README.md) — current-scope framework design (index)
+  - [design/backend-pool.md](backend-pool.md) — frontend ↔ backend mechanics
+  - [background/pg_background.md](../../background/pg_background.md)
+  - [background/omnigres.md](../../background/omnigres.md)

@@ -10,18 +10,20 @@ pg_transport/
 ├── Cargo.toml                     # workspace
 ├── pg_transport.control           # the actual PG extension (rendered by pgrx)
 ├── docs/
-│   ├── design/                    # this design dir
+│   ├── design/                    # this design dir (active v0 design)
 │   │   ├── README.md
 │   │   ├── architecture.md
 │   │   ├── api.md
 │   │   ├── handoff.md
-│   │   ├── executor-pool.md       # deferred design draft
+│   │   ├── backend-handoff.md
 │   │   ├── transports.md
 │   │   ├── workspace.md           # ← this file
 │   │   ├── configuration.md
 │   │   ├── comparison.md
-│   │   └── roadmap.md
-│   ├── future-transports.md
+│   │   ├── roadmap.md
+│   │   └── deferred/              # design captured for deferred work
+│   │       ├── backend-pool.md         # shm_mq general path / SessionTransport
+│   │       └── future-transports.md    # QUIC, io_uring, AF_XDP, DPDK, RDMA, shmem
 │   ├── background/
 │   │   ├── pg_background.md
 │   │   └── omnigres.md
@@ -30,8 +32,8 @@ pg_transport/
 │   ├── api/                       # rlib; no PG deps; trait definitions only
 │   │   └── src/{transport.rs, handoff.rs, shutdown.rs, types.rs}
 │   ├── core/                      # the pgrx extension (cdylib via pgrx)
-│   │   └── src/{lib.rs, dispatcher.rs, registry.rs, guc.rs, catalog.rs, metrics.rs}
-│   ├── executor/                  # rlib; linked into core; executor-pool bgworker
+│   │   └── src/{lib.rs, frontend.rs, registry.rs, guc.rs, catalog.rs, metrics.rs}
+│   ├── backend/                  # rlib; linked into core; backend-pool bgworker
 │   │   └── src/{pool.rs, worker_main.rs, handoff.rs}
 │   ├── handoff-listener/          # rlib; shared accept-loop helper used by
 │   │                              #   every HandoffTransport. Stream-shaped
@@ -47,8 +49,8 @@ pg_transport/
 │   │                              #   rdma-*, shmem-loopback-*, http2-sql)
 │   │                              #   live in their own crates that will be
 │   │                              #   added when their phase begins. See
-│   │                              #   docs/future-transports.md and
-│   │                              #   docs/design/executor-pool.md.
+│   │                              #   docs/design/deferred/future-transports.md and
+│   │                              #   docs/design/deferred/backend-pool.md.
 │   ├── bench/                     # std binary; drives clients of each protocol
 │   └── testutil/                  # cluster spin-up helpers for integration tests
 └── README.md
@@ -81,14 +83,14 @@ default = ["tcp-handoff", "uds-handoff"]
 
 # Transports (each is a complete network entry point). v0 ships handoff
 # transports only; SessionTransport-based features (http2-sql, etc.)
-# are deferred — see docs/design/executor-pool.md.
+# are deferred — see docs/design/deferred/backend-pool.md.
 tcp-handoff = ["dep:transport-tcp-handoff"]
 uds-handoff = ["dep:transport-uds-handoff"]
 
 # Convenience bundle
 all-transports = ["tcp-handoff", "uds-handoff"]
 
-# Deferred (see docs/future-transports.md and docs/design/executor-pool.md):
+# Deferred (see docs/design/deferred/future-transports.md and docs/design/deferred/backend-pool.md):
 # iouring-pgwire, quic-quinn-pgwire, afxdp-*, dpdk-*, rdma-*,
 # shmem-loopback-*, http2-sql. Each is added here as its phase begins.
 ```
@@ -116,7 +118,7 @@ A single explicit function in `core` registers built-in transports, gated
 by Cargo features. v0 has **one** trait (`HandoffTransport`) and
 therefore one factory map. A second map (`session: HashMap<&'static
 str, SessionFactory>`) is reserved in the `Registry` shape so the
-deferred `SessionTransport` (see [executor-pool.md](executor-pool.md))
+deferred `SessionTransport` (see [backend-pool.md](deferred/backend-pool.md))
 can land without a registry shape change; in v0 that map is always
 empty.
 
@@ -143,12 +145,12 @@ pub fn register_builtin_transports(reg: &mut Registry) {
     reg.handoff.insert("uds_handoff", transport_uds_handoff::build);
 
     // Deferred (iouring, quic, afxdp, dpdk, rdma, http2-sql, …) will land
-    // in whichever map matches their trait. See docs/future-transports.md
-    // and docs/design/executor-pool.md.
+    // in whichever map matches their trait. See docs/design/deferred/future-transports.md
+    // and docs/design/deferred/backend-pool.md.
 }
 ```
 
-At spawn time the dispatcher looks the row's `kind` up in the handoff
+At spawn time the frontend looks the row's `kind` up in the handoff
 map and dispatches accordingly:
 
 ```rust
@@ -170,14 +172,14 @@ belongs to.
 ## 5. Catalog ↔ feature interaction
 
 The `pg_transport.transports` catalog table references a transport by name
-(e.g. `"tcp_handoff"`). The dispatcher resolves the name against the
+(e.g. `"tcp_handoff"`). The frontend resolves the name against the
 **compile-time** registry. If the user references a name that wasn't
 compiled in — or that is currently deferred — start-up fails with a clear
 error:
 
 ```
 ERROR:  transport "quic_quinn" referenced by transport id 7 is not present
-DETAIL: this transport is currently deferred (see docs/future-transports.md).
+DETAIL: this transport is currently deferred (see docs/design/deferred/future-transports.md).
         Once it lands, rebuild pg_transport with `--features quic-quinn`.
 ```
 

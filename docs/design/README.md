@@ -10,7 +10,7 @@ server; the explicit goal is to make swapping transports a small, controlled
 experiment with comparable benchmark numbers.
 
 **Current scope**: TCP, Unix domain sockets, TLS (over TCP/UDS), the FE/BE v3
-wire protocol, and a pre-spawned executor-pool of bgworker backends that
+wire protocol, and a pre-spawned backend pool of bgworkers that
 receive handed-off kernel sockets via `SCM_RIGHTS`. **Only the handoff
 path is in scope.**
 
@@ -19,10 +19,10 @@ path is in scope.**
 - **`SessionTransport` + `SessionHandle` (the shm_mq general path)** — for
   non-FE/BE wires (HTTP/2 + SQL, custom binary) and FE/BE transports that
   need plaintext inspection. Design captured in
-  [api.md](api.md) and [executor-pool.md](executor-pool.md); revisited
+  [api.md](api.md) and [backend-pool.md](deferred/backend-pool.md); revisited
   once the handoff baseline produces benchmark numbers.
 - **Exotic transports** — QUIC, io_uring, AF_XDP, DPDK, RDMA,
-  shared-memory loopback. Live in [../future-transports.md](../future-transports.md).
+  shared-memory loopback. Live in [../future-transports.md](deferred/future-transports.md).
 
 **Design stance.** The framework standardises *only* what touches PostgreSQL:
 the handle type vended to transports, the bgworker lifecycle, the shutdown
@@ -35,7 +35,7 @@ A second trait (`SessionTransport`) is anticipated but **deferred**; the
 current trait is named `HandoffTransport` (not just `Transport`) to
 leave room for it.
 
-**Single path into the executor pool (v0).** Transports hold a kernel
+**Single path into the backend pool (v0).** Transports hold a kernel
 `OwnedFd`, speak FE/BE v3, implement the **`HandoffTransport`** trait,
 and receive a **`HandoffHandle`** — one method, `handoff(fd)`, which
 hands the socket to a bgworker; the bgworker runs `ProcessStartupPacket`
@@ -50,8 +50,9 @@ PostgreSQL with `SCM_RIGHTS` in place of `fork`. See [handoff.md](handoff.md).
 |---|---|---|
 | [architecture.md](architecture.md) | active | 3-layer architecture diagram + runtime integration (tokio × pgrx × signals) |
 | [api.md](api.md) | active | The framework's trait surface: `HandoffTransport`, `HandoffHandle`, `ShutdownToken`, plus an end-to-end example transport. Deferred surface (`SessionTransport`, `SessionHandle`) sketched at end. |
-| [handoff.md](handoff.md) | active | The v0 path: blind fd-pass for kernel-socket FE/BE transports. Symmetric with default PG (`SCM_RIGHTS` replaces `fork`). |
-| [executor-pool.md](executor-pool.md) | **deferred** | Design draft for the shm_mq general path (`SessionTransport` + `SessionHandle`: `execute` / `acquire` / `submit`). Not implemented in v0. |
+| [handoff.md](handoff.md) | active | The v0 path — **FE/IPC side**: when to use, per-slot control-socket setup/teardown, end-to-end per-connection flow, comparison with default PG, performance. Symmetric with default PG (`SCM_RIGHTS` replaces `fork`). |
+| [backend-handoff.md](backend-handoff.md) | active | The v0 path — **BE side**: per-handoff handler, per-session reset, `PostgresMain`-equivalent, TLS (PG OpenSSL or rustls sidecar), cancel routing, backend-side limitations. |
+| [backend-pool.md](deferred/backend-pool.md) | **deferred** | Design draft for the shm_mq general path (`SessionTransport` + `SessionHandle`: `execute` / `acquire` / `submit`). Not implemented in v0. |
 | [transports.md](transports.md) | active | Per-transport notes for the current-scope set + helper crates the framework ships |
 | [workspace.md](workspace.md) | active | Cargo workspace layout, feature flags, build commands |
 | [configuration.md](configuration.md) | active | Catalog tables, GUCs, SQL surface, observability/metrics |
@@ -60,7 +61,7 @@ PostgreSQL with `SCM_RIGHTS` in place of `fork`. See [handoff.md](handoff.md).
 
 Companion docs (outside this design dir):
 
-- [../future-transports.md](../future-transports.md) — deferred transport experiments
+- [../future-transports.md](deferred/future-transports.md) — deferred transport experiments
 - [../background/pg_background.md](../background/pg_background.md) — the DSM + `shm_mq` + `pq_redirect_to_shm_mq` mechanics we lift
 - [../background/omnigres.md](../background/omnigres.md) — the listener-bgworker + worker-pool pattern we mirror
 
@@ -70,8 +71,8 @@ Companion docs (outside this design dir):
 
 ### Goals
 
-1. **Dispatcher bgworker** that hosts a tokio current-thread runtime, owns
-   the executor pool, and supervises a configurable set of transports.
+1. **Frontend bgworker** that hosts a tokio current-thread runtime, owns
+   the backend pool, and supervises a configurable set of transports.
 2. **Pluggable transports** as Rust crates in the workspace, statically
    linked into the `core` extension at build time and gated by Cargo
    features. Each crate implements `HandoffTransport` (v0) and is
@@ -81,7 +82,7 @@ Companion docs (outside this design dir):
    `HandoffHandle` (one method, `handoff(fd)`). A second handle
    (`SessionHandle`) is planned for the deferred general path; it will
    be the *only* place that surface widens.
-4. **Pre-spawned executor pool** — bgworker backends that take ownership
+4. **Pre-spawned backend pool** — backends (bgworkers) that take ownership
    of handed-off kernel sockets and run PG's `ProcessStartupPacket` /
    `ClientAuthentication` / `PostgresMain`-equivalent on them. The
    `pg_background`-style DSM + `shm_mq` + `pq_redirect_to_shm_mq` machinery
@@ -119,7 +120,7 @@ These are not negotiable inside a PG extension and shape everything below.
 
 `src/backend/storage/ipc/latch.c` (`WaitEventSet`) is how PG bgworkers
 classically wait on `MyLatch`, postmaster death, signals, and fds. We do
-**not** use it as the central event loop. Instead the dispatcher runs a
+**not** use it as the central event loop. Instead the frontend runs a
 **tokio current-thread runtime** as its top-level scheduler:
 
 - All fd-driven transports (TCP, UDS, TLS, QUIC's UDP, io_uring's ring fd,
@@ -128,7 +129,7 @@ classically wait on `MyLatch`, postmaster death, signals, and fds. We do
   arbitrary `RawFd`s.
 - Polling-only transports (DPDK PMDs, busy-poll AF_XDP) keep the
   data-plane-thread + eventfd bridge documented in
-  [../future-transports.md §3](../future-transports.md); the eventfd is
+  [../future-transports.md §3](deferred/future-transports.md); the eventfd is
   registered with tokio via `AsyncFd`, not with `WaitEventSet`.
 - PG signals (`SIGHUP`, `SIGTERM`) are observed via
   `tokio::signal::unix::signal(...)`. We still install pgrx's
@@ -159,7 +160,7 @@ For `!Send` per-connection state we use `LocalSet` + `spawn_local`.
 
 `pgrx::bgworker::BackgroundWorker` exposes a sync entrypoint. Inside it we
 build a `tokio::runtime::Builder::new_current_thread().enable_all().build()`
-and `block_on` the dispatcher's top-level `async fn`. Choice notes:
+and `block_on` the frontend's top-level `async fn`. Choice notes:
 
 - **Current-thread, not multi-thread.** No PG-touching code is ever spawned
   onto a worker thread. The runtime owns exactly the bgworker's main
@@ -174,7 +175,7 @@ and `block_on` the dispatcher's top-level `async fn`. Choice notes:
 - **No `tokio::task::block_in_place`** — it requires a multi-thread
   runtime. For blocking work (e.g. synchronous SPI from a debug helper)
   we accept that the runtime stalls; if that becomes a problem we move
-  the work to the executor pool instead.
+  the work to the backend pool instead.
 
 ### C-4 — Postmaster owns 5432
 
@@ -187,10 +188,11 @@ different port / socket family).
 ## Where to go next
 
 - New here? Read [architecture.md](architecture.md) next, then
-  [api.md](api.md), then [handoff.md](handoff.md).
+  [api.md](api.md), then [handoff.md](handoff.md) (FE/IPC) +
+  [backend-handoff.md](backend-handoff.md) (BE).
 - Looking up a specific decision? Use the index above.
 - Planning to contribute? Read [roadmap.md](roadmap.md) and
   [workspace.md](workspace.md).
-- Curious about what was deferred? [executor-pool.md](executor-pool.md)
+- Curious about what was deferred? [backend-pool.md](deferred/backend-pool.md)
   is the captured design for the shm_mq general path; [roadmap.md §4 —
   Deferred for v0](roadmap.md) records why.

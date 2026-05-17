@@ -25,7 +25,7 @@ illuminating than that headline similarity suggests.
 |  | **pgbouncer** | **`pg_transport`** |
 |---|---|---|
 | Process model | External daemon | PG extension (bgworker inside the cluster) |
-| Where it sits | In front of PG (client → pgbouncer → PG over TCP/UDS) | Inside PG (client → dispatcher bgworker → executor bgworker, all in-process) |
+| Where it sits | In front of PG (client → pgbouncer → PG over TCP/UDS) | Inside PG (client → frontend bgworker → backend bgworker, all in-process) |
 | Production maturity | Hardened since 2007, ubiquitous | Research framework, **deliberately not production** |
 | Wire protocols on the client side | FE/BE v3 only | FE/BE v3 today; QUIC, HTTP/2, custom binary on the roadmap |
 | Wire protocols on the backend side | FE/BE v3 over TCP/UDS to real PG backends | None — the "backend" is the same process talking via DSM + `shm_mq`, no FE/BE on the wire |
@@ -42,7 +42,7 @@ different path in our design:
 |---|---|---|
 | **session** | One backend assigned for the whole client session; released on disconnect | **Handoff path** (`HandoffTransport` + `HandoffHandle`). Identical semantics: slot pinned for connection lifetime. See [handoff.md](handoff.md). |
 | **transaction** | Backend assigned at `BEGIN`, released at `COMMIT` / `ROLLBACK`. Multiple clients share fewer backends, swapping per transaction. | **Not supported.** Would require transaction-boundary detection on the FE/BE wire; the v0 handoff path pins one connection to one slot for its whole lifetime. See [Known gap](#15-known-gap-transaction-pooling) below. |
-| **statement** | Backend assigned per statement, released after each `Query` / `Sync`. Most aggressive multiplexing; prepared statements break. | **Not supported in v0.** The closest equivalent is `SessionHandle::execute(opts, payload)` on the **deferred** shm_mq general path — the slot would be acquired internally, the payload runs, the slot returns to the pool when `FrameStream` ends. See [api.md §6](api.md) and [executor-pool.md](executor-pool.md). |
+| **statement** | Backend assigned per statement, released after each `Query` / `Sync`. Most aggressive multiplexing; prepared statements break. | **Not supported in v0.** The closest equivalent is `SessionHandle::execute(opts, payload)` on the **deferred** shm_mq general path — the slot would be acquired internally, the payload runs, the slot returns to the pool when `FrameStream` ends. See [api.md §6](api.md) and [backend-pool.md](deferred/backend-pool.md). |
 
 So `pg_transport` covers two of pgbouncer's three modes natively (session
 via handoff, statement via execute) and is missing the middle one
@@ -61,7 +61,7 @@ pgbouncer (transaction mode):    ~50–100 µs per query
        (~4 kernel context switches, full FE/BE parsing in pgbouncer)
 
 pg_transport handoff path:       ~10 µs *once* at connect, then 0 µs ongoing
-  └── after fd-pass, executor talks directly to client; dispatcher is gone
+  └── after fd-pass, backend talks directly to client; frontend is gone
 
 pg_transport execute() path:     ~50–150 µs per query
   └── full IPC: shm_mq + envelope + frame demux + mpsc routing
@@ -90,9 +90,9 @@ pattern.
    existing observability rather than being a black box in front of it.
 5. **(Deferred) Alternative wire protocols.** pgbouncer speaks FE/BE
    only. The deferred `SessionTransport` (see
-   [executor-pool.md](executor-pool.md)) will let you serve HTTP/2 +
+   [backend-pool.md](deferred/backend-pool.md)) will let you serve HTTP/2 +
    JSON, custom binary protocols, or eventually QUIC, all dispatching to
-   the same executor pool. Not in v0.
+   the same backend pool. Not in v0.
 
 ### 1.5 Known gap: transaction pooling
 
@@ -141,7 +141,7 @@ pgbouncer in front (see [§1.7](#17-can-you-stack-them)).
 Yes, and in some scenarios it makes sense:
 
 ```
-client ── TCP ──→ pgbouncer ── TCP ──→ pg_transport.tcp_handoff ── handoff ──→ executor
+client ── TCP ──→ pgbouncer ── TCP ──→ pg_transport.tcp_handoff ── handoff ──→ backend
          (transaction pooling)         (inside PG)
 ```
 
@@ -167,7 +167,7 @@ specifically need both:
 | Single-binary deployment, SQL-managed config | **`pg_transport`** |
 | Massive connection amplification (thousands of idle clients on tens of backends) | **pgbouncer** transaction mode |
 | Tight observability integration with PG (`pg_stat_*`, GUCs, catalog) | **`pg_transport`** |
-| TLS termination with `pg_hba.conf cert` mTLS, zero new code | **`pg_transport`** handoff (executor uses PG's TLS) |
+| TLS termination with `pg_hba.conf cert` mTLS, zero new code | **`pg_transport`** handoff (backend uses PG's TLS) |
 
 ### 1.9 One-line summary
 
@@ -193,21 +193,21 @@ Everything in [§1](#1-pgbouncer) applies; substitute "Odyssey" for
 
 ## 3. `pg_background`
 
-The direct ancestor of the executor pool. See
+The direct ancestor of the backend pool. See
 [../background/pg_background.md](../background/pg_background.md) for
 the full architecture review.
 
 | | `pg_background` | `pg_transport` |
 |---|---|---|
 | Trigger | SQL function call (`pg_background_launch(...)`) | Inbound network connection |
-| Worker lifecycle | One bgworker per call; exits after the SQL completes | Pre-spawned pool; bgworkers live for the whole dispatcher lifetime |
+| Worker lifecycle | One bgworker per call; exits after the SQL completes | Pre-spawned pool; bgworkers live for the whole frontend lifetime |
 | Per-call overhead | Full `RegisterDynamicBackgroundWorker` + fork (~1 ms+) | Pool checkout + `SCM_RIGHTS` handoff (~10 µs) |
-| Result delivery | DSM + `shm_mq`, consumed by `pg_background_result_v2()` | v0: executor runs FE/BE on the inherited fd; bytes go directly to the client. Deferred (shm_mq general path): same DSM + `shm_mq` mechanism as `pg_background`, relayed by the dispatcher as a `FrameStream` \u2014 see [executor-pool.md](executor-pool.md). |
+| Result delivery | DSM + `shm_mq`, consumed by `pg_background_result_v2()` | v0: backend runs FE/BE on the inherited fd; bytes go directly to the client. Deferred (shm_mq general path): same DSM + `shm_mq` mechanism as `pg_background`, relayed by the frontend as a `FrameStream` \u2014 see [backend-pool.md](deferred/backend-pool.md). |
 | Use case | Autonomous transactions from SQL ("run this in the background") | Listener / proxy / alternative-wire-protocol substrate |
 
 `pg_transport` borrows `pg_background`'s pool-of-bgworkers idea but
 takes its mechanism only **for the deferred shm_mq path** (see
-[executor-pool.md](executor-pool.md)). v0 itself does **not** use DSM /
+[backend-pool.md](deferred/backend-pool.md)). v0 itself does **not** use DSM /
 `shm_mq` / `pq_redirect_to_shm_mq` — it hands the kernel fd directly to
 the bgworker, which runs PG's own `PostgresMain`-equivalent on it.
 
@@ -222,10 +222,10 @@ review.
 | | Omnigres `omni_httpd` | `pg_transport` |
 |---|---|---|
 | Wire protocol scope | HTTP/1.1, HTTP/2, HTTP/3 (via h2o) | FE/BE v3 today; HTTP/2 + others on the roadmap |
-| Listener process model | Master bgworker + N HTTP worker bgworkers; each HTTP worker has a PG-touching main thread + non-PG-touching h2o thread | Single dispatcher bgworker (tokio current-thread) + N executor bgworkers; transports run as tokio tasks inside the dispatcher |
-| Per-connection backend | Each HTTP worker IS a PG backend; runs handlers in-process via SPI | Executor bgworker is the PG backend; the transport is decoupled in the dispatcher |
+| Listener process model | Master bgworker + N HTTP worker bgworkers; each HTTP worker has a PG-touching main thread + non-PG-touching h2o thread | Single frontend bgworker (tokio current-thread) + N backend bgworkers; transports run as tokio tasks inside the frontend |
+| Per-connection backend | Each HTTP worker IS a PG backend; runs handlers in-process via SPI | Each backend slot's bgworker IS a PG backend (recycled across handoffs); the transport is decoupled in the frontend |
 | Configuration | SQL catalog tables (`omni_httpd.listeners`, route table) | SQL catalog tables (`pg_transport.transports`) — directly inspired by Omnigres |
-| TLS termination | h2o-side (the secondary thread) | Executor-side, either PG OpenSSL or rustls sidecar (handoff path) |
+| TLS termination | h2o-side (the secondary thread) | Backend-side, either PG OpenSSL or rustls sidecar (handoff path) |
 | What's being researched | HTTP-as-PG-runtime application platform | Alternative transports / protocols for PG, performance research |
 
 Omnigres confirms the load-bearing parts of our design:
@@ -237,11 +237,11 @@ Where we diverge:
   application primitives like auth/sessions/ledger). We're a deliberately
   narrow framework with a small API surface.
 - **Omnigres co-locates listener and execution.** Each `omni_httpd`
-  worker is both. We split them: dispatcher (transports) is separate from
-  the executor pool, which lets transports be written without thinking
+  worker is both. We split them: frontend (transports) is separate from
+  the backend pool, which lets transports be written without thinking
   about PG semantics.
 - **Omnigres is HTTP-first.** We're protocol-agnostic by design — FE/BE
-  on day one, with the executor contract specifically shaped to allow
+  on day one, with the backend contract specifically shaped to allow
   arbitrary wire protocols.
 
 ---
@@ -253,12 +253,12 @@ default PG already works:
 
 | Step | Default PG | `pg_transport` handoff |
 |---|---|---|
-| Listen on a port | postmaster's `ServerLoop` | dispatcher's tokio accept loop |
-| Accept a connection | postmaster | dispatcher |
+| Listen on a port | postmaster's `ServerLoop` | frontend's tokio accept loop |
+| Accept a connection | postmaster | frontend |
 | Give the fd to a child process | `fork()` | `sendmsg(SCM_RIGHTS)` |
 | Per-connection startup cost | full fork (~1 ms) | fd-pass (~10 µs); bgworker pre-spawned |
-| Protocol probe + auth + `PostgresMain` | backend | executor bgworker (same PG code) |
-| Lifecycle after disconnect | backend exits, postmaster reaps | executor resets per-session state, slot returns to pool |
+| Protocol probe + auth + `PostgresMain` | backend | backend bgworker (same PG code) |
+| Lifecycle after disconnect | backend exits, postmaster reaps | backend resets per-session state, slot returns to pool |
 
 Differences:
 
@@ -269,7 +269,7 @@ Differences:
    listeners, all simultaneously, all dispatching to the same pool.
 
 For details and the full step-by-step see
-[handoff.md §6](handoff.md#6-comparison-with-default-pg).
+[handoff.md §3](handoff.md#3-comparison-with-default-pg).
 
 ---
 
@@ -278,7 +278,7 @@ For details and the full step-by-step see
 - [README.md](README.md) — design entry point.
 - [handoff.md](handoff.md) — the fast path that beats pgbouncer on
   steady-state latency.
-- [executor-pool.md](executor-pool.md) — *deferred* general path that
+- [backend-pool.md](deferred/backend-pool.md) — *deferred* general path that
   *would* approximate pgbouncer's statement-mode pooling once it lands.
 - [roadmap.md](roadmap.md) — phased build plan; transaction-pooling is
   *not* on the plan but could become Q16 if the project's scope shifts.

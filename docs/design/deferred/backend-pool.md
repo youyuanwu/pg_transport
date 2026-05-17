@@ -1,64 +1,64 @@
-# Executor pool (general path)
+# Backend pool (general path)
 
-> Parent: [README.md](README.md)
-> Sibling: [handoff.md](handoff.md) · [api.md](api.md) · [architecture.md](architecture.md)
+> Parent: [README.md](../README.md)
+> Sibling: [handoff.md](../handoff.md) · [api.md](../api.md) · [architecture.md](../architecture.md)
 >
 > **STATUS: DEFERRED.** This document describes the planned `SessionTransport`
 > + `SessionHandle` general path. **It is not implemented in v0.** v0 ships
-> the handoff path only (see [handoff.md](handoff.md)) and a pre-spawned
+> the handoff path only (see [handoff.md](../handoff.md)) and a pre-spawned
 > bgworker pool whose only role is receiving handed-off fds. The DSM /
 > `shm_mq` / `pq_redirect_to_shm_mq` plumbing, the `Payload` envelope,
 > `ExecutorSession`, `FrameStream`, frame tagging, and the cross-process
 > wakeup options A/B/C below are captured here so they can land later
-> without re-deriving the design. See [roadmap.md §4 — Deferred for v0](roadmap.md)
+> without re-deriving the design. See [roadmap.md §4 — Deferred for v0](../roadmap.md)
 > for the rejection rationale.
 
 This doc describes the framework's **general path**: requests submitted
 via `SessionHandle::execute(...)` or `SessionHandle::acquire(...).submit(...)` are serialised into
-shared-memory queues (`shm_mq`), processed by an executor bgworker, and
+shared-memory queues (`shm_mq`), processed by a backend bgworker, and
 streamed back as FE/BE response frames. It is the detailed companion to
-[api.md](api.md), which describes the trait surface in the abstract.
+[api.md](../api.md), which describes the trait surface in the abstract.
 
 Use this path for transports whose wire protocol is **not** FE/BE on a
 kernel socket: HTTP/2 + JSON-SQL, custom binary protocols, datagram
 transports (QUIC, DPDK), or any FE/BE transport that needs to
 inspect/modify protocol bytes before submission. Transports that hold a
 kernel `OwnedFd` and speak FE/BE v3 use the simpler fast path in
-[handoff.md](handoff.md) instead.
+[handoff.md](../handoff.md) instead.
 
 The high-level mechanism is lifted from
-[`pg_background`](../background/pg_background.md): a pool of background
+[`pg_background`](../../background/pg_background.md): a pool of background
 worker bgworkers, each with a DSM segment and a pair of `shm_mq`s, with
 `pq_redirect_to_shm_mq` installed so the backend's FE/BE protocol output
 goes into the response queue instead of a real TCP socket. The framework's
 contribution on top is (a) a *pre-spawned, long-lived* pool instead of
 per-request fork, (b) an async-friendly request/response shape on the
-dispatcher side, and (c) a serialised request envelope so each worker can
+frontend side, and (c) a serialised request envelope so each worker can
 serve multiple sessions sequentially over its lifetime.
 
 > The same pool also serves the handoff path. A slot is either holding a
 > handed-off connection (handoff path) or serving an `acquire`d session
 > (this doc) at any time, never both. See
-> [handoff.md §2](handoff.md) for the cross-path slot model.
+> [handoff.md §2](../handoff.md) for the cross-path slot model.
 
 ---
 
-## 1. Anatomy of an executor slot
+## 1. Anatomy of a backend slot
 
-The pool consists of N slots, where N = `pg_transport.executor_pool_size`
+The pool consists of N slots, where N = `pg_transport.backend_pool_size`
 (GUC, defaults to `max(4, num_cpus)`). Each slot is allocated once at
-dispatcher startup and lives until shutdown.
+frontend startup and lives until shutdown.
 
 ### Per-slot resources
 
 | Resource                    | Created by | Lifetime | Purpose                                                  |
 | --------------------------- | ---------- | -------- | -------------------------------------------------------- |
-| Slot DSM segment            | Dispatcher | Pool     | Container for the two `shm_mq`s and the fixed-data block |
-| `req_q` (`shm_mq`)          | Dispatcher | Pool     | Carries serialised `Request` envelopes, dispatcher → worker |
-| `resp_q` (`shm_mq`)         | Dispatcher | Pool     | Carries FE/BE response frames, worker → dispatcher       |
-| Fixed-data block            | Dispatcher | Pool     | Slot id, dispatcher PID, error fields (see §6)           |
-| Bgworker child process      | Dispatcher (via `RegisterDynamicBackgroundWorker` at pool startup) | Pool | Runs the slot's executor loop |
-| `slot_loop` tokio task      | Dispatcher | Pool     | Drains `resp_q` and routes frames to per-session mpscs    |
+| Slot DSM segment            | Frontend | Pool     | Container for the two `shm_mq`s and the fixed-data block |
+| `req_q` (`shm_mq`)          | Frontend | Pool     | Carries serialised `Request` envelopes, frontend → worker |
+| `resp_q` (`shm_mq`)         | Frontend | Pool     | Carries FE/BE response frames, worker → frontend       |
+| Fixed-data block            | Frontend | Pool     | Slot id, frontend PID, error fields (see §6)           |
+| Bgworker child process      | Frontend (via `RegisterDynamicBackgroundWorker` at pool startup) | Pool | Runs the slot's backend loop |
+| `slot_loop` tokio task      | Frontend | Pool     | Drains `resp_q` and routes frames to per-session mpscs    |
 
 ### Per-session resources (acquired and released through `SessionHandle`)
 
@@ -73,15 +73,15 @@ dispatcher startup and lives until shutdown.
 
 | Resource                    | Lifetime              | Purpose                                                 |
 | --------------------------- | --------------------- | ------------------------------------------------------- |
-| Request envelope            | Dispatcher → worker   | `(conn_id, Request)` length-prefixed on `req_q`         |
-| Response frame stream       | Worker → dispatcher   | Sequence of FE/BE frames tagged with `conn_id` on `resp_q`, terminated by `ReadyForQuery` |
+| Request envelope            | Frontend → worker   | `(conn_id, Request)` length-prefixed on `req_q`         |
+| Response frame stream       | Worker → frontend   | Sequence of FE/BE frames tagged with `conn_id` on `resp_q`, terminated by `ReadyForQuery` |
 
 ---
 
 ## 2. End-to-end path of one `Payload`
 
 ```
-Transport's tokio task                Dispatcher's per-slot task              Executor bgworker (separate process)
+Transport's tokio task                Frontend's per-slot task              Backend bgworker (separate process)
 ═════════════════════════             ════════════════════════════════        ═══════════════════════════════════
 
 session.submit(Payload::Raw(b))                                                shm_mq_receive_blocking(req_q)
@@ -132,11 +132,11 @@ Five things are worth pulling out of the picture:
 
 1. The transport never opens or reads the `shm_mq` directly. It hands
    bytes to `submit()` and receives a `FrameStream`. The shared-memory
-   plumbing lives entirely inside the dispatcher.
-2. The dispatcher's `slot_loop` is the only thing reading `resp_q`. It
+   plumbing lives entirely inside the frontend.
+2. The frontend's `slot_loop` is the only thing reading `resp_q`. It
    demultiplexes by `conn_id` and pushes onto the right per-session
    mpsc.
-3. The executor bgworker's loop is essentially `pg_background`'s loop,
+3. The backend bgworker's loop is essentially `pg_background`'s loop,
    minus the "exit after one query" behaviour. It serves many envelopes
    over its lifetime.
 4. The `conn_id` tag flows in both directions. The envelope carries the
@@ -144,16 +144,16 @@ Five things are worth pulling out of the picture:
    conn_id that's currently *active* (set by `set_current_conn` right
    before SPI executes).
 5. The `FrameStream` terminates on `ReadyForQuery` (or `ErrorResponse`
-   followed by `ReadyForQuery`). The dispatcher does not tear down the
+   followed by `ReadyForQuery`). The frontend does not tear down the
    per-session mpsc on RFQ — that mpsc is reused for the session's
    *next* `submit()` call.
 
 ---
 
-## 3. Dispatcher side: pseudocode
+## 3. Frontend side: pseudocode
 
 ```rust
-// crates/executor/src/pool.rs
+// crates/backend/src/pool.rs
 
 pub struct Pool {
     slots: Vec<Arc<Slot>>,
@@ -201,7 +201,7 @@ impl SessionHandle {
         let conn_id = self.pool.next_conn_id();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         slot.router.lock().insert(conn_id, tx);
-        // Send a "startup" envelope so the executor sets per-session GUCs,
+        // Send a "startup" envelope so the backend sets per-session GUCs,
         // application_name, etc. (Optional in phase 2; pgwire passes those
         // through as a normal Raw(StartupMessage)).
         Ok(ExecutorSession { slot, conn_id, rx: Some(rx) })
@@ -235,13 +235,13 @@ the session's underlying mpsc is preserved for the next call.
 
 ---
 
-## 4. Executor side: pseudocode
+## 4. Backend side: pseudocode
 
 ```rust
-// crates/executor/src/worker_main.rs (pgrx, sync, runs in the bgworker child)
+// crates/backend/src/worker_main.rs (pgrx, sync, runs in the bgworker child)
 
 #[pg_guard]
-pub extern "C" fn pg_transport_executor_main(arg: pg_sys::Datum) {
+pub extern "C" fn pg_transport_backend_main(arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(
         SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM,
     );
@@ -283,7 +283,7 @@ The three request paths:
 
 | Variant         | What the worker does                                                  |
 | --------------- | --------------------------------------------------------------------- |
-| `Raw(bytes)`    | Hands the bytes to a minimal FE-message dispatcher that mirrors the relevant branch of `PostgresMain` (Query → SPI; Parse/Bind/Execute → extended-protocol path; Terminate → close session). |
+| `Raw(bytes)`    | Hands the bytes to a minimal FE-message frontend that mirrors the relevant branch of `PostgresMain` (Query → SPI; Parse/Bind/Execute → extended-protocol path; Terminate → close session). |
 | `Sql(s)`        | `SPI_connect` → `SPI_execute(s)` → emit results. Simpler path, suitable for non-FE/BE transports. |
 | `Extended { … }`| `SPI_prepare` + `SPI_execute_plan`, with `Param` values converted via `postgres-types`. |
 
@@ -331,10 +331,10 @@ experiment would require a protocol change.
 
 ---
 
-## 6. Cross-process wakeup: how the dispatcher knows there's data
+## 6. Cross-process wakeup: how the frontend knows there's data
 
 This is the one part the design has been deliberately quiet about until
-now. The dispatcher's `slot_loop` needs to be woken when the executor
+now. The frontend's `slot_loop` needs to be woken when the backend
 pushes a frame onto `resp_q`. `shm_mq` does not expose a kernel fd that
 tokio's reactor can poll directly, so we have three viable mechanisms:
 
@@ -360,23 +360,23 @@ Cons: latency floor at ~½ × interval (50 µs average); wakeful CPU at idle.
 ### Option B — Eventfd bridge
 
 Worker creates an eventfd at startup, writes its number into the slot's
-fixed-data block. The dispatcher then needs the *same* eventfd; since
+fixed-data block. The frontend then needs the *same* eventfd; since
 fds are per-process, this requires either:
 
 - **B-a** — passing the fd over a per-slot Unix socket with `SCM_RIGHTS`,
   or
-- **B-b** — having the dispatcher create the eventfd and pass it to the
+- **B-b** — having the frontend create the eventfd and pass it to the
   worker the same way (which doesn't actually work because the worker
-  is a child of postmaster, not of the dispatcher, so postmaster-time fd
+  is a child of postmaster, not of the frontend, so postmaster-time fd
   inheritance doesn't help us either).
 
 Either way: nontrivial. Lowest latency though (single-µs wakeups).
 
 ### Option C — PG-latch bridge thread
 
-A single dispatcher-owned auxiliary thread sits in
-`WaitLatch(MyLatch, ..., 1000ms)`. When the dispatcher's latch fires (the
-worker calls `SetLatch(dispatcher_proc->procLatch)` after `shm_mq_send`),
+A single frontend-owned auxiliary thread sits in
+`WaitLatch(MyLatch, ..., 1000ms)`. When the frontend's latch fires (the
+worker calls `SetLatch(frontend_proc->procLatch)` after `shm_mq_send`),
 the bridge thread writes to a single eventfd that tokio is watching, then
 loops back. Tokio sees the wakeup and drains all slots' `resp_q`s.
 
@@ -395,7 +395,7 @@ because it composes best with PG's signalling and only adds a single
 thread. **Option B** stays available as a "go faster" knob if we ever need
 to drive a single slot to its theoretical limit.
 
-This is open question §6 in [roadmap.md](roadmap.md).
+This is open question §6 in [roadmap.md](../roadmap.md).
 
 ---
 
@@ -412,7 +412,7 @@ slots are busy, `acquire` either:
 - **returns** an `Err(PoolExhausted)` if the caller specifies
   `SessionOpts::nonblocking`.
 
-This model is correct for FE/BE v3 because the executor holds server-side
+This model is correct for FE/BE v3 because the backend holds server-side
 session state (temp tables, prepared statements, GUCs) that must not bleed
 between sessions.
 
@@ -423,12 +423,12 @@ exclusive pinning wastes capacity. A later phase can introduce a "shared
 mode" where a slot serves multiple in-flight `Payload::Sql` calls
 concurrently, identified by `conn_id` in the envelope. The slot's PG
 state must be reset between requests (`DISCARD ALL` or a fresh `SPI_connect`
-context). Open question §10 in [roadmap.md](roadmap.md) tracks this.
+context). Open question §10 in [roadmap.md](../roadmap.md) tracks this.
 
 ### Pool sizing
 
-GUC: `pg_transport.executor_pool_size`. Default `max(4, num_cpus)`.
-Hard ceiling: `max_worker_processes - safety_margin`. The dispatcher
+GUC: `pg_transport.backend_pool_size`. Default `max(4, num_cpus)`.
+Hard ceiling: `max_worker_processes - safety_margin`. The frontend
 refuses to start more than will fit, with a clear error.
 
 ---
@@ -442,17 +442,17 @@ refuses to start more than will fit, with a clear error.
     cancelled depending on transport policy.
 4.  As transports finish their `run` futures, ExecutorSessions drop;
     routers empty; slots become idle.
-5.  Once join_all(transports) completes, the dispatcher calls
+5.  Once join_all(transports) completes, the frontend calls
     exec.shutdown().
 6.  exec.shutdown() sends Req::Shutdown to every slot's req_q.
-7.  Each executor bgworker exits its loop, detaches DSM, and exits the
+7.  Each backend bgworker exits its loop, detaches DSM, and exits the
     process.
 8.  slot_loop tasks observe their slot's shutdown token, exit.
-9.  Dispatcher bgworker returns from dispatcher_main; pgrx exits.
+9.  Frontend bgworker returns from frontend_main; pgrx exits.
 ```
 
 The ordering matters: we drain transports first so no new requests can
-arrive while the executor pool is closing.
+arrive while the backend pool is closing.
 
 ---
 
@@ -460,9 +460,9 @@ arrive while the executor pool is closing.
 
 | Source                                | Surfaced as                                                                    |
 | ------------------------------------- | ------------------------------------------------------------------------------ |
-| SQL error inside executor             | `ErrorResponse` frame on `resp_q`, then `ReadyForQuery`. Transport sees them in the `FrameStream` and forwards. Same as a normal libpq client. |
+| SQL error inside backend             | `ErrorResponse` frame on `resp_q`, then `ReadyForQuery`. Transport sees them in the `FrameStream` and forwards. Same as a normal libpq client. |
 | Worker process crash                  | Detected by detach callback on the slot's DSM; `slot_loop` notes the loss; pool tries to respawn; in-flight sessions see their `FrameStream` end with `08006 — lost connection to worker process` (synthesised by the slot loop). |
-| Dispatcher exit during a request      | `ShutdownToken` cancellation propagates; transport's per-conn task drops its `FrameStream`; the slot router drops the mpsc tx; new frames coming off `resp_q` for that `conn_id` are dropped silently. |
+| Frontend exit during a request      | `ShutdownToken` cancellation propagates; transport's per-conn task drops its `FrameStream`; the slot router drops the mpsc tx; new frames coming off `resp_q` for that `conn_id` are dropped silently. |
 | Slot pool exhausted                   | `acquire` blocks on its semaphore, or returns `Err(PoolExhausted)` for nonblocking callers. |
 | Invalid envelope on `req_q`           | Worker emits an internal error (and may exit); slot loop reports the slot as faulted and the pool tries to respawn it. |
 
@@ -476,9 +476,9 @@ can ask via a helper on `ExecutorSession`.
 
 ## See also
 
-- [api.md](api.md) — the `SessionTransport`, `SessionHandle`, `ShutdownToken`
+- [api.md](../api.md) — the `SessionTransport`, `SessionHandle`, `ShutdownToken`
   trait surface that the machinery in this doc implements.
-- [../background/pg_background.md](../background/pg_background.md) — the
+- [../background/pg_background.md](../../background/pg_background.md) — the
   DSM + `shm_mq` + `pq_redirect_to_shm_mq` mechanics we lift.
-- [roadmap.md](roadmap.md) — phase plan; the wakeup-option ADR; the
+- [roadmap.md](../roadmap.md) — phase plan; the wakeup-option ADR; the
   shared-slot open question.

@@ -16,15 +16,15 @@ PostgreSQL**:
 | Cancellation             | ✅ `ShutdownToken`    | Async-wakeable signal; transport must honour it                               |
 | Catalog → instance       | ✅ Config + factory   | One factory per transport; registry has one map (a second is reserved for the deferred `SessionTransport`) |
 | Byte I/O model           | ❌                    | Transport's choice (tokio, mio, future io_uring, raw threads, …)              |
-| Wire protocol parsing    | ❌ (and not needed)   | After `handoff(fd)` returns, the executor runs FE/BE inside PG                |
-| Connection-state model   | ❌ (and not needed)   | The executor's `PostgresMain`-equivalent owns the session                     |
-| TLS termination          | ❌ (and not needed)   | Executor-side; transport just sets `tls_allowed` in the handoff hints         |
-| Auth flow                | ❌ (and not needed)   | Executor runs PG's `ClientAuthentication`                                      |
+| Wire protocol parsing    | ❌ (and not needed)   | After `handoff(fd)` returns, the backend runs FE/BE inside PG                |
+| Connection-state model   | ❌ (and not needed)   | The backend's `PostgresMain`-equivalent owns the session                     |
+| TLS termination          | ❌ (and not needed)   | Backend-side; transport just sets `tls_allowed` in the handoff hints         |
+| Auth flow                | ❌ (and not needed)   | Backend runs PG's `ClientAuthentication`                                      |
 | Threading inside `run`   | ❌                    | Transport's choice (subject to C-2 — no PG access off the bgworker main thread) |
 
 Most of the cells marked ❌ are "not needed" rather than "transport's
 choice" because in v0 every transport is a `HandoffTransport`, which by
-construction hands the wire to the executor before any protocol
+construction hands the wire to the backend before any protocol
 processing. When `SessionTransport` lands (see §6 below), several of
 those cells flip to "transport's choice".
 
@@ -45,12 +45,12 @@ use crate::{Config, HandoffHandle, ShutdownToken};
 /// Future returned by `HandoffTransport::run`. Boxed so the trait stays
 /// object-safe (we need `Box<dyn HandoffTransport>` for the registry).
 ///
-/// Not `Send`-bound: the dispatcher runs a tokio current-thread runtime
+/// Not `Send`-bound: the frontend runs a tokio current-thread runtime
 /// with `LocalSet`, so the future can hold `!Send` state across awaits
 /// (pgrx handles, `Rc<…>` for shared per-instance config, etc.).
 pub type RunFuture = Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'static>>;
 
-/// For transports that hand kernel sockets to the executor pool.
+/// For transports that hand kernel sockets to the backend pool.
 /// The handle exposes only `handoff` — no Payload, no Session,
 /// no FrameStream visible to the transport.
 pub trait HandoffTransport: 'static {
@@ -73,7 +73,7 @@ pub type HandoffFactory = fn(cfg: &Config) -> anyhow::Result<Box<dyn HandoffTran
 
 Why manual `Pin<Box<dyn Future + '_>>` and not `#[async_trait]`:
 
-- **One async method, called once per transport per dispatcher lifetime.**
+- **One async method, called once per transport per frontend lifetime.**
   The macro's ergonomics payoff (write many `async fn`s naturally)
   doesn't apply; one `Box::pin(async move { … })` at the impl site is
   the entire tax.
@@ -92,7 +92,7 @@ Why the name `HandoffTransport` rather than just `Transport`:
 
 - The eventual `SessionTransport` sibling (deferred — see §6) will sit
   alongside it; both names already exist in the design vocabulary
-  ([architecture.md](architecture.md), [executor-pool.md](executor-pool.md)).
+  ([architecture.md](architecture.md), [backend-pool.md](deferred/backend-pool.md)).
 - Keeps the v0 → v0.x rename-free: when the second trait lands, no
   existing transport changes shape.
 
@@ -109,23 +109,23 @@ use std::os::fd::OwnedFd;
 pub struct HandoffHandle { /* opaque */ }
 
 impl HandoffHandle {
-    /// Hand a kernel socket to an executor bgworker. The bgworker takes
+    /// Hand a kernel socket to a backend bgworker. The bgworker takes
     /// ownership and runs FE/BE v3 (including TLS and auth) on it
     /// directly. Returns when the client disconnects.
     ///
     /// Use this when the transport has an OwnedFd and the wire is FE/BE.
     /// See [handoff.md](handoff.md) for the SCM_RIGHTS mechanism, the
-    /// per-slot control socket, and the executor-side TLS choices.
+    /// per-slot control socket, and the backend-side TLS choices.
     pub async fn handoff(&self, sock: OwnedFd) -> anyhow::Result<()>;
 }
 ```
 
-Nothing else. No Payload, no SessionOpts, no FrameStream — the executor
+Nothing else. No Payload, no SessionOpts, no FrameStream — the backend
 reads `StartupMessage` from the fd itself, so the framework doesn't need
 to pass database/user/auth metadata.
 
 For the implementation of `handoff` (`SCM_RIGHTS`, per-slot control
-socket, executor-side `ProcessStartupPacket`), see [handoff.md](handoff.md).
+socket, backend-side `ProcessStartupPacket`), see [handoff.md](handoff.md).
 
 ---
 
@@ -152,7 +152,7 @@ impl ShutdownToken {
 
 A transport is expected to `tokio::select!` on `shutdown.cancelled()` in
 its accept loop. (There are no per-connection tasks to cancel under the
-v0 handoff model: once `handoff(fd)` returns, the dispatcher has no
+v0 handoff model: once `handoff(fd)` returns, the frontend has no
 further role for that connection.)
 
 ---
@@ -195,7 +195,7 @@ That's the entire transport. The only "async-trait" tax is the
 loop itself, including shutdown discipline and per-accept error
 logging, lives in `handoff-listener` and is shared across every
 fd-producing transport (today and future ones). No FE/BE parsing, no
-auth code, no TLS code, no per-conn state machine: the executor (see
+auth code, no TLS code, no per-conn state machine: the backend (see
 [handoff.md](handoff.md)) runs PG's own `ProcessStartupPacket` →
 `ClientAuthentication` → `PostgresMain`-equivalent on the inherited fd.
 
@@ -217,7 +217,7 @@ For the catalog-name ↔ feature-flag mismatch error path
 
 > **Status: not implemented in v0.** This section captures the planned
 > shape so it can land without breaking the v0 surface. The full design
-> is in [executor-pool.md](executor-pool.md).
+> is in [backend-pool.md](deferred/backend-pool.md).
 
 A second trait is anticipated for transports whose wire is *not* FE/BE
 on a kernel socket (HTTP/2 + SQL, custom binary, future QUIC/DPDK) or
@@ -239,10 +239,10 @@ pub type SessionFactory = fn(cfg: &Config) -> anyhow::Result<Box<dyn SessionTran
 
 The handle exposes two methods — `execute(opts, payload)` for stateless
 one-shots and `acquire(opts)` for stateful multi-submit sessions — that
-route payloads through the executor pool's `shm_mq`s and surface
+route payloads through the backend pool's `shm_mq`s and surface
 responses as a `FrameStream`. The chooser table (when to use `execute`
 vs `acquire`), the `Payload` enum (`Raw` / `Sql` / `Extended`), and the
-`ExecutorSession` type all live in [executor-pool.md](executor-pool.md).
+`ExecutorSession` type all live in [backend-pool.md](deferred/backend-pool.md).
 
 Why two traits rather than one generic `Transport<H>` when the second
 lands:
@@ -270,5 +270,5 @@ Roadmap: see [roadmap.md §4 — Deferred for v0](roadmap.md).
   `HandoffHandle::handoff`.
 - [transports.md](transports.md) — which concrete transports implement
   the v0 trait.
-- [executor-pool.md](executor-pool.md) — *deferred* design for
+- [backend-pool.md](deferred/backend-pool.md) — *deferred* design for
   `SessionHandle::execute` / `acquire` / `submit`.

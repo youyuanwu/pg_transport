@@ -8,18 +8,18 @@ Strict ordering — each phase locks in a contract that subsequent phases
 extend rather than break. **v0 ends at phase 6.5.** Phase 7
 (`SessionTransport` + shm_mq general path) is **deferred**; see
 [§4 Deferred for v0](#4-deferred-for-v0). Other deferred transport
-phases are listed in [../future-transports.md §4](../future-transports.md).
+phases are listed in [../future-transports.md §4](deferred/future-transports.md).
 
 | Phase | Deliverable                                                   | Gate / done criterion                                                |
 | ----- | ------------------------------------------------------------- | -------------------------------------------------------------------- |
 | **0** | Repo scaffold, ADRs, this design doc set                      | `cargo check -p api -p core` passes                                  |
 | **1** | `core` bgworker boots a tokio current-thread runtime          | Heartbeat task logs every 1 s; clean SIGHUP/SIGTERM via `tokio::signal`; postmaster-death watchdog exits the runtime |
-| **2** | `executor` pool — pre-spawned bgworkers, per-slot UDS control socket | Pool starts N executor bgworkers; dispatcher can `sendmsg(SCM_RIGHTS)` a dummy fd to a slot; slot reads and closes it; no shm_mq machinery yet |
-| **3** | `transport-tcp-handoff` as a `HandoffTransport` + executor runs `PostgresMain`-equivalent | `psql -h … -p …` connects, runs `SELECT 1` (no TLS yet) |
+| **2** | `backend` pool — pre-spawned bgworkers, per-slot UDS control socket | Pool starts N backend bgworkers; frontend can `sendmsg(SCM_RIGHTS)` a dummy fd to a slot; slot reads and closes it; no shm_mq machinery yet |
+| **3** | `transport-tcp-handoff` as a `HandoffTransport` + backend runs `PostgresMain`-equivalent | `psql -h … -p …` connects, runs `SELECT 1` (no TLS yet) |
 | **4** | `bench/` harness                                              | Reports p50/p95/p99 latency, throughput; produces a CSV per run |
 | **5** | `transport-uds-handoff` as a `HandoffTransport`                | Adds a second transport; flushes out the SCM_RIGHTS control-socket plumbing |
-| **6** | TLS in the executor via PG's `secure_open_server`             | `psql sslmode=require` connects via TCP and UDS; transports unchanged |
-| **6.5** | (Optional) rustls sidecar TLS in the executor                | Same `psql sslmode=require` flow; demonstrates `tls_impl="rustls"` GUC |
+| **6** | TLS in the backend via PG's `secure_open_server`             | `psql sslmode=require` connects via TCP and UDS; transports unchanged |
+| **6.5** | (Optional) rustls sidecar TLS in the backend                | Same `psql sslmode=require` flow; demonstrates `tls_impl="rustls"` GUC |
 | ~~7~~ | ~~`transport-http2-sql` as a `SessionTransport`~~             | **DEFERRED** — see [§4 Deferred for v0](#4-deferred-for-v0) |
 
 Phase 1 is, in practice, **the** integration spike: validating that a tokio
@@ -32,7 +32,7 @@ Bench harness arrives **before** transport #2 deliberately — without it,
 later "did this help?" questions are unanswerable.
 
 Deferred transports (io_uring, QUIC, AF_XDP, DPDK, RDMA, shmem-loopback)
-resume at "phase F1" in [../future-transports.md §4](../future-transports.md),
+resume at "phase F1" in [../future-transports.md §4](deferred/future-transports.md),
 gated on a stable in-scope baseline producing comparable benchmark numbers.
 The deferred `SessionTransport` path (phase 7 above) is a *prerequisite*
 for several of those (HTTP/2 + SQL, datagram QUIC, DPDK), so its
@@ -48,29 +48,29 @@ path (see [§4](#4-deferred-for-v0)); they will need ADRs when that path
 is un-deferred, not before. Deferred-only open questions for exotic
 transports (0-RTT QUIC, connection migration, RDMA protocol pairing, DPDK
 CPU budget) live in
-[../future-transports.md §5](../future-transports.md).
+[../future-transports.md §5](deferred/future-transports.md).
 
 1. **Auth handshake location.** ~~Open~~ **Resolved.** v0 handoff-path
-   transports delegate auth entirely to the executor, which runs PG's
+   transports delegate auth entirely to the backend, which runs PG's
    own `ClientAuthentication` (uses `pg_hba.conf` as normal). See
-   [handoff.md §3](handoff.md). When the deferred shm_mq path lands,
+   [backend-handoff.md §1](backend-handoff.md). When the deferred shm_mq path lands,
    FE/BE-aware transports on it will need to run auth themselves before
    calling `acquire`; a thin `protocol-pgwire-auth` helper crate
    wrapping SCRAM is a likely addition then.
-2. **Per-session executor pinning vs. session migration.** For FE/BE v3 the
-   natural model is pinned (session state lives in the executor). What's
-   the failure model when an executor dies mid-session? Replay vs. drop the
+2. **Per-session backend pinning vs. session migration.** For FE/BE v3 the
+   natural model is pinned (session state lives in the backend). What's
+   the failure model when a backend dies mid-session? Replay vs. drop the
    connection — we lean drop, but document it. For the v0 handoff path
    this is enforced by construction (the slot owns the fd). For the
    deferred shm_mq path the same policy is the default; see
-   [executor-pool.md §7](executor-pool.md#7-slot-allocation-pinning-and-lifetime).
+   [backend-pool.md §7](deferred/backend-pool.md#7-slot-allocation-pinning-and-lifetime).
 3. **TLS termination location.** ~~Open~~ **Resolved.** v0 handoff-path
-   transports terminate TLS in the executor (PG's `secure_open_server`
+   transports terminate TLS in the backend (PG's `secure_open_server`
    by default, optional rustls sidecar — see Q12). The deferred shm_mq
    path would have its transports terminate TLS themselves via the
    (also deferred) `tls-rustls` helper.
 4. **`shared_preload_libraries` requirement.** `pg_background` deliberately
-   makes SPL optional. We need it for the executor pool to be pre-spawned at
+   makes SPL optional. We need it for the backend pool to be pre-spawned at
    postmaster start. Trade-off: simpler config (SPL required) vs. broader
    compatibility (lazy pool spawn on first transport start).
 5. **Cargo feature defaults.** What's in `default-features`? Lean *minimal*
@@ -80,7 +80,7 @@ CPU budget) live in
    Option B (eventfd bridge), or Option C (PG-latch bridge thread). Only
    relevant to the deferred shm_mq path — the v0 handoff path needs no
    cross-process wakeup once the fd is handed off. See
-   [executor-pool.md §6](executor-pool.md#6-cross-process-wakeup-how-the-dispatcher-knows-theres-data).
+   [backend-pool.md §6](deferred/backend-pool.md#6-cross-process-wakeup-how-the-frontend-knows-theres-data).
 7. **Latch bridge fidelity (if we adopt Option C).** pgrx's
    `attach_signal_handlers` sets PG-side flags (`ConfigReloadPending`,
    `ShutdownRequestPending`). We additionally take `SIGHUP` / `SIGTERM` via
@@ -102,23 +102,23 @@ CPU budget) live in
     can let stateless transports (HTTP/2 SQL, datagram protocols) share
     a slot with `conn_id`-based multiplexing and explicit per-request
     session reset. See
-    [executor-pool.md §7](executor-pool.md#7-slot-allocation-pinning-and-lifetime).
+    [backend-pool.md §7](deferred/backend-pool.md#7-slot-allocation-pinning-and-lifetime).
 11. **`Payload` variant set** **[deferred]**. Today (in the deferred design):
     `Raw`, `Sql`, `Extended`. Do we need more (`CopyIn` / `CopyOut`
     streams, `Notify` subscribe, cursor fetch)? Add as needed when the
     shm_mq path lands; `Payload` is `#[non_exhaustive]` so it's a
     non-breaking change.
-12. **TLS implementation in the executor (handoff path).** Default to PG's
+12. **TLS implementation in the backend (handoff path).** Default to PG's
     `secure_open_server` (OpenSSL) or to a rustls sidecar thread? OpenSSL
     is zero-extra-code and reuses PG's `ssl_*` GUCs and `cert` auth
     method; rustls is memory-safe, modern, decoupled from system OpenSSL,
     and a research-interesting alternative. Lean *OpenSSL default,
     rustls opt-in via `pg_transport.tls_impl` GUC*. See
-    [handoff.md §4](handoff.md).
+    [backend-handoff.md §4](backend-handoff.md).
 13. **Per-listener TLS variation.** Handoff path currently uses cluster-
     wide PG `ssl_*` GUCs (one cert for the whole cluster). If a real
     deployment needs per-listener certs, add a `cert_path` to
-    `HandoffHints` and let the executor resolve it per-connection. Phase
+    `HandoffHints` and let the backend resolve it per-connection. Phase
     6 punts; reopen if asked.
 14. **Should we add a third trait + `QueryHandle` for stateless-only?**
     **[deferred]**. Pre-empts a slicing decision *within* the deferred
@@ -130,10 +130,10 @@ CPU budget) live in
     handoff-vs-session; over-splitting forces breaking changes when a
     transport later wants `BEGIN`/`COMMIT` continuity. Revisit when the
     shm_mq path lands.
-15. **Live pool resize.** `pg_transport.executor_pool_size` is read once
-    at dispatcher startup; phase 2 requires `stop()` / `start()` (or a
+15. **Live pool resize.** `pg_transport.backend_pool_size` is read once
+    at frontend startup; phase 2 requires `stop()` / `start()` (or a
     postmaster restart) to change it. Should `pg_transport.reload()` be
-    able to grow and/or shrink the pool without a dispatcher restart?
+    able to grow and/or shrink the pool without a frontend restart?
     Lean **yes for grow, no for shrink** at first:
     - *Grow* is cheap and safe — call `RegisterDynamicBackgroundWorker`
       for the additional slots, allocate their Unix control sockets,
@@ -154,16 +154,16 @@ CPU budget) live in
 Deferred-only risks (DPDK operational pain, polled-bridge cross-thread
 soundness, `quinn`/`tokio-uring` ABI churn during the deferral, RDMA hardware
 availability) live in
-[../future-transports.md §6](../future-transports.md).
+[../future-transports.md §6](deferred/future-transports.md).
 
 | Risk                                                              | Likelihood | Mitigation                                                                    |
 | ----------------------------------------------------------------- | ---------- | ----------------------------------------------------------------------------- |
 | tokio current-thread runtime × pgrx bgworker interaction unproven | High       | Phase-1 spike validates signals, latch, postmaster-death; ADR before phase 2  |
-| `SCM_RIGHTS` semantics across PG versions / OSes                  | Medium     | Wrap behind a compat shim in `executor` crate; Unix-only in v0                |
+| `SCM_RIGHTS` semantics across PG versions / OSes                  | Medium     | Wrap behind a compat shim in `backend` crate; Unix-only in v0                |
 | Tokio task panics tear down the runtime                           | Medium     | Wrap every `spawn_local` in `AssertUnwindSafe` + `catch_unwind`; log + close  |
 | Bench harness becomes its own quagmire                            | Medium     | Use `criterion` for in-process, plain `tokio-postgres` / raw clients for end-to-end |
 | Build matrix explosion across feature combinations                | Medium     | CI builds `default`, `all-transports`, and the minimal feature set            |
-| Deferred shm_mq path drifts out of sync with v0 changes           | Low        | Treat [executor-pool.md](executor-pool.md) as a versioned design draft; touch it whenever v0 changes invalidate an assumption |
+| Deferred shm_mq path drifts out of sync with v0 changes           | Low        | Treat [backend-pool.md](deferred/backend-pool.md) as a versioned design draft; touch it whenever v0 changes invalidate an assumption |
 
 ---
 
@@ -203,7 +203,7 @@ wakeup options A/B/C, and shared-slot mode for stateless callers.
 
 - API surface (trait, handle, `Payload`): [api.md §6](api.md).
 - Mechanism (DSM, `shm_mq`, envelope, frame demux, wakeup, slot model,
-  shutdown, errors): [executor-pool.md](executor-pool.md) (entire doc;
+  shutdown, errors): [backend-pool.md](deferred/backend-pool.md) (entire doc;
   banner at top marks it deferred).
 - Where it shows up in cross-references: every "deferred" / "shm_mq path"
   pointer across the design docs.
@@ -217,7 +217,7 @@ wakeup options A/B/C, and shared-slot mode for stateless callers.
   comparator for shm_mq numbers.
 
 When those conditions hold, phase 7 (`transport-http2-sql` as a
-`SessionTransport`) reopens with the design in [executor-pool.md](executor-pool.md)
+`SessionTransport`) reopens with the design in [backend-pool.md](deferred/backend-pool.md)
 as its starting point. The trait surface in [api.md §6](api.md) is
 intended to be additive: existing `HandoffTransport`s remain unchanged.
 
@@ -231,39 +231,39 @@ those are things we intend to build later.)
 
 ### 5.1 `SO_REUSEPORT` — executors accept their own connections
 
-**Idea.** Instead of the dispatcher being the single accepter that hands
-fds off to executors via `SCM_RIGHTS`, each executor binds its own
+**Idea.** Instead of the frontend being the single accepter that hands
+fds off to executors via `SCM_RIGHTS`, each backend binds its own
 listening socket on the same port with `SO_REUSEPORT`. The kernel hashes
-incoming 4-tuples across the listening processes, so each executor calls
+incoming 4-tuples across the listening processes, so each backend calls
 its own `accept()` and is the sole owner of the resulting fd. This would
 eliminate the ~10 µs handoff cost ([handoff.md §7](handoff.md)) and the
-dispatcher's role would shrink to lifecycle + configuration.
+frontend's role would shrink to lifecycle + configuration.
 
 **Why rejected.**
 
-- **Executors become async listeners.** Today the executor is sync `pgrx`
+- **Executors become async listeners.** Today the backend is sync `pgrx`
   C-side code that polls the per-slot UDS for handoffs and runs PG's
-  `PostgresMain`-equivalent on demand. With `SO_REUSEPORT` each executor
+  `PostgresMain`-equivalent on demand. With `SO_REUSEPORT` each backend
   would need its own accept loop, signal handling, postmaster-death
   watchdog — duplicating tokio-runtime machinery that C-3 deliberately
   keeps in one place. The simplification of "all PG-touching code is in
-  one sync path per executor, all async I/O is in the dispatcher" goes
+  one sync path per backend, all async I/O is in the frontend" goes
   away.
 - **Central control is lost.** Pre-handoff filtering (IP allowlist, TLS
   SNI, rate limiting, per-tenant policy) only makes sense if there's a
   single accept point. With `SO_REUSEPORT`, those would have to be
-  replicated per executor or moved to in-kernel BPF — both significant
+  replicated per backend or moved to in-kernel BPF — both significant
   scope expansions.
 - **Kernel hash, not framework choice.** `SO_REUSEPORT` distributes
   connections by `hash(src_ip, src_port, dst_ip, dst_port)`. The
   framework gives up the ability to say "send this connection to a
   specific slot" (e.g. for affinity, capacity-aware routing, custom load
   balancing). The handoff path retains that control because the
-  dispatcher picks the slot explicitly.
-- **Crashed-executor traffic blackholing.** When an executor dies, the
+  frontend picks the slot explicitly.
+- **Crashed-backend traffic blackholing.** When a backend dies, the
   kernel keeps hashing 1/N of incoming SYNs to its now-stale socket
-  queue until it's respawned. With the dispatcher-as-accepter model,
-  the dispatcher just stops picking the dead slot.
+  queue until it's respawned. With the frontend-as-accepter model,
+  the frontend just stops picking the dead slot.
 - **Cross-platform behaviour.** `SO_REUSEPORT` semantics differ between
   Linux (load-balancing), BSD (last-bind-wins or no load-balancing
   depending on variant), and Windows (no equivalent). Unix-first is
@@ -276,14 +276,14 @@ dispatcher's role would shrink to lifecycle + configuration.
 
 **What was removed when this was rejected.**
 
-- `pg_transport.dispatcher_workers` GUC (its only purpose was scaling
+- `pg_transport.frontend_workers` GUC (its only purpose was scaling
   the accept side via `SO_REUSEPORT`).
 - "Future work" pointer in [handoff.md §7](handoff.md).
 
 **Conditions under which we'd revisit.** Benchmarks (phase 4+) show
 handoff is a measurable production bottleneck *and* a clear use case
 needs sub-10-µs connection establishment that pgbouncer-style proxies
-can't satisfy. Until then: single dispatcher, pre-spawned executor pool,
+can't satisfy. Until then: single frontend, pre-spawned backend pool,
 `SCM_RIGHTS` handoff is the design.
 
 ---
@@ -304,6 +304,6 @@ can't satisfy. Until then: single dispatcher, pre-spawned executor pool,
 - rust-postgres family (used for the bench harness): <https://github.com/sfackler/rust-postgres>
 - tokio-rustls: <https://github.com/rustls/tokio-rustls>
 - Companion docs:
-  - [../future-transports.md](../future-transports.md) — deferred transports (QUIC, io_uring, AF_XDP, DPDK, RDMA, shmem-loopback) and the polled-transport bridge pattern
+  - [../future-transports.md](deferred/future-transports.md) — deferred transports (QUIC, io_uring, AF_XDP, DPDK, RDMA, shmem-loopback) and the polled-transport bridge pattern
   - [../background/pg_background.md](../background/pg_background.md) — DSM + `shm_mq` + `pq_redirect_to_shm_mq` mechanics we lift wholesale
   - [../background/omnigres.md](../background/omnigres.md) — listener-bgworker pattern + pool architecture we mirror

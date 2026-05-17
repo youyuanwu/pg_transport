@@ -8,22 +8,22 @@
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │  Transport plugins (workspace crates, linked into core)              │
-│    tcp_handoff │ uds_handoff │ …                                       │
+│    tcp_handoff │ uds_handoff │ …                                     │
 │                                                                      │
-│    Each transport is a self-contained network entry point. It owns  │
-│    its own accept loop and per-listener policy. The framework's     │
-│    only requirement in v0:                                          │
+│    Each transport is a self-contained network entry point. It owns   │
+│    its own accept loop and per-listener policy. The framework's      │
+│    only requirement in v0:                                           │
 │                                                                      │
-│      impl HandoffTransport — receives a HandoffHandle               │
+│      impl HandoffTransport — receives a HandoffHandle                │
 │                                                                      │
-│    A second trait (SessionTransport) is anticipated and deferred;   │
-│    see executor-pool.md.                                            │
+│    A second trait (SessionTransport) is anticipated and deferred;    │
+│    see backend-pool.md.                                              │
 │                                                                      │
-│    Everything below the `run` boundary is the transport's business.│
+│    Everything below the `run` boundary is the transport's business.  │
 └────────────────────────────┬─────────────────────────────────────────┘
                              │ HandoffHandle::handoff(fd)
 ┌────────────────────────────┴─────────────────────────────────────────┐
-│  Dispatcher Core  (crate `core`, the pgrx extension)                 │
+│  Frontend Core  (crate `core`, the pgrx extension)                   │
 │    - tokio current-thread runtime + LocalSet                         │
 │    - Transport registry (one map in v0; second map reserved for the  │
 │      deferred SessionTransport)                                      │
@@ -33,12 +33,12 @@
 └────────────────────────────┬─────────────────────────────────────────┘
                              │ sendmsg(SCM_RIGHTS) over per-slot UDS
 ┌────────────────────────────┴─────────────────────────────────────────┐
-│  Executor Pool  (in-tree crate `executor`)                           │
-│    - Pre-spawned bgworker backends                                   │
+│  Backend Pool  (in-tree crate `backend`)                             │
+│    - Pre-spawned PG backends (bgworkers)                             │
 │    - Owns inherited fd via MyProcPort; runs ProcessStartupPacket,    │
 │      TLS, ClientAuthentication, PostgresMain-equivalent loop         │
 │    - (DSM + shm_mq + pq_redirect_to_shm_mq plumbing for the          │
-│      deferred general path is captured in executor-pool.md but       │
+│      deferred general path is captured in backend-pool.md but        │
 │      not built in v0.)                                               │
 └──────────────────────────────────────────────────────────────────────┘
 ```
@@ -50,10 +50,10 @@ Three layers, sharply separated by interface size:
   io_uring sockets) plus per-listener policy (bind address, IP
   allowlist, optional pre-handoff metadata). The framework imposes one
   method.
-- **Dispatcher core** — the *thin* layer. tokio runtime, signal handling,
+- **Frontend core** — the *thin* layer. tokio runtime, signal handling,
   postmaster-death watchdog, transport registry, `HandoffHandle`
   vending, metrics. Knows nothing about wire protocols.
-- **Executor pool** — pre-spawned bgworker backends. Each receives the
+- **Backend pool** — pre-spawned backends (bgworkers). Each receives the
   handed-off fd, makes it `MyProcPort.sock`, and runs PG's own
   `ProcessStartupPacket` → `ClientAuthentication` → `PostgresMain`-equivalent
   loop on it. Structurally identical to default PostgreSQL with
@@ -61,14 +61,14 @@ Three layers, sharply separated by interface size:
 
 The framework deliberately does **not** define a `Connection` trait, an
 `AsyncRead`/`AsyncWrite` boundary, or a `Protocol` abstraction. Once the
-fd is handed off, the dispatcher has no further role for that connection.
+fd is handed off, the frontend has no further role for that connection.
 
-### One path into the executor pool (v0)
+### One path into the backend pool (v0)
 
 The handle a transport receives in its `run` method has one method:
 
 - **Handoff** — `HandoffHandle::handoff(fd)`. The transport holds an
-  `OwnedFd` on which the wire is FE/BE v3; the dispatcher hands the
+  `OwnedFd` on which the wire is FE/BE v3; the frontend hands the
   socket to a bgworker via `SCM_RIGHTS`; the bgworker runs
   `ProcessStartupPacket`, TLS, auth, and the FE/BE loop on it directly.
   Structurally identical to default PostgreSQL with `SCM_RIGHTS` in
@@ -80,19 +80,19 @@ A second trait — `SessionTransport`, receiving a `SessionHandle` with
 `execute(opts, payload)` and `acquire(opts).submit(payload)` — is
 planned for non-FE/BE wires (HTTP/2 + SQL, custom binary) and for FE/BE
 transports that need plaintext inspection. Its full design is in
-[executor-pool.md](executor-pool.md); it is **not** built in v0. The
-dispatcher's registry reserves a slot for its factory map so it can
+[backend-pool.md](deferred/backend-pool.md); it is **not** built in v0. The
+frontend's registry reserves a slot for its factory map so it can
 land without a registry-shape change.
 
 ---
 
 ## 2. Runtime integration (tokio × pgrx × PG signals)
 
-The dispatcher's bgworker entry point is roughly:
+The frontend's bgworker entry point is roughly:
 
 ```rust
 #[pg_guard]
-pub extern "C" fn pg_transport_dispatcher_main(_arg: pg_sys::Datum) {
+pub extern "C" fn pg_transport_frontend_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(
         SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM,
     );
@@ -104,22 +104,22 @@ pub extern "C" fn pg_transport_dispatcher_main(_arg: pg_sys::Datum) {
         .expect("tokio current-thread runtime");
 
     let local = tokio::task::LocalSet::new();
-    rt.block_on(local.run_until(dispatcher_main()));
+    rt.block_on(local.run_until(frontend_main()));
 }
 
-async fn dispatcher_main() {
+async fn frontend_main() {
     let mut sighup  = tokio::signal::unix::signal(SignalKind::hangup()).unwrap();
     let mut sigterm = tokio::signal::unix::signal(SignalKind::terminate()).unwrap();
     let mut pm_watchdog = tokio::time::interval(Duration::from_millis(500));
 
-    // Stand up the executor pool and a root shutdown token.
-    let pool     = ExecutorPool::start(executor_pool_config()).await;
+    // Stand up the backend pool and a root shutdown token.
+    let pool     = BackendPool::start(backend_pool_config()).await;
     let shutdown = ShutdownToken::new();
 
     // For each enabled row in pg_transport.transports, build the transport
     // and spawn its `run` on the LocalSet. Each transport owns its own
     // accept loop, per-conn tasks, parsing, and TLS internally — the
-    // dispatcher just holds the JoinHandles.
+    // frontend just holds the JoinHandles.
     let mut transports: Vec<JoinHandle<anyhow::Result<()>>> =
         spawn_transports_from_catalog(&pool, &shutdown).await;
 
@@ -161,7 +161,7 @@ Four integration points worth calling out:
    suspenders.
 3. **`LocalSet` for per-connection tasks.** Transports `spawn_local`
    per-connection handlers on the same `LocalSet`. Those handlers may
-   hold non-`Send` PG types (e.g. cached executor handles), which a
+   hold non-`Send` PG types (e.g. cached backend handles), which a
    multi-thread runtime would forbid. The price is no work-stealing, which
    we don't want anyway given C-2.
 4. **Supervisor never polls transports.** A `Transport::run` future is
@@ -179,5 +179,5 @@ Four integration points worth calling out:
   sketch).
 - [handoff.md](handoff.md) — what happens on the other side of
   `HandoffHandle::handoff`.
-- [executor-pool.md](executor-pool.md) — *deferred* design for the
+- [backend-pool.md](deferred/backend-pool.md) — *deferred* design for the
   shm_mq general path.
