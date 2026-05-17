@@ -14,7 +14,7 @@ pg_transport/
 │   │   ├── README.md
 │   │   ├── architecture.md
 │   │   ├── api.md
-│   │   ├── handoff.md
+│   │   ├── frontend-handoff.md
 │   │   ├── backend-handoff.md
 │   │   ├── transports.md
 │   │   ├── workspace.md           # ← this file
@@ -33,24 +33,34 @@ pg_transport/
 │   │   └── src/{transport.rs, handoff.rs, shutdown.rs, types.rs}
 │   ├── core/                      # the pgrx extension (cdylib via pgrx)
 │   │   └── src/{lib.rs, frontend.rs, registry.rs, guc.rs, catalog.rs, metrics.rs}
-│   ├── backend/                  # rlib; linked into core; backend-pool bgworker
-│   │   └── src/{pool.rs, worker_main.rs, handoff.rs}
+│   ├── backend/                  # rlib; linked into core; backend pool bgworker
+│   │   └── src/{pool.rs, slot.rs, wire.rs, spi_bridge.rs, hba.rs}
+│   │                              #   slot.rs = socket layer (backend-handoff.md);
+│   │                              #   wire.rs = Wire trait (backend-wire.md);
+│   │                              #   spi_bridge.rs = wire → SPI;
+│   │                              #   hba.rs = hba_getauthmethod wrapper.
+│   ├── wire-pgwire-v3/           # rlib; v0 Wire impl using sunng87/pgwire.
+│   │                              #   FE/BE v3 parse/encode, SCRAM exchange,
+│   │                              #   driver loop, error frames. See
+│   │                              #   docs/design/backend-wire.md §2.
 │   ├── handoff-listener/          # rlib; shared accept-loop helper used by
 │   │                              #   every HandoffTransport. Stream-shaped
 │   │                              #   API: takes Stream<Item=Result<OwnedFd>>,
 │   │                              #   drives it until shutdown. See
 │   │                              #   docs/design/transports.md §2.1.
-│   ├── transport-tcp-handoff/      # rlib; gated by core feature `tcp-handoff`
-│   │                              #   complete transport: TCP socket +
-│   │                              #   accept loop + SCM_RIGHTS handoff
-│   ├── transport-uds-handoff/      # rlib; gated by core feature `uds-handoff`
-│   │                              # — deferred transports (iouring-pgwire,
-│   │                              #   quic-quinn-pgwire, afxdp-*, dpdk-*,
-│   │                              #   rdma-*, shmem-loopback-*, http2-sql)
-│   │                              #   live in their own crates that will be
+│   ├── transport-tcp-handoff/      # rlib; the single v0 transport.
+│   │                              #   Complete transport: TCP socket +
+│   │                              #   accept loop + SCM_RIGHTS handoff.
+│   │                              #   Compiled into `core` unconditionally;
+│   │                              #   there is no Cargo feature gate.
+│   │                              #   Deferred transports (uds-handoff,
+│   │                              #   iouring-pgwire, quic-quinn-pgwire,
+│   │                              #   afxdp-*, dpdk-*, rdma-*,
+│   │                              #   shmem-loopback-*, http2-sql) live
+│   │                              #   in their own crates that will be
 │   │                              #   added when their phase begins. See
-│   │                              #   docs/design/deferred/future-transports.md and
-│   │                              #   docs/design/deferred/backend-pool.md.
+│   │                              #   docs/design/deferred/future-transports.md
+│   │                              #   and docs/design/deferred/backend-pool.md.
 │   ├── bench/                     # std binary; drives clients of each protocol
 │   └── testutil/                  # cluster spin-up helpers for integration tests
 └── README.md
@@ -69,62 +79,59 @@ Notes:
   definitions without dragging in the extension toolchain.
 - pgrx schema generation: only `core` runs `cargo pgrx`. Plugin crates have
   no SQL surface.
-- Deferred helper crates (`protocol-pgwire-v3`, `protocol-http2`,
-  `tls-rustls`) are not in the v0 tree — they only appear when the
-  deferred `SessionTransport` path lands. See
-  [transports.md §2](transports.md).
+- Deferred helper crates (`protocol-http2`, `tls-rustls`) are not in
+  the v0 tree — they only appear when the deferred `SessionTransport`
+  path lands. See [transports.md §2](transports.md). The pgwire-v3
+  wire is v0 (lives in `crates/wire-pgwire-v3/`, depends on the
+  [`pgwire`](https://github.com/sunng87/pgwire) crate).
 
-## 2. Cargo feature design
+## 2. Cargo features — deliberately none in v0
+
+`crates/core/Cargo.toml` has **no `[features]` table** in v0. The single
+v0 transport (`tcp_handoff`) is a direct dependency of `core` and is
+compiled in unconditionally:
 
 ```toml
 # crates/core/Cargo.toml
-[features]
-default = ["tcp-handoff", "uds-handoff"]
-
-# Transports (each is a complete network entry point). v0 ships handoff
-# transports only; SessionTransport-based features (http2-sql, etc.)
-# are deferred — see docs/design/deferred/backend-pool.md.
-tcp-handoff = ["dep:transport-tcp-handoff"]
-uds-handoff = ["dep:transport-uds-handoff"]
-
-# Convenience bundle
-all-transports = ["tcp-handoff", "uds-handoff"]
-
-# Deferred (see docs/design/deferred/future-transports.md and docs/design/deferred/backend-pool.md):
-# iouring-pgwire, quic-quinn-pgwire, afxdp-*, dpdk-*, rdma-*,
-# shmem-loopback-*, http2-sql. Each is added here as its phase begins.
+[dependencies]
+api               = { path = "../api" }
+backend           = { path = "../backend" }
+wire-pgwire-v3    = { path = "../wire-pgwire-v3" }
+handoff-listener  = { path = "../handoff-listener" }
+transport-tcp-handoff = { path = "../transport-tcp-handoff" }
+# (no [features] section)
 ```
 
-This mirrors Omnigres's `-DOMNIGRES_INCLUDE / -DOMNIGRES_EXCLUDE` mechanism
-with Cargo's native machinery.
+Features come back into the picture when a second transport lands
+(post-v0). At that point we'll decide — with a concrete second
+transport in front of us — whether to gate it on a feature, ship it
+always-on, or split into separate dist packages. Picking a feature
+shape now would be guessing.
 
 ## 3. Build commands
 
 ```bash
-# Default build — TCP + UDS, both speaking FE/BE v3
+# Build the extension
 cargo build -p pg_transport
-
-# Custom subset
-cargo build -p pg_transport --no-default-features \
-    --features "tcp-handoff,uds-handoff"
 
 # Schema + install (pgrx machinery)
 cargo pgrx install --release
 ```
 
+There is no `--features` flag in v0; there's nothing to toggle.
+
 ## 4. Registry — how transports get wired in
 
-A single explicit function in `core` registers built-in transports, gated
-by Cargo features. v0 has **one** trait (`HandoffTransport`) and
-therefore one factory map. A second map (`session: HashMap<&'static
-str, SessionFactory>`) is reserved in the `Registry` shape so the
-deferred `SessionTransport` (see [backend-pool.md](deferred/backend-pool.md))
-can land without a registry shape change; in v0 that map is always
-empty.
+A single explicit function in `core` registers built-in transports. v0
+has **one** trait (`HandoffTransport`) and one transport (`tcp_handoff`),
+so the registry is correspondingly small. A second map (`session:
+HashMap<&'static str, SessionFactory>`) is reserved in the `Registry`
+shape so the deferred `SessionTransport` (see
+[backend-pool.md](deferred/backend-pool.md)) can land without a
+registry-shape change; in v0 that map is always empty.
 
 We deliberately do **not** use the `inventory` crate or ctor-based
-auto-registration: explicit lines here keep the dependency graph greppable
-and the build matrix obvious.
+auto-registration: explicit lines here keep the dependency graph greppable.
 
 ```rust
 // crates/core/src/registry.rs
@@ -138,15 +145,12 @@ pub struct Registry {
 }
 
 pub fn register_builtin_transports(reg: &mut Registry) {
-    #[cfg(feature = "tcp-handoff")]
+    // The single v0 transport. Compiled in unconditionally; no Cargo
+    // feature gates this. A second handoff transport (uds-handoff, etc.)
+    // is deferred — see docs/design/deferred/future-transports.md and
+    // docs/design/deferred/backend-pool.md — and would add another
+    // insert here (and a corresponding crates/ dep) when it lands.
     reg.handoff.insert("tcp_handoff", transport_tcp_handoff::build);
-
-    #[cfg(feature = "uds-handoff")]
-    reg.handoff.insert("uds_handoff", transport_uds_handoff::build);
-
-    // Deferred (iouring, quic, afxdp, dpdk, rdma, http2-sql, …) will land
-    // in whichever map matches their trait. See docs/design/deferred/future-transports.md
-    // and docs/design/deferred/backend-pool.md.
 }
 ```
 
@@ -169,26 +173,27 @@ second arm that resolves through the `session` map. No new catalog
 column is required — the registry knows which category each name
 belongs to.
 
-## 5. Catalog ↔ feature interaction
+## 5. Catalog ↔ registry interaction
 
 The `pg_transport.transports` catalog table references a transport by name
 (e.g. `"tcp_handoff"`). The frontend resolves the name against the
-**compile-time** registry. If the user references a name that wasn't
-compiled in — or that is currently deferred — start-up fails with a clear
-error:
+**compile-time** registry. In v0 the only registered name is
+`tcp_handoff`; any other name fails with a clear error:
 
 ```
-ERROR:  transport "quic_quinn" referenced by transport id 7 is not present
+ERROR:  transport "uds_handoff" referenced by transport id 7 is not present
 DETAIL: this transport is currently deferred (see docs/design/deferred/future-transports.md).
-        Once it lands, rebuild pg_transport with `--features quic-quinn`.
 ```
 
 This keeps "configure via SQL" while trading runtime plugin choice for
-compile-time enablement.
+compile-time enablement. Once a second transport lands (post-v0) and
+the Cargo-features question is reopened (see [roadmap.md §2
+Q5](roadmap.md#2-open-questions)), the error message may grow a
+build-flag hint.
 
 ## See also
 
 - [api.md](api.md) — `HandoffTransport`, `HandoffFactory` (and the
   deferred `SessionTransport` / `SessionFactory`).
 - [configuration.md](configuration.md) — the catalog schema this resolves against.
-- [roadmap.md](roadmap.md) — phased plan; new transports map to new Cargo features.
+- [roadmap.md](roadmap.md) — phased plan; v0 has no Cargo features.

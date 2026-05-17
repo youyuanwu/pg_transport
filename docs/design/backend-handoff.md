@@ -1,230 +1,381 @@
-# Backend — running PG on the handed-off fd
+# Backend slot runner — the socket layer
 
 > Parent: [README.md](README.md)
-> Sibling: [handoff.md](handoff.md) · [api.md](api.md)
+> Sibling: [frontend-handoff.md](frontend-handoff.md) · [backend-wire.md](backend-wire.md) · [api.md](api.md)
 
-This doc describes the **BE (backend) side** of `pg_transport`'s v0
-fd-pass path. Its FE (transport / frontend / IPC) companion is
-[handoff.md](handoff.md), which covers when this path applies, how the
-per-slot control socket is set up and torn down, and the `sendmsg(SCM_RIGHTS)`
-mechanics that bring an fd into the backend in the first place.
+This doc describes the **socket layer** of the BE side of `pg_transport`'s
+v0 fd-pass path. The slot runner owns the fd, the per-slot lifecycle,
+and the per-handoff reset. It does **no** wire-protocol work — that's
+the [backend-wire.md](backend-wire.md) layer.
 
-This doc picks up at the moment the backend's main loop pulls one
-`(fd, hints)` off its per-slot control socket. It is **all** PG-side
-work — `ProcessStartupPacket`, TLS, `ClientAuthentication`,
-`PostgresMain`-equivalent, cancel routing, per-session cleanup — done
-inside a recycled bgworker rather than a freshly forked backend.
+Companions:
 
-The backend never speaks the IPC protocol directly; it just receives
-`OwnedFd`s and the small `HandoffHints` block accompanying each one. The
-deferred shm_mq general path's backend-side machinery lives separately
+| Layer (BE side)              | Doc                                  |
+| ---------------------------- | ------------------------------------ |
+| **Slot runner — socket layer (this doc)** | **backend-handoff.md**  |
+| Wire — TLS, auth, FE/BE v3 protocol | [backend-wire.md](backend-wire.md) |
+| Execution — SQL via SPI       | (implicit; see backend-wire.md §6)   |
+
+The FE/IPC companion ([frontend-handoff.md](frontend-handoff.md)) covers when this path
+applies, the per-slot control socket setup/teardown, and the
+`sendmsg(SCM_RIGHTS)` mechanics that bring an fd into the slot runner.
+
+The slot runner picks up at the moment its main loop pulls one
+`(fd, hints)` off the per-slot control socket; it ends when the wire
+layer's `run` returns and the slot runner performs the per-handoff
+reset.
+
+The slot runner never speaks the IPC protocol directly; it just
+receives `OwnedFd`s and a small `HandoffHints` block accompanying each
+one. The deferred shm_mq general path's slot-runner equivalent lives
 in [backend-pool.md](deferred/backend-pool.md).
 
 ---
 
-## 1. Per-handoff handler
+## 1. Pool spawning (`_PG_init` + `shared_preload_libraries`)
 
-The backend's per-handoff handler reuses PG's own protocol-startup code
-wholesale. We are not reimplementing FE/BE — we are calling the existing
-PG functions with `MyProcPort` set up around the inherited fd.
+Before there is a slot runner there has to be a *slot bgworker* for it
+to run in. v0 spawns the entire pool statically at postmaster start.
+
+### Requirement: `pg_transport` must be in `shared_preload_libraries`
+
+The operator's `postgresql.conf` must contain:
+
+```
+shared_preload_libraries = 'pg_transport'
+```
+
+This causes `pg_transport.so` to be loaded into the postmaster and
+the extension's `_PG_init()` to run inside the postmaster, very early
+in `PostmasterMain()` — the only context where PG accepts static
+`RegisterBackgroundWorker` calls.
+
+If SPL is missing, `_PG_init()` never runs in the postmaster; the pool
+is never registered; the first `SELECT pg_transport.start()` raises a
+clear `FATAL` ("pg_transport must be in shared_preload_libraries").
+We do not have a lazy-spawn fallback in v0. (Rationale and the
+rejected lazy path are in
+[roadmap.md §2 Q4](roadmap.md#2-open-questions).)
+
+### What `_PG_init()` does
 
 ```rust
-// crates/backend/src/handoff.rs (sketch; pgrx + raw pg_sys)
-
-unsafe fn handle_handoff(fd: OwnedFd, hints: HandoffHints) -> anyhow::Result<()> {
-    // 1. Build a fresh MyProcPort for this connection.
-    let mut port = init_port_from_fd(fd, &hints);
-    pg_sys::MyProcPort = &mut port;
-
-    // 2. PG's own startup-packet processor handles ALL protocol probes:
-    //    SSLRequest, GSSENCRequest, StartupMessageV3, CancelRequest.
-    //    For SSLRequest it calls secure_open_server directly.
-    //    For CancelRequest it does the cancel lookup and returns
-    //    a status that causes us to exit early.
-    if pg_sys::ProcessStartupPacket(&mut port, false, false) != STATUS_OK {
-        // CancelRequest handled, or fatal protocol error.
-        return Ok(());
+// crates/core/src/lib.rs (sketch)
+#[pg_guard]
+pub extern "C" fn _PG_init() {
+    // Refuse to proceed when not in shared_preload_libraries: in that
+    // case _PG_init runs in a regular backend, not the postmaster, and
+    // RegisterBackgroundWorker is illegal.
+    if !pg_sys::process_shared_preload_libraries_in_progress {
+        ereport!(FATAL, "pg_transport must be in shared_preload_libraries");
     }
 
-    // 3. Authentication. Uses pg_hba.conf as normal.
-    pg_sys::ClientAuthentication(&mut port);
+    register_gucs();   // pg_transport.backend_pool_size, .auth_source, …
 
-    // 4. PostgresMain-equivalent loop until the client disconnects.
-    run_backend_loop(&mut port)?;
+    // Validate required GUCs at postmaster start, BEFORE any tokio
+    // runtime or bgworker resources are allocated. A missing
+    // pg_transport.auth_source is an operator error we surface
+    // immediately rather than letting it FATAL inside a slot bgworker
+    // (which would degrade the pool silently). See configuration.md
+    // and Q4's resolution in roadmap.md.
+    guc::auth_source().unwrap_or_else(|| ereport!(
+        FATAL,
+        "pg_transport.auth_source must be set to 'pg_hba' or 'pg_transport'"
+    ));
 
-    // 5. Reset per-session state so the slot is ready for the next handoff.
-    reset_per_session_state();
-    Ok(())
+    let pool_size = guc::backend_pool_size();   // default max(4, num_cpus)
+    for slot_id in 0..pool_size {
+        BackgroundWorkerBuilder::new(&format!("pg_transport slot {slot_id}"))
+            .set_type("pg_transport_slot")
+            .set_library("pg_transport")
+            .set_function("pg_transport_slot_main")
+            .set_argument(Some((slot_id as i32).into()))
+            .set_start_time(BgWorkerStartTime::RecoveryFinished)
+            .set_restart_time(Some(Duration::from_secs(1)))
+            .enable_shmem_access(None)
+            .load();   // ← static; calls RegisterBackgroundWorker under the hood
+    }
 }
 ```
 
-`HandoffHints` is a tiny opaque struct passed in the `sendmsg` payload
-alongside the fd. Currently just one field:
+Once `PostmasterMain` finishes recovery, the postmaster spawns all
+`pool_size` workers; each runs `pg_transport_slot_main(slot_id)` which
+is the entry point for the slot runner loop in §2 below.
+
+### Why static (not `load_dynamic()`)
+
+pgrx also exposes `BackgroundWorkerBuilder::load_dynamic()`, which
+wraps PG's `RegisterDynamicBackgroundWorker` and lets a regular
+backend register workers at run time. We don't use it in v0 because:
+
+- The pool is sized once and lives for the whole cluster lifetime;
+  there is no per-request spawn pattern (unlike `pg_background`).
+- Static registration makes the postmaster the parent and the
+  restart-policy owner (`bgw_restart_time`). Dynamic registration
+  ties the worker's lifetime to the backend that registered it
+  unless `bgw_notify_pid` is zeroed — a foot-gun we don't need.
+- First-connection latency does not include pool spawn time.
+- One operational story: "the pool is up iff the postmaster is up."
+
+Live pool resize via `load_dynamic()` (grow-only) is sketched in
+[roadmap.md §2 Q15](roadmap.md#2-open-questions) and **deferred** —
+static sizing at `_PG_init()` is sufficient for v0 and the phase-5
+bench harness.
+
+### What `_PG_init()` does *not* do
+
+- It does not start the tokio runtime in the postmaster. Runtimes
+  are per-slot, created inside each bgworker's `pg_transport_slot_main`
+  (see [§3 Async / threading model](#3-async--threading-model)).
+- It does not register the frontend bgworker — the frontend is
+  spawned dynamically by `pg_transport.start()` from a SQL backend
+  (the FE/IPC-side mechanics live in
+  [frontend-handoff.md](frontend-handoff.md)).
+- It does not bind any sockets or read the catalog. All of that is
+  deferred to the frontend bgworker.
+
+---
+
+## 2. The slot runner loop
+
+```rust
+// crates/backend/src/slot.rs (sketch; pgrx + raw pg_sys + our wire trait)
+
+fn run_slot<W: Wire>(slot: SlotCtx) -> anyhow::Result<()> {
+    loop {
+        // Block on the per-slot UDS control socket; receive one
+        // (fd, HandoffHints) per iteration.
+        let (fd, hints) = match slot.unix_ctrl.recvmsg() {
+            Ok(msg)               => decode_handoff(msg)?,
+            Err(EofOrShutdown)    => return Ok(()),
+        };
+
+        // the wire-layer ctx for this handoff; bundles slot.shutdown,
+        // the SPI bridge handle, hints.tls_allowed, etc.
+        let ctx = WireCtx::new(&slot, hints);
+
+        // Hand the fd to the wire layer and let it run until the client
+        // disconnects (or the wire itself errors fatally, or shutdown).
+        // We don't see any protocol bytes; the wire owns them.
+        let outcome = W::run(fd, ctx);
+
+        // Per-handoff reset, regardless of how the wire returned.
+        // Drops the wire's per-session state and any SPI artefacts
+        // the wire created (prepared statements, portals, temp tables,
+        // GUCs touched via SET).
+        reset_per_handoff_state();
+
+        // Log fatal wire errors; non-fatal ones are part of normal
+        // disconnects and don't need attention.
+        if let Err(e) = outcome { tracing::warn!(?e, "wire run failed"); }
+    }
+}
+```
+
+The slot runner never:
+
+- Reads or writes the fd directly (it doesn't even know what wire
+  format the bytes are in).
+- Calls PG's `ProcessStartupPacket`, `ClientAuthentication`,
+  `secure_open_server`, or `PostgresMain` (see
+  [backend-wire.md](backend-wire.md) for the rationale).
+- Opens or closes TLS sessions.
+- Looks at FE/BE message types.
+
+Everything in that list is the wire layer's job. The slot runner is
+deliberately small: a `recvmsg` loop, a wire instantiation, a wire
+run, and a reset.
+
+> **Silent handoff loss — resolved as accept (option b).** If the
+> backend dies between the frontend's last observation and the
+> `recvmsg` above, the kernel buffers the SCM_RIGHTS payload but
+> nobody consumes it — the current client connection is orphaned
+> (TCP RST). The dead slot is detected on the *next* `sendmsg →
+> EPIPE` and respawned then. No per-handoff ack; zero added cost on
+> the happy path. Full reasoning in
+> [roadmap.md §2 Q21](roadmap.md#2-open-questions).
+
+---
+
+## 3. Async / threading model
+
+The slot runner runs on the bgworker's **main thread — the only
+thread**. That thread also hosts a small **single-threaded tokio
+runtime** that the wire layer uses; everything else is sync.
+
+```
+backend bgworker process (single thread)
+├─ slot runner loop                              (plain sync, no tokio)
+│    loop {
+│      let (fd, hints) = unix_ctrl.recvmsg();   // blocking syscall
+│      runtime.block_on(W::run(fd, build_ctx())); // ← tokio enters here
+│      reset_per_handoff_state();
+│    }
+│
+└─ runtime: tokio::runtime::Builder::new_current_thread()
+             .enable_all()
+             .build()                              // built once at bgworker boot
+                                                   // reused across handoffs
+```
+
+### Why tokio appears in the backend at all
+
+Forced by the choice in [backend-wire.md §2](backend-wire.md) to reuse
+the [`pgwire`](https://github.com/sunng87/pgwire) crate and
+`tokio-openssl` for TLS. Both expose `tokio::io::AsyncRead` /
+`AsyncWrite`-shaped APIs and `async fn` trait methods; running them
+needs an async executor. A hand-rolled sync wire (using `openssl`'s
+sync `SslStream` and our own FE/BE codec) would avoid tokio entirely
+on this side, at the cost of giving up pgwire's protocol code.
+
+### What this runtime is *not*
+
+- **Not a concurrency primitive.** Exactly one task runs on it (the
+  current handoff's `W::run` future). One client per slot at a time,
+  by construction.
+- **Not multi-threaded.** That would violate C-2 (PG state is
+  single-threaded). Current-thread only.
+- **Not a `LocalSet`-bearer.** No `spawn_local`; the wire's `run`
+  future is the whole workload. The frontend uses `LocalSet` because
+  it multiplexes per-transport tasks; the backend has nothing to
+  multiplex.
+- **Not rebuilt per handoff.** One `Runtime` per bgworker, reused for
+  every `block_on(...)`. Building tokio runtimes costs hundreds of
+  microseconds; per-handoff construction would dominate connection
+  setup.
+- **Not running the slot runner loop itself.** The `recvmsg` loop and
+  the per-handoff reset are plain sync code *outside* `block_on`. The
+  runtime is entered per handoff and exited when the wire returns.
+
+It's effectively a **trampoline / executor for the wire's async
+future**, not a scheduler.
+
+### SPI blocking the runtime is fine
+
+When the wire layer calls `SPI_execute` (or any other `SPI_*`), the
+running task blocks the executor synchronously. There's no other task
+to schedule and no other client to serve on this slot, so nothing
+starves. The runtime's I/O reactor is also idle during SPI execution
+because the only fd the wire was watching is the client fd, and the
+client won't see any more bytes until SPI returns and the wire emits
+row data anyway.
+
+### C-2 compliance
+
+Satisfied by construction:
+
+- The runtime runs only on the bgworker's main thread.
+- All SPI calls happen synchronously from within the single task, on
+  that same thread.
+- No work-stealing, no helper threads (no `block_in_place`, which
+  would require a multi-thread runtime anyway).
+
+### Cost
+
+- ~1 MB of resident state per bgworker (timer wheel + I/O reactor
+  allocations). With `backend_pool_size = max(4, num_cpus)` that's
+  small in absolute terms.
+- Per-handoff `block_on` entry cost is microseconds (no runtime
+  construction; just polling the first frame of the wire's `run`
+  future).
+- Per pgwire call: whatever `Future::poll` adds over a sync call —
+  negligible next to `read`/`write` syscalls or SPI execution.
+
+---
+
+## 4. `HandoffHints`
 
 ```rust
 #[repr(C)]
 pub struct HandoffHints {
-    /// Whether the listener allowed TLS. The backend honours this when
-    /// deciding to reply 'S' to SSLRequest. Other PG-level TLS config
-    /// (cert path, ciphers, min version) comes from PG GUCs, not here.
+    /// Whether the listener allowed TLS. The wire layer honours this
+    /// when deciding to reply 'S' to SSLRequest. Other TLS config
+    /// (cert path, ciphers, min version) is GUC-driven; see
+    /// backend-wire.md §5.
     pub tls_allowed: bool,
 }
 ```
 
-We deliberately keep this tiny. Per-listener cert variation is not
-supported in phase 6; everyone shares the cluster's `ssl_cert_file`.
+We deliberately keep this tiny in v0. Per-listener cert variation
+(adding a `cert_id` field) is a likely v0.x extension; see
+[backend-wire.md §5](backend-wire.md).
 
 ---
 
-## 2. Per-session state reset
+## 5. Per-handoff state reset
 
 Between handoffs on the same slot, we must purge anything that could
-leak from session to session:
+leak from session to session. The reset is split by who owns the
+state:
 
-| State                             | How we reset                                                          |
-| --------------------------------- | --------------------------------------------------------------------- |
-| GUCs touched by `SET LOCAL` / `SET` | `ResetAllOptions()`                                                  |
-| Temp tables                       | drop session's temp namespace                                          |
-| Prepared statements               | `DropAllPreparedStatements()`                                          |
-| Cursors                           | `PortalDrop` over the session's portals                                |
-| Per-session memory contexts       | `MemoryContextDelete(MessageContext)`; reinit                          |
-| `MyProcPort`                      | free `peer_dn`, TLS state, then null `MyProcPort`                      |
-| Backend ID                        | unchanged (slot reuses its bgworker `PGPROC` slot across handoffs)     |
+| Owned by  | State                              | How we reset                                             |
+| --------- | ---------------------------------- | -------------------------------------------------------- |
+| Wire      | Prepared-statement / portal maps   | Wire drops its `HashMap`s on return; no slot-runner work |
+| Wire      | TLS session, auth state            | Wire owns; gone when the wire struct is dropped          |
+| SPI       | Prepared plans (per-name `SPIPlan`) | `SPI_freeplan` on each name the wire registered (the wire keeps the list) |
+| PG        | GUCs touched by `SET LOCAL` / `SET` | `ResetAllOptions()`                                      |
+| PG        | Temp tables                        | drop session's temp namespace                            |
+| PG        | Portals                            | `PortalDrop` over the slot's portals                     |
+| PG        | Per-session memory contexts        | `MemoryContextDelete(MessageContext)`; reinit            |
+| Pool slot | Bgworker PGPROC slot, `MyDatabaseId` | unchanged (intentionally — that's the *point* of the pool) |
 
-This is roughly `DISCARD ALL` plus a few extras. PG already exposes most
-of these as discrete calls; we wrap them in `reset_per_session_state()`.
-
----
-
-## 3. PostgresMain-equivalent
-
-We don't call `PostgresMain()` directly because it has `proc_exit` calls
-that would terminate the bgworker after one connection. Instead we
-extract its inner loop into a callable function:
-
-```rust
-fn run_backend_loop(port: &mut Port) -> anyhow::Result<()> {
-    loop {
-        let msg_type = pg_sys::pq_getbyte();
-        if msg_type < 0 { return Ok(()); }    // EOF / disconnect
-        match msg_type as u8 {
-            b'Q' => exec_simple_query(port),
-            b'P' | b'B' | b'E' | b'D' | b'C' | b'S' | b'H' => exec_extended_protocol(msg_type as u8),
-            b'X' => return Ok(()),             // Terminate
-            b'F' => exec_function_call(port),
-            b'c' | b'd' | b'f' => exec_copy_data(msg_type as u8),
-            _    => bail!("unsupported FE message {msg_type}"),
-        }
-    }
-}
-```
-
-For phase 3 the body delegates to the underlying PG functions
-(`exec_simple_query`, `exec_parse_message`, …) which are all already
-linkable. Phase 4 (bench harness) tells us whether anything's missing.
+The shrunken responsibility vs. default PG: we are not freeing
+`MyProcPort.peer_dn` or tearing down a libpq-style port, because we
+never built one. The wire layer's own constructs are its own
+`Drop` impls.
 
 ---
 
-## 4. TLS handling
+## 6. Slot lifecycle
 
-TLS is **entirely the backend's concern**. The frontend never sees
-plaintext; it never sees ciphertext beyond the kernel fd it forwarded.
-The transport's `options jsonb` does not carry cert paths.
+The slot runner doesn't make any choices about the slot's lifetime
+itself — that's policy enforced by the pool above. What it observes
+and responds to:
 
-Two implementations the backend can be configured to use, by GUC:
+| Event                              | Slot runner's response                                                              |
+| ---------------------------------- | ----------------------------------------------------------------------------------- |
+| `recvmsg` returns a handoff        | Build `WireCtx`, run the wire, reset, loop                                          |
+| `recvmsg` returns EOF              | Frontend's end of the per-slot UDS closed; clean exit                               |
+| `shutdown.cancelled()` fires       | Stop accepting new handoffs; if a wire is currently running, wait for it to observe the shutdown token via `WireCtx`; reset and exit |
+| Wire returns `Err`                 | Log, reset, continue the loop (slot remains in the pool)                            |
+| Postmaster-death detected          | Behaves the same as shutdown                                                        |
 
-| `pg_transport.tls_impl` | TLS code path                          | Notes                                 |
-| ----------------------- | -------------------------------------- | ------------------------------------- |
-| `"openssl"` *(default)* | PG's `secure_open_server` (`be-secure-openssl.c`) | Uses cluster's `ssl_*` GUCs; mTLS via `pg_hba.conf cert`; `pg_stat_ssl` populated |
-| `"rustls"`              | rustls in a sidecar OS thread inside the backend | Uses `pg_transport.rustls_cert` / `pg_transport.rustls_key`; mTLS via rustls's `WebPkiClientVerifier`; metrics surfaced via `pg_transport.list_v2()` |
-
-Both run **inside the backend process**, so TLS CPU work parallelises
-across slots the same way it does in default PG (one TLS handshake per
-backend at a time). Neither bottlenecks on the frontend's tokio thread.
-
-The rustls case uses a sync OS thread per connection that drives rustls
-state machines against the inherited TCP fd, exposes a plaintext UDS
-fd to PG via `MyProcPort.sock`, and exits when the connection closes.
-The sidecar thread strictly does not touch PG state (C-2). This is the
-same pattern that would have been needed in the frontend to run rustls
-there; relocating it to the backend preserves PG's parallel scaling.
-
-See [open Q1 in roadmap.md](roadmap.md) — defaulting to OpenSSL vs rustls.
-
-### What the transport does for TLS
-
-Nothing. The transport sets `hints.tls_allowed = (catalog row says TLS
-is enabled)` and that's it. Cert paths, ciphers, protocol versions are
-all PG-side configuration.
-
-### Per-listener TLS variation
-
-If you want listener A to allow TLS but listener B to forbid it, that's
-expressed entirely via `hints.tls_allowed`. The backend reads the bit
-and replies 'S' or 'N' accordingly. Per-listener *cert* variation is not
-supported in phase 6 (the backend uses the cluster's `ssl_*` GUCs);
-phase 7+ may add per-handoff cert selection if needed.
+The slot runner has no concept of "session" beyond the bounds of one
+wire `run` call.
 
 ---
 
-## 5. CancelRequest handling
+## 7. Limitations specific to the slot layer
 
-PG's `ProcessStartupPacket` handles CancelRequest natively — it looks up
-the target backend by `(pid, secret_key)` in PG's shared cancel-request
-state and sends SIGINT. We just need to make this work across our
-multi-process pool model:
+- **One wire instance per handoff.** The slot runner doesn't multiplex
+  wire-layer sessions onto one slot. (The framework's [comparison.md](comparison.md)
+  discussion of "slot pinning" applies here unchanged.)
+- **Wire trait is compile-time, not configurable per row.** A slot
+  runs whichever `W: Wire` the build was compiled with. In v0 that's
+  always `pgwire_v3::PgwireV3`. A future "let the catalog row pick the
+  wire" feature would require either pluggable factories (the
+  framework already has those for transports — same shape) or one slot
+  pool per wire kind.
+- **No transport-side message inspection.** The transport's
+  [frontend-handoff.md §5](frontend-handoff.md) limitation pulls all the way through:
+  the slot runner doesn't see protocol bytes either. Anything that
+  needs them must live in the wire layer.
 
-1. When a backend accepts a handoff and completes authentication, it
-   publishes its `(MyProc->backendId, BackendKey)` into a shared-memory
-   map keyed by `(pid, secret_key)`. The map lives in our pool's main
-   DSM segment, alongside the per-slot data.
-2. The StartupMessage handler in the backend advertises `(MyProc->pid,
-   secret_key)` to the client, same as default PG.
-3. When a *different* backend receives a CancelRequest fd, its
-   `ProcessStartupPacket` runs PG's cancel logic, which consults the
-   shared map (we patch PG's cancel-lookup to also consult our map) and
-   signals the target backend.
-
-Implementation detail: PG already provides `SendCancelRequest` and a
-backend-lookup hook; we register our pool's map as an additional source
-for that hook. If the hook isn't usable for our case, we fall back to a
-plain SIGINT to the target backend's PID (which we read from our map),
-since the target's signal handler already does the right thing.
-
----
-
-## 6. Backend-side limitations
-
-- **Per-listener cert variation is not supported in phase 6.** All
-  listeners using TLS share the cluster's `ssl_cert_file`. Per-handoff
-  cert selection (driven from `HandoffHints`) is a phase 7+ extension.
-- **Cancel-map dependency.** We need a small shared-memory map for
-  cross-pool cancel routing; this is extra mechanism over default PG's
-  built-in cancel state.
-- **`PostgresMain` is not called directly.** We extract the inner
-  message loop into `run_backend_loop` (§3) because `PostgresMain` calls
-  `proc_exit` which would terminate the bgworker after one connection.
-  Any new FE message types added to PG must be added to the match arm
-  in `run_backend_loop`.
-- **Per-session state reset must keep up.** Every new piece of
-  per-session backend state PG introduces is a potential cross-handoff
-  leak. The reset table (§2) is exhaustive for today's PG but needs
-  review on every PG major-version bump.
-
-(FE/IPC-side limitations — no transport-side inspection, slot pinning,
-OS portability of `SCM_RIGHTS` — live in [handoff.md §5](handoff.md).)
+(Wire-layer-side concerns — TLS, auth, extended-query state — live in
+[backend-wire.md](backend-wire.md). Cancel routing is deferred from v0;
+design in [deferred/cancel-routing.md](deferred/cancel-routing.md).)
 
 ---
 
 ## See also
 
-- [handoff.md](handoff.md) — the FE/IPC side: when this path applies,
+- [frontend-handoff.md](frontend-handoff.md) — the FE/IPC side: when this path applies,
   per-slot control socket setup/teardown, `SCM_RIGHTS` mechanics, the
-  end-to-end per-connection sequence, performance ceiling, and the
-  comparison with default PG's `fork`-based model.
+  end-to-end per-connection sequence.
+- [backend-wire.md](backend-wire.md) — the layer this slot runner
+  drives: wire trait, the v0 pgwire-v3 implementation via the
+  `pgwire` (sunng87) crate, TLS, auth, SPI bridge, open questions.
 - [api.md](api.md) — `HandoffHandle::handoff(fd)`, the only thing a
   transport calls.
-- [backend-pool.md](deferred/backend-pool.md) — *deferred* design for the
-  backend side of the shm_mq general path.
-- [../background/pg_background.md](../background/pg_background.md) — the
-  pg_background mechanism the deferred shm_mq path lifts.
+- [backend-pool.md](deferred/backend-pool.md) — *deferred* design for
+  the slot-runner-equivalent on the shm_mq general path.

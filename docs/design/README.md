@@ -38,9 +38,16 @@ leave room for it.
 **Single path into the backend pool (v0).** Transports hold a kernel
 `OwnedFd`, speak FE/BE v3, implement the **`HandoffTransport`** trait,
 and receive a **`HandoffHandle`** — one method, `handoff(fd)`, which
-hands the socket to a bgworker; the bgworker runs `ProcessStartupPacket`
-/ TLS / auth / FE/BE on it directly, structurally identical to default
-PostgreSQL with `SCM_RIGHTS` in place of `fork`. See [handoff.md](handoff.md).
+hands the socket to a bgworker. Inside the bgworker, a slot runner
+(socket layer) drives a wire layer that speaks FE/BE v3 to the client
+on the inherited fd. The wire layer is **our** Rust code (built on
+the [`pgwire`](https://github.com/sunng87/pgwire) crate for parsing /
+encoding / SCRAM, with rust-openssl for TLS and PG's `pg_hba.conf`
+lookup helpers for auth dispatch) — we deliberately don't reuse PG's
+`ProcessStartupPacket` / `ClientAuthentication` / `secure_open_server`
+/ `PostgresMain`. SQL execution still goes through `SPI_*`. See
+[frontend-handoff.md](frontend-handoff.md), [backend-handoff.md](backend-handoff.md),
+and [backend-wire.md](backend-wire.md).
 
 ---
 
@@ -50,14 +57,17 @@ PostgreSQL with `SCM_RIGHTS` in place of `fork`. See [handoff.md](handoff.md).
 |---|---|---|
 | [architecture.md](architecture.md) | active | 3-layer architecture diagram + runtime integration (tokio × pgrx × signals) |
 | [api.md](api.md) | active | The framework's trait surface: `HandoffTransport`, `HandoffHandle`, `ShutdownToken`, plus an end-to-end example transport. Deferred surface (`SessionTransport`, `SessionHandle`) sketched at end. |
-| [handoff.md](handoff.md) | active | The v0 path — **FE/IPC side**: when to use, per-slot control-socket setup/teardown, end-to-end per-connection flow, comparison with default PG, performance. Symmetric with default PG (`SCM_RIGHTS` replaces `fork`). |
-| [backend-handoff.md](backend-handoff.md) | active | The v0 path — **BE side**: per-handoff handler, per-session reset, `PostgresMain`-equivalent, TLS (PG OpenSSL or rustls sidecar), cancel routing, backend-side limitations. |
+| [frontend-handoff.md](frontend-handoff.md) | active | The v0 path — **FE/IPC side**: when to use, per-slot control-socket setup/teardown, end-to-end per-connection flow, comparison with default PG, performance. The dispatch model mirrors default PG (`SCM_RIGHTS` replaces `fork`); what runs on the fd is our wire layer. |
+| [backend-handoff.md](backend-handoff.md) | active | The v0 path — **BE socket layer**: slot runner, fd receipt, slot lifecycle, per-handoff reset. |
+| [backend-wire.md](backend-wire.md) | active | The v0 path — **BE wire layer**: Wire trait + `pgwire-v3` implementation via the `pgwire` (sunng87) crate; TLS via rust-openssl; auth via `hba_getauthmethod` + Rust-side method impls; SPI bridge; open Qs. |
 | [backend-pool.md](deferred/backend-pool.md) | **deferred** | Design draft for the shm_mq general path (`SessionTransport` + `SessionHandle`: `execute` / `acquire` / `submit`). Not implemented in v0. |
+| [deferred/cancel-routing.md](deferred/cancel-routing.md) | **deferred** | Cancel-routing options + recommended design (frontend-owned registry over a multi-tag per-slot UDS; `kill(SIGINT)` for the interrupt). v0 drops `CancelRequest` fds silently. |
 | [transports.md](transports.md) | active | Per-transport notes for the current-scope set + helper crates the framework ships |
-| [workspace.md](workspace.md) | active | Cargo workspace layout, feature flags, build commands |
+| [workspace.md](workspace.md) | active | Cargo workspace layout, build commands (v0 has no Cargo features) |
 | [configuration.md](configuration.md) | active | Catalog tables, GUCs, SQL surface, observability/metrics |
 | [comparison.md](comparison.md) | active | How `pg_transport` relates to pgbouncer, Odyssey, `pg_background`, Omnigres, and default PG |
 | [roadmap.md](roadmap.md) | active | Phased build plan, open questions, risks, references |
+| [testing.md](testing.md) | active | Correctness testing strategy: subsystem risk register, test seams the design must provide, harness shape, error injection, per-phase acceptance criteria |
 
 Companion docs (outside this design dir):
 
@@ -83,10 +93,13 @@ Companion docs (outside this design dir):
    (`SessionHandle`) is planned for the deferred general path; it will
    be the *only* place that surface widens.
 4. **Pre-spawned backend pool** — backends (bgworkers) that take ownership
-   of handed-off kernel sockets and run PG's `ProcessStartupPacket` /
-   `ClientAuthentication` / `PostgresMain`-equivalent on them. The
-   `pg_background`-style DSM + `shm_mq` + `pq_redirect_to_shm_mq` machinery
-   is **deferred** along with `SessionTransport`.
+   of handed-off kernel sockets via a slot runner
+   ([backend-handoff.md](backend-handoff.md)), and run a wire layer
+   ([backend-wire.md](backend-wire.md)) on the fd that implements FE/BE
+   v3 ourselves on top of the `pgwire` crate. SQL execution goes
+   through `SPI_*`. The `pg_background`-style DSM + `shm_mq` +
+   `pq_redirect_to_shm_mq` machinery is **deferred** along with
+   `SessionTransport`.
 5. **Benchmark harness** built into the workspace from day one: per-op
    latency histogram, connection-setup cost, throughput, CPU per request.
    Comparable numbers across transport choices are the whole point.
@@ -169,9 +182,13 @@ and `block_on` the frontend's top-level `async fn`. Choice notes:
   non-`Send` types (e.g. `Rc`, pgrx handles); `LocalSet::spawn_local`
   permits this safely on a current-thread runtime.
 - **`enable_all`** turns on tokio's I/O and time drivers.
-- **`async_trait`** for the plugin traits initially — cheap and
-  object-safe. Migrate to native `async fn in traits` when the surface
-  stabilises and object-safety story matures.
+- **No `#[async_trait]`** — the `HandoffTransport` trait returns a
+  manual `Pin<Box<dyn Future + 'static>>` (aliased as `RunFuture`).
+  Reasons in [api.md §1](api.md#1-the-handofftransport-trait): one
+  async method called once per transport lifetime; same runtime shape
+  as the macro desugar; no proc-macro dep in `crates/api/`; cleaner
+  errors; trivial migration to native `async fn in traits` once
+  `dyn`-safe.
 - **No `tokio::task::block_in_place`** — it requires a multi-thread
   runtime. For blocking work (e.g. synchronous SPI from a debug helper)
   we accept that the runtime stalls; if that becomes a problem we move
@@ -188,7 +205,7 @@ different port / socket family).
 ## Where to go next
 
 - New here? Read [architecture.md](architecture.md) next, then
-  [api.md](api.md), then [handoff.md](handoff.md) (FE/IPC) +
+  [api.md](api.md), then [frontend-handoff.md](frontend-handoff.md) (FE/IPC) +
   [backend-handoff.md](backend-handoff.md) (BE).
 - Looking up a specific decision? Use the index above.
 - Planning to contribute? Read [roadmap.md](roadmap.md) and

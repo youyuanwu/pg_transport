@@ -1,13 +1,15 @@
 # The framework's trait surface (minimal by design)
 
 > Parent: [README.md](README.md)
-> Sibling: [architecture.md](architecture.md) · [handoff.md](handoff.md)
+> Sibling: [architecture.md](architecture.md) · [frontend-handoff.md](frontend-handoff.md)
 
-Transport plugins are regular Rust crates in the workspace, linked into the
-`core` extension at build time and gated by Cargo features. No dynamic
-loading, no FFI ABI, no `libloading`, no `unsafe extern "C"`. Within that
-build model, the framework standardises **only what must talk to
-PostgreSQL**:
+Transport plugins are regular Rust crates in the workspace, linked into
+the `core` extension at build time. v0 ships a single transport
+(`tcp_handoff`) compiled in directly — there are no Cargo features in
+v0 (see [workspace.md §2](workspace.md#2-cargo-features--deliberately-none-in-v0)).
+No dynamic loading, no FFI ABI, no `libloading`, no `unsafe extern "C"`.
+Within that build model, the framework standardises **only what must
+talk to PostgreSQL**:
 
 | Surface                  | Defined by framework? | Notes                                                                          |
 | ------------------------ | --------------------- | ------------------------------------------------------------------------------ |
@@ -16,10 +18,10 @@ PostgreSQL**:
 | Cancellation             | ✅ `ShutdownToken`    | Async-wakeable signal; transport must honour it                               |
 | Catalog → instance       | ✅ Config + factory   | One factory per transport; registry has one map (a second is reserved for the deferred `SessionTransport`) |
 | Byte I/O model           | ❌                    | Transport's choice (tokio, mio, future io_uring, raw threads, …)              |
-| Wire protocol parsing    | ❌ (and not needed)   | After `handoff(fd)` returns, the backend runs FE/BE inside PG                |
-| Connection-state model   | ❌ (and not needed)   | The backend's `PostgresMain`-equivalent owns the session                     |
-| TLS termination          | ❌ (and not needed)   | Backend-side; transport just sets `tls_allowed` in the handoff hints         |
-| Auth flow                | ❌ (and not needed)   | Backend runs PG's `ClientAuthentication`                                      |
+| Wire protocol parsing    | ❌ (and not needed)   | The backend wire layer ([backend-wire.md](backend-wire.md)) parses FE/BE v3 itself via the `pgwire` crate |
+| Connection-state model   | ❌ (and not needed)   | The backend wire layer owns the FE/BE message loop and SPI dispatch |
+| TLS termination          | ❌ (and not needed)   | Backend wire-layer-side (rust-openssl); transport just sets `tls_allowed` in the handoff hints |
+| Auth flow                | ❌ (and not needed)   | Backend wire layer: `hba_getauthmethod` lookup + our Rust method execution (SCRAM via `pgwire`) |
 | Threading inside `run`   | ❌                    | Transport's choice (subject to C-2 — no PG access off the bgworker main thread) |
 
 Most of the cells marked ❌ are "not needed" rather than "transport's
@@ -114,18 +116,32 @@ impl HandoffHandle {
     /// directly. Returns when the client disconnects.
     ///
     /// Use this when the transport has an OwnedFd and the wire is FE/BE.
-    /// See [handoff.md](handoff.md) for the SCM_RIGHTS mechanism, the
+    /// See [frontend-handoff.md](frontend-handoff.md) for the SCM_RIGHTS mechanism, the
     /// per-slot control socket, and the backend-side TLS choices.
     pub async fn handoff(&self, sock: OwnedFd) -> anyhow::Result<()>;
 }
 ```
 
 Nothing else. No Payload, no SessionOpts, no FrameStream — the backend
-reads `StartupMessage` from the fd itself, so the framework doesn't need
-to pass database/user/auth metadata.
+wire layer reads `StartupMessage` from the fd itself, so the framework
+doesn't need to pass database/user/auth metadata.
 
 For the implementation of `handoff` (`SCM_RIGHTS`, per-slot control
-socket, backend-side `ProcessStartupPacket`), see [handoff.md](handoff.md).
+socket, slot runner, wire layer), see [frontend-handoff.md](frontend-handoff.md),
+[backend-handoff.md](backend-handoff.md), and
+[backend-wire.md](backend-wire.md).
+
+> **Resolved: simplest contract.** `handoff()` returns `Ok(())` on
+> successful kernel-level handoff ("kernel accepted the fd-pass" —
+> per Q21 this is `Ok(())` even if the backend dies before
+> `recvmsg`; the client connection is then lost via TCP RST and the
+> slot respawns on the next `sendmsg → EPIPE`), or `Err(Cancelled)`
+> if the frontend shuts down while the future is pending. Pool
+> exhaustion blocks on a semaphore until a slot frees; `EAGAIN`/
+> `EINTR` retry transparently; slot death mid-`sendmsg` is invisible
+> to the caller. Full reasoning in
+> [roadmap.md §2 Q20](roadmap.md#2-open-questions) and
+> [Q21](roadmap.md#2-open-questions).
 
 ---
 
@@ -189,27 +205,33 @@ impl HandoffTransport for TcpHandoff {
 }
 ```
 
-`uds_handoff` is identical modulo `UnixListener::bind` + `uds_incoming`.
-That's the entire transport. The only "async-trait" tax is the
-`Box::pin(async move { … })` wrapper at the top of `run`; the accept
-loop itself, including shutdown discipline and per-accept error
-logging, lives in `handoff-listener` and is shared across every
-fd-producing transport (today and future ones). No FE/BE parsing, no
-auth code, no TLS code, no per-conn state machine: the backend (see
-[handoff.md](handoff.md)) runs PG's own `ProcessStartupPacket` →
-`ClientAuthentication` → `PostgresMain`-equivalent on the inherited fd.
+That's the entire transport. The only async tax is the
+`Box::pin(async move { … })` wrapper at the top of `run` (because the
+trait method returns a `Pin<Box<dyn Future>>` rather than using the
+`#[async_trait]` macro — see §1 and
+[roadmap.md §2 Q8](roadmap.md#2-open-questions)). The accept loop
+itself, including shutdown discipline and per-accept error logging,
+lives in `handoff-listener` and is shared across every fd-producing
+transport (today and future ones). No FE/BE parsing, no
+auth code, no TLS code, no per-conn state machine: the backend
+([backend-handoff.md](backend-handoff.md) slot runner +
+[backend-wire.md](backend-wire.md) wire layer) handles FE/BE v3 itself
+via the `pgwire` crate, terminates TLS via rust-openssl, runs auth
+against `pg_hba.conf` via `hba_getauthmethod`, and executes SQL via
+`SPI_*`.
 
 ---
 
-## 5. Registry & feature flags
+## 5. Registry & wiring
 
-For how transports are registered at compile time, how Cargo features
-gate them, and how the catalog binds names to factories, see
-[workspace.md](workspace.md).
+For how transports are registered at compile time and how the catalog
+binds names to factories, see [workspace.md §4](workspace.md#4-registry--how-transports-get-wired-in).
 
-For the catalog-name ↔ feature-flag mismatch error path
-(`transport "X" is not present` / "rebuild with `--features X`"), see
-[configuration.md](configuration.md).
+v0 has no Cargo features and exactly one registered transport
+(`tcp_handoff`); any other name in `pg_transport.transports` fails with
+a clear `"transport X is not present"` error at start-up. See
+[configuration.md](configuration.md) and
+[workspace.md §5](workspace.md#5-catalog--registry-interaction).
 
 ---
 
@@ -266,7 +288,7 @@ Roadmap: see [roadmap.md §4 — Deferred for v0](roadmap.md).
 
 - [architecture.md](architecture.md) — how the trait surface fits into the
   larger picture.
-- [handoff.md](handoff.md) — the implementation behind
+- [frontend-handoff.md](frontend-handoff.md) — the implementation behind
   `HandoffHandle::handoff`.
 - [transports.md](transports.md) — which concrete transports implement
   the v0 trait.

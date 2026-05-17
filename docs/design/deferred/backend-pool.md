@@ -1,11 +1,11 @@
 # Backend pool (general path)
 
 > Parent: [README.md](../README.md)
-> Sibling: [handoff.md](../handoff.md) · [api.md](../api.md) · [architecture.md](../architecture.md)
+> Sibling: [frontend-handoff.md](../frontend-handoff.md) · [api.md](../api.md) · [architecture.md](../architecture.md)
 >
 > **STATUS: DEFERRED.** This document describes the planned `SessionTransport`
 > + `SessionHandle` general path. **It is not implemented in v0.** v0 ships
-> the handoff path only (see [handoff.md](../handoff.md)) and a pre-spawned
+> the handoff path only (see [frontend-handoff.md](../frontend-handoff.md)) and a pre-spawned
 > bgworker pool whose only role is receiving handed-off fds. The DSM /
 > `shm_mq` / `pq_redirect_to_shm_mq` plumbing, the `Payload` envelope,
 > `ExecutorSession`, `FrameStream`, frame tagging, and the cross-process
@@ -24,7 +24,7 @@ kernel socket: HTTP/2 + JSON-SQL, custom binary protocols, datagram
 transports (QUIC, DPDK), or any FE/BE transport that needs to
 inspect/modify protocol bytes before submission. Transports that hold a
 kernel `OwnedFd` and speak FE/BE v3 use the simpler fast path in
-[handoff.md](../handoff.md) instead.
+[frontend-handoff.md](../frontend-handoff.md) instead.
 
 The high-level mechanism is lifted from
 [`pg_background`](../../background/pg_background.md): a pool of background
@@ -39,7 +39,7 @@ serve multiple sessions sequentially over its lifetime.
 > The same pool also serves the handoff path. A slot is either holding a
 > handed-off connection (handoff path) or serving an `acquire`d session
 > (this doc) at any time, never both. See
-> [handoff.md §2](../handoff.md) for the cross-path slot model.
+> [frontend-handoff.md §2](../frontend-handoff.md) for the cross-path slot model.
 
 ---
 

@@ -1,14 +1,15 @@
 # Architecture
 
 > Parent: [README.md](README.md)
-> Sibling: [api.md](api.md) · [handoff.md](handoff.md)
+> Sibling: [api.md](api.md) · [frontend-handoff.md](frontend-handoff.md)
 
 ## 1. Three layers
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │  Transport plugins (workspace crates, linked into core)              │
-│    tcp_handoff │ uds_handoff │ …                                     │
+│    tcp_handoff                                                       │
+│      (v0 ships exactly one; uds_handoff and friends deferred)        │
 │                                                                      │
 │    Each transport is a self-contained network entry point. It owns   │
 │    its own accept loop and per-listener policy. The framework's      │
@@ -34,13 +35,19 @@
                              │ sendmsg(SCM_RIGHTS) over per-slot UDS
 ┌────────────────────────────┴─────────────────────────────────────────┐
 │  Backend Pool  (in-tree crate `backend`)                             │
-│    - Pre-spawned PG backends (bgworkers)                             │
-│    - Owns inherited fd via MyProcPort; runs ProcessStartupPacket,    │
-│      TLS, ClientAuthentication, PostgresMain-equivalent loop         │
-│    - (DSM + shm_mq + pq_redirect_to_shm_mq plumbing for the          │
-│      deferred general path is captured in backend-pool.md but        │
-│      not built in v0.)                                               │
-└──────────────────────────────────────────────────────────────────────┘
+│    │ Slot runner (socket layer; backend-handoff.md)                  │
+│    │   - pre-spawned bgworker per slot                               │
+│    │   - recvmsg per-slot UDS → (fd, HandoffHints)                   │
+│    │   - drive a Wire to completion; per-handoff reset               │
+│    │ Wire layer (backend-wire.md; v0 = pgwire-v3 crate-based)        │
+│    │   - TLS via rust-openssl; auth via hba_getauthmethod + our Rust │
+│    │   - FE/BE v3 message loop; *not* PG's PostgresMain               │
+│    │ SPI bridge                                                      │
+│    └   - SPI_execute / SPI_execute_plan_with_params for actual SQL   │
+│    (DSM + shm_mq + pq_redirect_to_shm_mq plumbing for the              │
+│     deferred general path is captured in deferred/backend-pool.md      │
+│     but not built in v0.)                                              │
+└────────────────────────────────────────────────────────────────────┘
 ```
 
 Three layers, sharply separated by interface size:
@@ -53,11 +60,12 @@ Three layers, sharply separated by interface size:
 - **Frontend core** — the *thin* layer. tokio runtime, signal handling,
   postmaster-death watchdog, transport registry, `HandoffHandle`
   vending, metrics. Knows nothing about wire protocols.
-- **Backend pool** — pre-spawned backends (bgworkers). Each receives the
-  handed-off fd, makes it `MyProcPort.sock`, and runs PG's own
-  `ProcessStartupPacket` → `ClientAuthentication` → `PostgresMain`-equivalent
-  loop on it. Structurally identical to default PostgreSQL with
-  `SCM_RIGHTS` in place of `fork`.
+- **Backend pool** — pre-spawned bgworkers, each running a slot runner
+  (socket layer; see [backend-handoff.md](backend-handoff.md)) that
+  receives handed-off fds and drives the wire layer (FE/BE v3 via the
+  [`pgwire`](https://github.com/sunng87/pgwire) crate; TLS via
+  rust-openssl; SQL execution through SPI — see
+  [backend-wire.md](backend-wire.md)).
 
 The framework deliberately does **not** define a `Connection` trait, an
 `AsyncRead`/`AsyncWrite` boundary, or a `Protocol` abstraction. Once the
@@ -69,10 +77,13 @@ The handle a transport receives in its `run` method has one method:
 
 - **Handoff** — `HandoffHandle::handoff(fd)`. The transport holds an
   `OwnedFd` on which the wire is FE/BE v3; the frontend hands the
-  socket to a bgworker via `SCM_RIGHTS`; the bgworker runs
-  `ProcessStartupPacket`, TLS, auth, and the FE/BE loop on it directly.
-  Structurally identical to default PostgreSQL with `SCM_RIGHTS` in
-  place of `fork`. See [handoff.md](handoff.md).
+  socket to a bgworker via `SCM_RIGHTS`; the bgworker's slot runner
+  drives the wire layer on it, which speaks FE/BE v3 via the `pgwire`
+  crate (with our own TLS / auth / SPI bridge on top — *not* PG's
+  `ProcessStartupPacket`/`ClientAuthentication`/`PostgresMain`). See
+  [frontend-handoff.md](frontend-handoff.md) for the FE/IPC side,
+  [backend-handoff.md](backend-handoff.md) for the slot runner,
+  [backend-wire.md](backend-wire.md) for the wire layer.
 
 ### Deferred: the general (shm_mq) path
 
@@ -177,7 +188,7 @@ Four integration points worth calling out:
 - [api.md](api.md) — the `HandoffTransport` trait and `HandoffHandle`
   contract shown above (plus the deferred `SessionTransport`/`SessionHandle`
   sketch).
-- [handoff.md](handoff.md) — what happens on the other side of
+- [frontend-handoff.md](frontend-handoff.md) — what happens on the other side of
   `HandoffHandle::handoff`.
 - [backend-pool.md](deferred/backend-pool.md) — *deferred* design for the
   shm_mq general path.

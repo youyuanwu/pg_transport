@@ -1,23 +1,26 @@
-# Handoff — blind fd-pass for kernel-socket transports
+# Frontend handoff — blind fd-pass for kernel-socket transports
 
 > Parent: [README.md](README.md)
-> Sibling: [api.md](api.md) · [architecture.md](architecture.md) · [backend-handoff.md](backend-handoff.md)
+> Sibling: [api.md](api.md) · [architecture.md](architecture.md) · [backend-handoff.md](backend-handoff.md) · [backend-wire.md](backend-wire.md)
 
 This doc describes the **FE (transport / frontend / IPC) side** of
 `pg_transport`'s v0 fd-pass path: when this path applies, how each
 backend slot's per-slot control socket is set up and torn down, the
 end-to-end per-connection sequence, and the performance / comparison
-story at the dispatch-model level. Its BE (backend) companion is
-[backend-handoff.md](backend-handoff.md), which covers everything
-that runs *inside the backend process* after a fd lands there:
-`ProcessStartupPacket`, TLS, `ClientAuthentication`,
-`PostgresMain`-equivalent, per-session reset, cancel routing.
+story at the dispatch-model level. Its BE companions:
+
+| Doc                                          | What it owns                                      |
+| -------------------------------------------- | ------------------------------------------------- |
+| [backend-handoff.md](backend-handoff.md)     | Slot runner (socket layer): fd receipt, slot lifecycle, per-handoff reset |
+| [backend-wire.md](backend-wire.md)           | Wire layer: TLS, auth, FE/BE v3 protocol, SPI bridge — implemented in Rust, *not* using PG's `ProcessStartupPacket` / `ClientAuthentication` / `secure_open_server` / `PostgresMain` |
 
 A transport that holds an `OwnedFd` for a kernel socket (TCP, UDS,
-future io_uring-backed sockets) and whose wire protocol is FE/BE v3
-hands the fd over to a backend bgworker and steps out entirely. The
-backend takes ownership and runs essentially `PostgresMain` on the
-inherited fd.
+future io_uring-backed sockets) hands the fd over to a backend
+bgworker and steps out entirely. The backend's slot runner takes
+ownership of the fd and hands it to its wire layer, which speaks
+FE/BE v3 to the client directly (via the [`pgwire`](https://github.com/sunng87/pgwire)
+crate, see [backend-wire.md](backend-wire.md)) and translates SQL into
+`SPI_*` calls.
 
 In v0 this is the **only** path. A second path — the shm_mq-based
 *general path* for transports that need plaintext inspection, run
@@ -25,21 +28,22 @@ non-FE/BE wires (HTTP/2 + SQL, custom binary), or have no shareable
 kernel fd (QUIC, DPDK) — is sketched in [backend-pool.md](deferred/backend-pool.md)
 but **deferred**.
 
-The model is conceptually identical to default PostgreSQL: postmaster
-`accept()`s, hands the fd to a child via `fork`, and the child runs the
-backend. We replace `fork` with `SCM_RIGHTS` over a Unix control socket,
-and we replace "freshly forked backend" with "pre-spawned bgworker pool
-member". Everything else — `ProcessStartupPacket`, TLS handshake,
-`ClientAuthentication`, FE/BE message loop, cancel handling — is unchanged
-PG code running in the backend (see
-[backend-handoff.md](backend-handoff.md)).
+The dispatch model is conceptually identical to default PostgreSQL:
+postmaster `accept()`s, hands the fd to a child via `fork`, and the
+child runs the backend. We replace `fork` with `SCM_RIGHTS` over a
+Unix control socket, and we replace "freshly forked backend" with
+"pre-spawned bgworker pool member". What runs on the fd, however, is
+our wire layer — not unchanged PG code. See
+[backend-wire.md §9](backend-wire.md) for the per-stage comparison.
 
 ---
 
 ## 1. When to use this path
 
-In v0: **always**. Every supported transport (`tcp_handoff`, `uds_handoff`)
-has a kernel fd and speaks FE/BE v3, so they all hand off.
+In v0: **always**. The single v0 transport (`tcp_handoff`) has a
+kernel fd and speaks FE/BE v3, so it hands off. Future fd-producing
+transports (deferred `uds_handoff`, io_uring variants, …) will use
+the same path.
 
 The table below records which future transport scenarios fit this path
 versus the deferred general path. "shm_mq" rows are reachable only once
@@ -190,75 +194,95 @@ Notes:
 ### 2.3 Per-connection flow
 
 ```
-Client                  Transport (frontend)            Backend bgworker
-══════                  ══════════════════════            ═══════════════════
+Client                  Transport (frontend)            Backend slot (bgworker)
+══════                  ══════════════════════            ═══════════════════════
 
 TCP connect ──────────► accept() → tcp_sock
                         │
                         │ slot = pool.pick();            ───►
                         │ sendmsg(slot.unix_ctrl,
                         │   SCM_RIGHTS(tcp_sock),
-                        │   payload = none/minimal)      ───►  recvmsg → fd
+                        │   hints = HandoffHints{...})   ───►  recvmsg → (fd, hints)
                         │ close(tcp_sock) locally              │
-                        ▼                                      │ MyProcPort.sock = fd
-                handoff returns                            │
-                                                               │ ProcessStartupPacket()
-SSLRequest/Startup/Cancel ─────────────────────────────────►   │   ← reads 8-byte probe
-                                                               │   ← dispatches:
-       ◄────────────────────────────────────────── 'S' or 'N'  │     SSLRequest → secure_open_server
-                                                               │     GSSEncRequest → similar
-                                                               │     StartupV3 → continue plaintext
-                                                               │     CancelRequest → cancel-map lookup, exit
+                        ▼                                      │ slot runner builds WireCtx;
+                handoff returns                                │ hands fd to W::run
                                                                │
-TLS ClientHello (if SSL) ──────────────────────────────────►   │ TLS handshake (PG OpenSSL OR
-                                                               │   rustls sidecar — see
-                                                               │   backend-handoff.md §4)
+                                                               │ -- wire layer (backend-wire.md):
+SSLRequest / Startup / Cancel ─────────────────────────────►   │ pgwire crate parses 8-byte probe
+                                                               │   ← our dispatcher decides:
+       ◄────────────────────────────────────────── 'S' or 'N'  │     SSLRequest → tokio_openssl::accept
+                                                               │     GSSEncRequest → 'N' (deferred)
+                                                               │     StartupV3 → continue
+                                                               │     CancelRequest → v0: log + close fd
+                                                               │                       (cancel routing deferred;
+                                                               │                        see deferred/cancel-routing.md)
                                                                │
-StartupMessage (over TLS) ─────────────────────────────────►   │ ProcessStartupPacket continues
+TLS ClientHello (if SSL) ──────────────────────────────────►   │ rust-openssl handshake on fd;
+                                                               │   pgwire sees plaintext side
                                                                │
-       ◄────────────────────────────────────────── Auth req    │ ClientAuthentication
-                                                               │   ← consults pg_hba.conf
+StartupMessage (over TLS) ─────────────────────────────────►   │ pgwire parses; auth dispatcher
+                                                               │   calls hba_getauthmethod() and
+                                                               │   runs the method (SCRAM via
+                                                               │   pgwire helpers; verifier reads
+                                                               │   pg_authid.rolpassword via SPI)
+       ◄────────────────────────────────────────── Auth req    │
                                                                │
+       ◄────────────────────────────────────────── ParameterStatus, BackendKeyData
        ◄────────────────────────────────────────── ReadyForQuery
                                                                │
-                                            FE/BE loop on the inherited fd
+                                            FE message loop in the wire layer;
+                                            SQL execution via SPI_*
                                                                │
-                                            on EOF / Terminate: close fd,
-                                                                reset per-session state,
+                                            on EOF / Terminate / wire fatal:
+                                                                W::run returns,
+                                                                slot runner closes fd,
+                                                                resets per-handoff state,
                                                                 slot returns to pool
 ```
 
-After `handle.handoff(fd).await` returns in the frontend, the frontend has no
-further role for this connection. All FE/BE I/O is between the backend
-and the client over the inherited fd, using PG's normal `pq_getbyte` /
-`pq_putmessage`.
+After `handle.handoff(fd).await` returns in the frontend, the frontend
+has no further role for this connection. All FE/BE I/O is between the
+backend's wire layer and the client over the inherited fd, using
+`pgwire`-parsed messages and (for TLS) `tokio_openssl`'s `SslStream`.
 
 ---
 
 ## 3. Comparison with default PG
 
+This is the dispatch-model comparison. For the wire-layer vs PG's wire
+code comparison, see [backend-wire.md §9](backend-wire.md).
+
 | Stage                           | Default PG                          | `pg_transport` handoff path             |
 | ------------------------------- | ----------------------------------- | --------------------------------------- |
-| Listen on port                  | postmaster's `ServerLoop`           | frontend's tokio accept loop          |
-| Accept a connection             | postmaster                          | frontend                              |
+| Listen on port                  | postmaster's `ServerLoop`           | frontend's tokio accept loop            |
+| Accept a connection             | postmaster                          | frontend                                |
 | Hand socket to child            | `fork()`; child inherits fd         | `sendmsg(SCM_RIGHTS)` to slot's bgworker |
 | Per-child startup cost          | full fork (~1 ms on Linux)          | fd-pass (~10 µs); bgworker pre-spawned  |
-| Protocol probe (SSLRequest etc) | backend reads in `ProcessStartupPacket` | backend reads in `ProcessStartupPacket` |
-| TLS handshake                   | `secure_open_server` in backend     | `secure_open_server` *or* rustls sidecar in backend |
-| `ClientAuthentication`          | backend                             | backend                                |
-| `PostgresMain` loop             | backend                             | backend (PostgresMain-equivalent)      |
-| Lifecycle after disconnect      | backend exits; postmaster reaps     | backend resets per-session state, slot returns to pool |
-| Cancel routing                  | postmaster looks up PID, signals    | backend consults shared cancel map, signals target backend |
+| Protocol probe (SSLRequest etc) | `ProcessStartupPacket` (PG C code)  | wire layer via `pgwire` crate           |
+| TLS handshake                   | `secure_open_server` (PG-wrapped OpenSSL) | `tokio_openssl::accept` (rust-openssl) in the wire layer |
+| Auth                            | `ClientAuthentication` + `pg_hba.conf` | wire layer: `hba_getauthmethod` lookup + our Rust-side method execution |
+| FE/BE message loop              | `PostgresMain` (`tcop/postgres.c`)  | wire layer's driver loop                |
+| SQL execution                   | inline in `exec_*` calls            | SPI bridge: `SPI_execute` / `SPI_execute_plan_with_params` |
+| Lifecycle after disconnect      | backend exits; postmaster reaps     | slot runner resets per-handoff state, slot returns to pool |
+| Cancel routing                  | postmaster looks up PID, signals    | **v0: not supported.** Wire layer drops `CancelRequest` fds silently; Ctrl-C in `psql` terminates the connection. Design for un-deferral: [deferred/cancel-routing.md](deferred/cancel-routing.md). |
 
-Structurally identical. The two differences are:
+Dispatch-model differences:
 
 1. **`fork()` → `SCM_RIGHTS`**: pre-spawned children, ~100× cheaper per
-   connection, but those children are recycled instead of exiting.
+   connection, recycled instead of exiting.
 2. **One global listener (postmaster) → many configurable listeners
-   (our transports)**: we can run TCP on a custom port, UDS at a custom
-   path, future io_uring-backed listeners, all simultaneously, all
+   (our transports)**: TCP on a custom port, UDS at a custom path,
+   future io_uring-backed listeners, all simultaneously, all
    dispatching to the same backend pool.
 
+What-runs-on-the-fd differences (see [backend-wire.md](backend-wire.md)
+for detail):
+
+3. **We don't reuse PG's wire code.** Our wire layer is Rust + the
+   `pgwire` crate; `ProcessStartupPacket`, `ClientAuthentication`,
+   `secure_open_server`, and `PostgresMain` are not called. SPI
+   (planner, executor, snapshots) *is* reused for the actual SQL
+   execution — the wire-layer surface is what changes.
 ---
 
 ## 4. Performance
@@ -299,9 +323,9 @@ pre-spawned-backend-pool / `SCM_RIGHTS`-handoff model is the design.
 - **OS portability.** `SCM_RIGHTS` works on every Unix; Windows needs
   `DuplicateHandle` + named pipes. Phase 6+ Linux/BSD/macOS only.
 
-(BE-side limitations — per-listener cert variation, cancel-map
-dependency, `PostgresMain` not being callable directly, per-session
-reset surface — live in [backend-handoff.md §6](backend-handoff.md).)
+(BE-side concerns — wire-layer TLS choice, auth model, cancel
+routing, per-handoff reset detail — live in [backend-handoff.md §5](backend-handoff.md#5-per-handoff-state-reset)
+and [backend-wire.md](backend-wire.md).)
 
 ---
 
@@ -309,15 +333,15 @@ reset surface — live in [backend-handoff.md §6](backend-handoff.md).)
 
 Several open questions in earlier drafts of the design were really
 "how does this work for fd-based transports?". The handoff path
-resolves them inside this doc:
+resolves them inside this doc and its BE companions:
 
-| Earlier open question                       | Resolution under handoff                                     |
-| ------------------------------------------- | ------------------------------------------------------------ |
-| Auth handshake location                     | Entirely in the backend, via PG's `ClientAuthentication`.   |
-| TLS termination location                    | Entirely in the backend, OpenSSL or rustls sidecar.         |
-| SCM_RIGHTS vs no-SCM_RIGHTS for fd transfer | SCM_RIGHTS, per-slot Unix control socket.                    |
-| Per-connection backend pinning             | Implied by the handoff itself — slot is pinned to connection.|
-| Cross-process wakeup for fast path          | Not needed — once the fd is handed off, all I/O is direct.   |
+| Earlier open question                       | Resolution under handoff                                                                  |
+| ------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| Auth handshake location                     | Entirely in the backend wire layer; details in [backend-wire.md §4](backend-wire.md).      |
+| TLS termination location                    | Entirely in the backend wire layer (rust-openssl); details in [backend-wire.md §5](backend-wire.md). |
+| SCM_RIGHTS vs no-SCM_RIGHTS for fd transfer | SCM_RIGHTS, per-slot Unix control socket.                                                 |
+| Per-connection backend pinning              | Implied by the handoff itself — slot is pinned to connection.                            |
+| Cross-process wakeup for fast path          | Not needed — once the fd is handed off, all I/O is direct between client and backend.    |
 
 Those questions reopen for the deferred shm_mq path; see
 [backend-pool.md](deferred/backend-pool.md) and
@@ -327,9 +351,10 @@ Those questions reopen for the deferred shm_mq path; see
 
 ## See also
 
-- [backend-handoff.md](backend-handoff.md) — the BE companion:
-  per-handoff handler, per-session reset, `PostgresMain`-equivalent,
-  TLS, cancel routing, backend-side limitations.
+- [backend-handoff.md](backend-handoff.md) — BE slot runner (socket
+  layer): fd receipt, slot lifecycle, per-handoff reset.
+- [backend-wire.md](backend-wire.md) — BE wire layer: TLS, auth, FE/BE
+  protocol via `pgwire` crate, SPI bridge, open questions.
 - [api.md](api.md) — `HandoffHandle::handoff`.
 - [transports.md](transports.md) — which transports use this path (in
   v0: all of them).

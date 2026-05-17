@@ -40,7 +40,7 @@ different path in our design:
 
 | pgbouncer mode | Behaviour | `pg_transport` analog |
 |---|---|---|
-| **session** | One backend assigned for the whole client session; released on disconnect | **Handoff path** (`HandoffTransport` + `HandoffHandle`). Identical semantics: slot pinned for connection lifetime. See [handoff.md](handoff.md). |
+| **session** | One backend assigned for the whole client session; released on disconnect | **Handoff path** (`HandoffTransport` + `HandoffHandle`). Identical semantics: slot pinned for connection lifetime. See [frontend-handoff.md](frontend-handoff.md). |
 | **transaction** | Backend assigned at `BEGIN`, released at `COMMIT` / `ROLLBACK`. Multiple clients share fewer backends, swapping per transaction. | **Not supported.** Would require transaction-boundary detection on the FE/BE wire; the v0 handoff path pins one connection to one slot for its whole lifetime. See [Known gap](#15-known-gap-transaction-pooling) below. |
 | **statement** | Backend assigned per statement, released after each `Query` / `Sync`. Most aggressive multiplexing; prepared statements break. | **Not supported in v0.** The closest equivalent is `SessionHandle::execute(opts, payload)` on the **deferred** shm_mq general path — the slot would be acquired internally, the payload runs, the slot returns to the pool when `FrameStream` ends. See [api.md §6](api.md) and [backend-pool.md](deferred/backend-pool.md). |
 
@@ -80,11 +80,17 @@ pattern.
    is the whole point of an external pooler.
 2. **No separate daemon.** Configured via SQL, lifecycles tied to PG.
    One binary, one process tree.
-3. **PG-native auth and TLS.** Handoff path uses PG's own
-   `ClientAuthentication` and (optionally) `secure_open_server`.
-   `pg_hba.conf`, `ssl_*` GUCs, the `cert` auth method — all "just
-   work". pgbouncer has its own auth layer with subtle gotchas (SCRAM
-   passthrough nuances, `auth_query`/`auth_user` setup, etc.).
+3. **`pg_hba.conf`-driven auth, no extra config.** The handoff path's
+   wire layer (see [backend-wire.md](backend-wire.md)) looks up auth
+   methods via PG's `hba_getauthmethod` helper and runs them in Rust
+   (SCRAM-SHA-256 / MD5 / trust / password). The same `pg_hba.conf`
+   that governs PG's 5432 listener governs ours; no `auth_query` /
+   `auth_user` setup, no SCRAM-passthrough nuances. (Caveat: we don't
+   reuse PG's `ClientAuthentication` C function; we reimplement the
+   methods on top of the `pgwire` crate's protocol exchange.
+   Method-coverage parity is tracked in [backend-wire.md §4](backend-wire.md);
+   v0 covers trust/reject/password/md5/scram-sha-256, with cert/peer
+   next.)
 4. **Tight integration with PG.** Catalog state, `pg_stat_*` views
    (planned), GUCs, signals — `pg_transport` participates in PG's
    existing observability rather than being a black box in front of it.
@@ -167,7 +173,7 @@ specifically need both:
 | Single-binary deployment, SQL-managed config | **`pg_transport`** |
 | Massive connection amplification (thousands of idle clients on tens of backends) | **pgbouncer** transaction mode |
 | Tight observability integration with PG (`pg_stat_*`, GUCs, catalog) | **`pg_transport`** |
-| TLS termination with `pg_hba.conf cert` mTLS, zero new code | **`pg_transport`** handoff (backend uses PG's TLS) |
+| `pg_hba.conf`-driven auth (trust / md5 / SCRAM) for in-process listeners | **`pg_transport`** handoff (wire layer uses `hba_getauthmethod` lookup; v0 covers trust / reject / password / md5 / SCRAM-SHA-256; `cert` and `peer` next) |
 
 ### 1.9 One-line summary
 
@@ -202,14 +208,15 @@ the full architecture review.
 | Trigger | SQL function call (`pg_background_launch(...)`) | Inbound network connection |
 | Worker lifecycle | One bgworker per call; exits after the SQL completes | Pre-spawned pool; bgworkers live for the whole frontend lifetime |
 | Per-call overhead | Full `RegisterDynamicBackgroundWorker` + fork (~1 ms+) | Pool checkout + `SCM_RIGHTS` handoff (~10 µs) |
-| Result delivery | DSM + `shm_mq`, consumed by `pg_background_result_v2()` | v0: backend runs FE/BE on the inherited fd; bytes go directly to the client. Deferred (shm_mq general path): same DSM + `shm_mq` mechanism as `pg_background`, relayed by the frontend as a `FrameStream` \u2014 see [backend-pool.md](deferred/backend-pool.md). |
+| Result delivery | DSM + `shm_mq`, consumed by `pg_background_result_v2()` | v0: backend's wire layer speaks FE/BE v3 to the client directly on the inherited fd (via the `pgwire` crate; SQL executed through SPI). Deferred (shm_mq general path): same DSM + `shm_mq` mechanism as `pg_background`, relayed by the frontend as a `FrameStream` — see [backend-pool.md](deferred/backend-pool.md). |
 | Use case | Autonomous transactions from SQL ("run this in the background") | Listener / proxy / alternative-wire-protocol substrate |
 
 `pg_transport` borrows `pg_background`'s pool-of-bgworkers idea but
-takes its mechanism only **for the deferred shm_mq path** (see
-[backend-pool.md](deferred/backend-pool.md)). v0 itself does **not** use DSM /
-`shm_mq` / `pq_redirect_to_shm_mq` — it hands the kernel fd directly to
-the bgworker, which runs PG's own `PostgresMain`-equivalent on it.
+takes its `shm_mq` mechanism only **for the deferred general path** (see
+[backend-pool.md](deferred/backend-pool.md)). v0 itself does **not** use
+DSM / `shm_mq` / `pq_redirect_to_shm_mq` — it hands the kernel fd
+directly to the bgworker, whose wire layer speaks FE/BE v3 to the
+client itself (see [backend-wire.md](backend-wire.md)).
 
 ---
 
@@ -225,7 +232,7 @@ review.
 | Listener process model | Master bgworker + N HTTP worker bgworkers; each HTTP worker has a PG-touching main thread + non-PG-touching h2o thread | Single frontend bgworker (tokio current-thread) + N backend bgworkers; transports run as tokio tasks inside the frontend |
 | Per-connection backend | Each HTTP worker IS a PG backend; runs handlers in-process via SPI | Each backend slot's bgworker IS a PG backend (recycled across handoffs); the transport is decoupled in the frontend |
 | Configuration | SQL catalog tables (`omni_httpd.listeners`, route table) | SQL catalog tables (`pg_transport.transports`) — directly inspired by Omnigres |
-| TLS termination | h2o-side (the secondary thread) | Backend-side, either PG OpenSSL or rustls sidecar (handoff path) |
+| TLS termination | h2o-side (the secondary thread) | Backend wire layer (rust-openssl via `tokio_openssl`); see [backend-wire.md §5](backend-wire.md) |
 | What's being researched | HTTP-as-PG-runtime application platform | Alternative transports / protocols for PG, performance research |
 
 Omnigres confirms the load-bearing parts of our design:
@@ -248,8 +255,9 @@ Where we diverge:
 
 ## 5. Default PostgreSQL (no extras)
 
-Worth recapping because the handoff path is structurally a clone of how
-default PG already works:
+Worth recapping because the handoff path's *dispatch model* is
+structurally a clone of how default PG already works — although what
+runs on the fd is our wire layer, not PG's:
 
 | Step | Default PG | `pg_transport` handoff |
 |---|---|---|
@@ -257,8 +265,9 @@ default PG already works:
 | Accept a connection | postmaster | frontend |
 | Give the fd to a child process | `fork()` | `sendmsg(SCM_RIGHTS)` |
 | Per-connection startup cost | full fork (~1 ms) | fd-pass (~10 µs); bgworker pre-spawned |
-| Protocol probe + auth + `PostgresMain` | backend | backend bgworker (same PG code) |
-| Lifecycle after disconnect | backend exits, postmaster reaps | backend resets per-session state, slot returns to pool |
+| Protocol probe + TLS + auth + FE/BE loop | PG C: `ProcessStartupPacket`, `secure_open_server`, `ClientAuthentication`, `PostgresMain` | our wire layer in Rust: `pgwire` crate + rust-openssl + `hba_getauthmethod` + our message-loop driver (see [backend-wire.md](backend-wire.md)) |
+| SQL execution                  | inline in PG's `exec_*` | SPI bridge (`SPI_execute` / `SPI_execute_plan_with_params`) |
+| Lifecycle after disconnect | backend exits, postmaster reaps | slot runner resets per-handoff state, slot returns to pool |
 
 Differences:
 
@@ -267,16 +276,19 @@ Differences:
 2. **One global listener → many configurable listeners** — we can run TCP
    on a custom port, UDS at a custom path, future io_uring-backed
    listeners, all simultaneously, all dispatching to the same pool.
-
+3. **We don't reuse PG's wire C code** — the wire layer is ours
+   (Rust + `pgwire` crate + rust-openssl). We *do* reuse SPI, `pg_authid`,
+   `pg_hba.conf` parsing, `MemoryContext`, and `ereport` (see
+   [backend-wire.md §9](backend-wire.md)).
 For details and the full step-by-step see
-[handoff.md §3](handoff.md#3-comparison-with-default-pg).
+[frontend-handoff.md §3](frontend-handoff.md#3-comparison-with-default-pg).
 
 ---
 
 ## See also
 
 - [README.md](README.md) — design entry point.
-- [handoff.md](handoff.md) — the fast path that beats pgbouncer on
+- [frontend-handoff.md](frontend-handoff.md) — the fast path that beats pgbouncer on
   steady-state latency.
 - [backend-pool.md](deferred/backend-pool.md) — *deferred* general path that
   *would* approximate pgbouncer's statement-mode pooling once it lands.
