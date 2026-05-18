@@ -11,6 +11,7 @@ set dotenv-load := true
 # recipe `foo` in `just/x.just` is invoked as `just foo`.
 import 'just/doctor.just'
 import 'just/smoke.just'
+import 'just/bench.just'
 
 # Pin every cargo-pgrx invocation to a user-global Postgres install at
 # `~/.pgrx` so multiple pgrx repos on the same machine share the same

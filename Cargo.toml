@@ -32,6 +32,12 @@ futures = { version = "0.3", default-features = false }
 # flags (aws-lc-rs / ring) — TLS lands phase 8 via tokio-openssl.
 pgwire = { version = "0.40", default-features = false, features = ["server-api"] }
 
+# Phase-5 bench client: tokio-postgres as the libpq-compatible
+# client driver. `default = ["runtime"]` is fine — bench is its
+# own binary, not the cdylib, so feature unification with `core`
+# doesn't matter.
+tokio-postgres = "0.7"
+
 # TLS in the wire layer (Q12: rust-openssl). Not yet linked into stubs.
 openssl       = "0.10"
 tokio-openssl = "0.6"

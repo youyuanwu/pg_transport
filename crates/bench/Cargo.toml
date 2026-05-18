@@ -8,12 +8,13 @@ license.workspace      = true
 repository.workspace   = true
 authors.workspace      = true
 
-# Binary, not a library — `cargo run -p bench` from the workspace root.
+# Binary, not a library — `cargo run -p bench` from the workspace root,
+# or `just bench` for the cluster-managed end-to-end run.
 [[bin]]
 name = "bench"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }
-
-# v0 phase 0 stub. Phase 5 lands the actual harness.
+tokio          = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }
+tokio-postgres = { workspace = true }
+anyhow         = { workspace = true }
