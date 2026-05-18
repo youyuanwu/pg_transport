@@ -5,14 +5,18 @@
 //! with a `LocalSet` and runs the frontend supervisor loop until
 //! `SIGTERM` or postmaster death.
 //!
-//! Phase 2 scope (in addition to phase 1's heartbeat + signals +
-//! watchdog): stand up the [`crate::backend::pool::BackendPool`] —
-//! per-slot UDS listener, wait for each slot bgworker to connect —
-//! and exercise the send path with a periodic dummy fd handoff for
-//! self-verification. No wire layer yet (phase 4).
+//! Phase 3 scope (adds to phases 1 + 2): on boot, also spawn the
+//! single v0 transport (`tcp_handoff`) on the LocalSet, with a
+//! [`HandoffHandle`] backed by the [`BackendPool`]. Every accepted
+//! TCP client is fd-passed to a slot via SCM_RIGHTS, where the
+//! phase-3 null wire writes a synthetic v3 ErrorResponse and closes.
+//! No SQL handler yet (phase 4).
 
+use std::net::SocketAddr;
+use std::rc::Rc;
 use std::time::Duration;
 
+use api::{HandoffHandle, ShutdownToken};
 use pgrx::bgworkers::{BackgroundWorker, SignalWakeFlags};
 use pgrx::pg_sys;
 use pgrx::prelude::*;
@@ -20,6 +24,7 @@ use tokio::signal::unix::{SignalKind, signal};
 
 use crate::backend::pool::BackendPool;
 use crate::guc;
+use crate::handoff::tcp::{TcpHandoff, TcpHandoffCfg};
 
 /// How long we wait for any single slot bgworker to connect to its
 /// listener before giving up. Static registration spawns slots
@@ -27,6 +32,10 @@ use crate::guc;
 /// 3 s (see `backend::slot::connect_with_retry`), so 5 s here has
 /// comfortable margin.
 const SLOT_ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Phase-3 hard-coded bind address for the single `tcp_handoff`
+/// transport. Phase ≥ 7 reads this from `pg_transport.transports`.
+const PHASE_3_TCP_BIND: &str = "127.0.0.1:5454";
 
 /// Frontend bgworker entry point.
 ///
@@ -97,26 +106,56 @@ async fn frontend_main() {
         }
     };
 
+    // HandoffHandle wraps the pool behind a Rc<dyn HandoffSink>.
+    // The transport's `run` future is spawn_local'd, so !Send is
+    // fine (LocalSet semantics).
+    let pool_rc: Rc<BackendPool> = Rc::new(pool);
+    let handle = HandoffHandle::new(pool_rc.clone());
+
+    // Shared shutdown token; one source, every transport's `run`
+    // gets a clone. Cancelled below before we drop the pool.
+    let shutdown = ShutdownToken::new();
+
+    // Spawn the single v0 transport. Phase ≥ 4 will drive this from
+    // a catalog read (`pg_transport.transports`); phase 3 hard-codes
+    // the one config we have.
+    let transport_handle = {
+        let bind_addr: SocketAddr = match PHASE_3_TCP_BIND.parse() {
+            Ok(a) => a,
+            Err(e) => {
+                pgrx::warning!(
+                    "pg_transport frontend: invalid bind addr {PHASE_3_TCP_BIND:?}: {e}"
+                );
+                shutdown.cancel();
+                // pool_rc dropped at fn exit
+                return;
+            }
+        };
+        let transport = TcpHandoff::boxed(TcpHandoffCfg { bind_addr });
+        let handle = handle.clone();
+        let shutdown = shutdown.clone();
+        tokio::task::spawn_local(async move {
+            if let Err(e) = transport.run(handle, shutdown).await {
+                pgrx::warning!("pg_transport tcp_handoff: run returned error: {e}");
+            }
+        })
+    };
+
     // Intervals: the FIRST `.tick()` on a fresh `Interval` fires
     // immediately, so consume it before the loop to avoid an instant
     // tick at startup. After this, all tickers fire at their
     // configured periods from "now".
     //
     // Phase-1 heartbeat / watchdog periods are hard-coded constants
-    // per Q23 (zero new GUCs in phase 1). The phase-2 test-handoff
-    // tick (5 s) is also hard-coded — phase 3 replaces it with real
-    // transport-driven traffic, so a knob would be obsolete by then.
+    // per Q23 (zero new GUCs in phase 1). Phase 3 dropped the
+    // phase-2 test-handoff tick — real transport traffic supersedes
+    // self-test.
     let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
     let mut watchdog = tokio::time::interval(Duration::from_millis(500));
-    let mut test_handoff = tokio::time::interval(Duration::from_secs(5));
     heartbeat.tick().await;
     watchdog.tick().await;
-    test_handoff.tick().await;
 
     pgrx::log!("pg_transport frontend: tokio runtime ready");
-
-    // Round-robin slot id for the test-handoff tick.
-    let mut next_test_slot: u32 = 0;
 
     loop {
         tokio::select! {
@@ -125,10 +164,10 @@ async fn frontend_main() {
                 break;
             }
             _ = sighup.recv() => {
-                // Phase 2: nothing to reload yet. Phase ≥3 will
+                // Phase 3: nothing to reload yet. Phase ≥ 4 will
                 // reconcile the live listener set against
                 // pg_transport.transports here.
-                pgrx::log!("pg_transport frontend: SIGHUP received (no-op in phase 2)");
+                pgrx::log!("pg_transport frontend: SIGHUP received (no-op in phase 3)");
             }
             _ = watchdog.tick() => {
                 if postmaster_died() {
@@ -139,29 +178,19 @@ async fn frontend_main() {
             _ = heartbeat.tick() => {
                 pgrx::log!("pg_transport frontend: heartbeat");
             }
-            _ = test_handoff.tick() => {
-                // Phase-2 acceptance: prove the FE→slot sendmsg
-                // path works. Round-robin through the pool so every
-                // slot exercises its recvmsg loop. Phase 3 drops
-                // this — real transports produce real fds.
-                let slot_id = next_test_slot;
-                next_test_slot = (next_test_slot + 1) % pool_size;
-                match pool.test_handoff(slot_id) {
-                    Ok(()) => pgrx::log!(
-                        "pg_transport frontend: test handoff -> slot {slot_id} OK"
-                    ),
-                    Err(e) => pgrx::warning!(
-                        "pg_transport frontend: test handoff -> slot {slot_id} failed: {e}"
-                    ),
-                }
-            }
         }
     }
 
-    // Explicit drop so the per-slot UnixStream closure (= slot-side
-    // EOF) happens before this fn returns. The slot bgworkers see
-    // recvmsg → 0 and exit cleanly.
-    drop(pool);
+    // Cancel the shared shutdown token; the transport's accept loop
+    // observes `shutdown.cancelled()` and returns from `run` of its
+    // own accord. We `.await` its join handle so the listener is
+    // gone before we drop the pool (which would close the per-slot
+    // UnixStreams and trigger slot-side EOF).
+    shutdown.cancel();
+    let _ = transport_handle.await;
+    // pool_rc dropped at fn exit — closes every per-slot UnixStream,
+    // slots observe recvmsg → 0, exit cleanly.
+    drop(pool_rc);
 }
 
 /// Non-blocking check: is the postmaster still alive?

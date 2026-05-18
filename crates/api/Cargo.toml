@@ -15,5 +15,7 @@ authors.workspace      = true
 # and docs/design/api.md.
 
 [dependencies]
-tokio   = { workspace = true, features = ["net"] }
-futures = { workspace = true }
+tokio      = { workspace = true, features = ["net"] }
+futures    = { workspace = true }
+tokio-util = { workspace = true }
+anyhow     = { workspace = true }

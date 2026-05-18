@@ -8,7 +8,7 @@
 //! inside the loop. Phase 2 just receives the fd, logs it, and
 //! drops it (close on Drop of `OwnedFd`).
 
-use std::io;
+use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::thread;
@@ -100,13 +100,19 @@ fn run_slot(slot_id: u32) -> io::Result<()> {
             }
             Ok(Some(fd)) => {
                 handoffs += 1;
-                // Phase 2 acceptance: "slot runner reads and closes
-                // it". The fd is dropped at the end of this block,
-                // which `close(2)`s it.
                 pgrx::log!(
-                    "pg_transport slot {slot_id}: received fd {} (handoff #{handoffs}); closing",
+                    "pg_transport slot {slot_id}: received fd {} (handoff #{handoffs}); null-wire FATAL",
                     fd.as_raw_fd()
                 );
+                // Phase 3 "null wire": write a minimal valid PG v3
+                // ErrorResponse(severity=FATAL) on the fd, then drop
+                // it (= close). psql's startup machinery reads the
+                // ErrorResponse as a fatal connection error and
+                // prints it. Phase 4 replaces this with the real
+                // pgwire-v3 driver loop.
+                if let Err(e) = null_wire(&fd) {
+                    pgrx::warning!("pg_transport slot {slot_id}: null-wire write failed: {e}");
+                }
                 drop(fd);
                 // Phase 4 lands the per-handoff WireCtx + W::run +
                 // reset_per_handoff_state sequence here.
@@ -152,4 +158,75 @@ fn connect_with_retry(path: &std::path::Path, slot_id: u32) -> io::Result<UnixSt
             path.display()
         ),
     ))
+}
+
+/// Phase-3 "null wire": write a minimal valid PG v3 `ErrorResponse`
+/// with severity `FATAL` on the client fd, then return. The caller
+/// drops the fd (closing it), which the client sees as connection
+/// termination after the error frame.
+///
+/// PG v3 ErrorResponse wire format (storage/protocol.c documents it):
+///
+/// ```text
+///   'E' (1 byte)        message type
+///   len (4 bytes BE)    payload length, INCLUDES the length field
+///                       itself but NOT the type byte
+///   fields...           each is one type byte + NUL-terminated string
+///   '\0' (1 byte)       end-of-fields terminator
+/// ```
+///
+/// We emit the four fields psql needs to render a usable error:
+/// * `'S'` localized severity     ("FATAL")
+/// * `'V'` non-localized severity ("FATAL") — added in PG 9.6,
+///   helps clients keying off severity programmatically
+/// * `'C'` SQLSTATE               ("08P01" = PROTOCOL_VIOLATION,
+///   fits the "no wire yet" story)
+/// * `'M'` human message          (descriptive)
+///
+/// psql reads the ErrorResponse during connection setup and prints
+/// it as `FATAL:  pg_transport ...`.
+fn null_wire(fd: &std::os::fd::OwnedFd) -> io::Result<()> {
+    use std::os::fd::FromRawFd;
+
+    const SEVERITY: &[u8] = b"FATAL\0";
+    const SQLSTATE: &[u8] = b"08P01\0";
+    const MESSAGE: &[u8] =
+        b"pg_transport: null wire (phase 3); FE\xe2\x86\x92BE fd-pass verified, no SQL handler yet\0";
+
+    // Field payload: each is (1-byte code) + NUL-terminated string,
+    // followed by a single 0 terminator.
+    let mut payload: Vec<u8> = Vec::with_capacity(
+        1 + SEVERITY.len() + 1 + SEVERITY.len() + 1 + SQLSTATE.len() + 1 + MESSAGE.len() + 1,
+    );
+    payload.push(b'S');
+    payload.extend_from_slice(SEVERITY);
+    payload.push(b'V');
+    payload.extend_from_slice(SEVERITY);
+    payload.push(b'C');
+    payload.extend_from_slice(SQLSTATE);
+    payload.push(b'M');
+    payload.extend_from_slice(MESSAGE);
+    payload.push(0);
+
+    // Length field includes itself (the 4 length bytes) but NOT the
+    // 'E' type byte.
+    let len: u32 = (4 + payload.len()) as u32;
+
+    let mut frame: Vec<u8> = Vec::with_capacity(1 + len as usize);
+    frame.push(b'E');
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(&payload);
+
+    // Borrow the fd as a std `TcpStream`-shaped writer via the
+    // `std::os::unix::net::UnixStream` constructor for fds. We
+    // don't actually know whether it's TCP or UDS; std doesn't care
+    // for `write_all`. UnixStream is the most generic borrow-shape
+    // for "stream-oriented fd".
+    //
+    // SAFETY: we borrow the fd for the duration of `write_all`; the
+    // ManuallyDrop prevents UnixStream's Drop from closing the fd
+    // (the caller's OwnedFd retains ownership and closes it).
+    let stream = unsafe { UnixStream::from_raw_fd(fd.as_raw_fd()) };
+    let mut stream = std::mem::ManuallyDrop::new(stream);
+    stream.write_all(&frame)
 }

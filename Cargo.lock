@@ -37,8 +37,10 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 name = "api"
 version = "0.0.1"
 dependencies = [
+ "anyhow",
  "futures",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -959,12 +961,14 @@ dependencies = [
 name = "pg_transport"
 version = "0.0.1"
 dependencies = [
+ "anyhow",
  "api",
  "futures",
  "libc",
  "pgrx",
  "pgrx-tests",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

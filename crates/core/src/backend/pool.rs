@@ -5,13 +5,21 @@
 //! the FE creates the per-slot listeners and waits for each slot
 //! bgworker to `connect()`. Once accepted, the per-slot peer stream
 //! is long-lived; we only drop it on shutdown.
+//!
+//! Implements [`api::HandoffSink`] so [`api::HandoffHandle`] can
+//! dispatch fds into the pool from transport accept loops. Phase 3
+//! uses a simple round-robin: every handoff goes to the next slot
+//! modulo `pool_size`. Phase ≥ 7 may grow this into per-slot load
+//! tracking or affinity hashing.
 
+use std::cell::Cell;
 use std::fs;
 use std::io;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use api::{HandoffHints, HandoffSink};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::time::timeout;
 
@@ -19,7 +27,7 @@ use super::fd_pass;
 use super::paths;
 
 /// One peer entry in the pool. In phase 2 we only need the long-lived
-/// `UnixStream` to the slot; phase ≥ 3 will add bookkeeping (state,
+/// `UnixStream` to the slot; phase ≥ 4 will add bookkeeping (state,
 /// in-flight handoff count, etc.).
 pub struct SlotPeer {
     pub slot_id: u32,
@@ -30,8 +38,15 @@ pub struct SlotPeer {
 }
 
 /// Frontend-side pool. Owns the per-slot listener-and-peer pair.
+///
+/// `Cell<u32>` for the round-robin cursor: the pool is held in an
+/// `Rc` inside [`api::HandoffHandle`], so `HandoffSink::handoff`
+/// gets `&self` (not `&mut self`). The cursor is single-threaded
+/// (LocalSet) so `Cell` is sufficient — no need for `RefCell` or
+/// atomics.
 pub struct BackendPool {
     pub peers: Vec<SlotPeer>,
+    next_slot: Cell<u32>,
 }
 
 impl BackendPool {
@@ -134,34 +149,45 @@ impl BackendPool {
         }
 
         pgrx::log!("pg_transport pool: all {} slots connected", peers.len());
-        Ok(Self { peers })
+        Ok(Self {
+            peers,
+            next_slot: Cell::new(0),
+        })
     }
 
-    /// Phase-2 test: send a placeholder fd (`/dev/null`) to slot `slot_id`
-    /// via SCM_RIGHTS. The slot logs and closes it.
+    /// Round-robin pick the next slot, wrap modulo `peers.len()`.
+    fn pick_slot(&self) -> &SlotPeer {
+        let len = self.peers.len() as u32;
+        let i = self.next_slot.get() % len;
+        self.next_slot.set(i.wrapping_add(1));
+        &self.peers[i as usize]
+    }
+}
+
+impl HandoffSink for BackendPool {
+    /// Round-robin dispatch the fd to a slot via SCM_RIGHTS. Returns
+    /// once the kernel has accepted the `sendmsg` (Q20 semantics:
+    /// `Ok(())` means "kernel accepted", not "backend in hand").
     ///
-    /// Synchronous despite running inside a tokio task: SCM_RIGHTS +
-    /// 1 byte will never block the kernel's socket buffer in
-    /// practice (one cmsg + one byte is well under any plausible
-    /// buffer limit). Phase ≥ 4 will revisit this once real wire
-    /// traffic happens.
-    pub fn test_handoff(&self, slot_id: u32) -> io::Result<()> {
-        let peer = self
-            .peers
-            .iter()
-            .find(|p| p.slot_id == slot_id)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("no peer for slot {slot_id}"),
-                )
-            })?;
-
-        // Open /dev/null read-only as a cheap fd we don't care about
-        // post-handoff. Closed on Drop of the File at end of scope.
-        let dummy = fs::File::open("/dev/null")?;
-
-        fd_pass::send_fd(peer.stream.as_raw_fd(), dummy.as_raw_fd())
+    /// Synchronous despite running inside a tokio task: SCM_RIGHTS
+    /// plus one placeholder byte will never block the kernel socket
+    /// buffer in practice. Phase ≥ 4 may revisit if the wire layer
+    /// starts heavy traffic.
+    ///
+    /// `_hints` is captured for forward-compat but not yet read —
+    /// the slot's null wire (phase 3) is hints-agnostic; phase ≥ 4
+    /// will plumb hints into a per-handoff metadata frame.
+    fn handoff(&self, fd: OwnedFd, _hints: HandoffHints) -> anyhow::Result<()> {
+        if self.peers.is_empty() {
+            anyhow::bail!("pg_transport pool: no slots available");
+        }
+        let peer = self.pick_slot();
+        fd_pass::send_fd(peer.stream.as_raw_fd(), fd.as_raw_fd())
+            .map_err(|e| anyhow::anyhow!("sendmsg to slot {}: {e}", peer.slot_id))?;
+        // `fd` dropped here — closes our local fd reference.
+        // The slot has its own (kernel-dup'd) copy from the SCM_RIGHTS
+        // delivery.
+        Ok(())
     }
 }
 
