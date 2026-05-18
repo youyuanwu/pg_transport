@@ -7,10 +7,15 @@
 //!
 //! v0 surface (incremental, see `docs/design/roadmap.md`):
 //! * phase 0 — scaffold: workspace compiles; `_PG_init` is a no-op.
-//! * phase 1 — **this phase**: `_PG_init` SPL-checks and registers the
-//!   frontend bgworker, which boots a tokio current-thread runtime
-//!   with heartbeat, SIGHUP/SIGTERM, and postmaster-death watchdog.
-//! * phase 2+ — backend pool, handoff, wire layer, SPI bridge.
+//! * phase 1 — `_PG_init` SPL-checks and registers the frontend
+//!   bgworker, which boots a tokio current-thread runtime with
+//!   heartbeat, SIGHUP/SIGTERM, and postmaster-death watchdog.
+//! * phase 2 — **this phase**: `_PG_init` also registers N slot
+//!   bgworkers (`pg_transport.backend_pool_size`); FE binds per-slot
+//!   UDS listeners and waits for each slot to `connect()`; FE can
+//!   `sendmsg(SCM_RIGHTS)` a dummy fd to a slot, which logs it and
+//!   closes it. No wire layer yet.
+//! * phase 3+ — tcp_handoff transport, wire layer, SPI bridge.
 
 use std::time::Duration;
 
@@ -19,7 +24,9 @@ use pgrx::prelude::*;
 
 ::pgrx::pg_module_magic!(name, version);
 
+mod backend;
 mod frontend;
+mod guc;
 
 /// Postgres calls this once per backend when it loads the extension's
 /// shared library. In the postmaster (when `shared_preload_libraries`
@@ -64,10 +71,13 @@ pub extern "C-unwind" fn _PG_init() {
         );
     }
 
+    // Register GUCs before anything reads them. Phase 2 surface:
+    // pg_transport.backend_pool_size only (Q23: GUC list starts at
+    // phase 2).
+    guc::register();
+
     // Frontend bgworker (Q22 → option (a)): registered statically so
-    // it comes up at postmaster start. Slot-pool registration lands
-    // here in phase 2; see the `_PG_init()` sketch in
-    // docs/design/backend-handoff.md §1 for the eventual full shape.
+    // it comes up at postmaster start.
     BackgroundWorkerBuilder::new("pg_transport frontend")
         .set_type("pg_transport_frontend")
         .set_library("pg_transport")
@@ -76,6 +86,24 @@ pub extern "C-unwind" fn _PG_init() {
         .set_restart_time(Some(Duration::from_secs(1)))
         .enable_shmem_access(None)
         .load();
+
+    // Slot bgworker pool. One bgworker per slot, registered
+    // statically alongside the frontend; the postmaster owns
+    // restart policy. Per-slot UDS listener creation is the FE's
+    // job and happens once the FE bgworker boots. See
+    // docs/design/backend-handoff.md §1.
+    let pool_size = guc::backend_pool_size();
+    for slot_id in 0..pool_size {
+        BackgroundWorkerBuilder::new(&format!("pg_transport slot {slot_id}"))
+            .set_type("pg_transport_slot")
+            .set_library("pg_transport")
+            .set_function("pg_transport_slot_main")
+            .set_argument((slot_id as i32).into_datum())
+            .set_start_time(BgWorkerStartTime::RecoveryFinished)
+            .set_restart_time(Some(Duration::from_secs(1)))
+            .enable_shmem_access(None)
+            .load();
+    }
 }
 
 /// Returns the extension version as a packed integer:
