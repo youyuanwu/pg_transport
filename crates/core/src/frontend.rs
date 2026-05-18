@@ -217,5 +217,20 @@ fn postmaster_died() -> bool {
     // from the postmaster; the buffer is a single byte on this
     // function's stack.
     let rc = unsafe { libc::read(fd, &mut byte as *mut u8 as *mut libc::c_void, 1) };
-    rc == 0
+    if rc == 0 {
+        return true;
+    }
+    if rc < 0 {
+        let errno = unsafe { *libc::__errno_location() };
+        // EAGAIN is the expected "alive" signal on the non-blocking
+        // pipe (EWOULDBLOCK == EAGAIN on Linux). EINTR is harmless
+        // (caller re-checks next tick). Anything else: log once and
+        // treat as alive so a transient glitch doesn't kill the FE.
+        if !matches!(errno, libc::EAGAIN | libc::EINTR) {
+            pgrx::warning!(
+                "pg_transport frontend: watchdog read on fd {fd} returned errno {errno} (treating as alive)"
+            );
+        }
+    }
+    false
 }

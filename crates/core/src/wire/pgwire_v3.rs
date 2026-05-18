@@ -17,9 +17,9 @@ use futures::Sink;
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::query::SimpleQueryHandler;
-use pgwire::api::results::{Response, Tag};
+use pgwire::api::results::Response;
 use pgwire::api::store::PortalStore;
-use pgwire::api::{ClientInfo, ClientPortalStore, NoopHandler, PgWireServerHandlers};
+use pgwire::api::{ClientInfo, ClientPortalStore, PgWireServerHandlers};
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pgwire::tokio::process_socket;
@@ -54,15 +54,14 @@ impl Wire for PgwireV3 {
         // construct it inside `block_on`'s async block.
         // Per backend-handoff.md §3 the slot has nothing else to
         // schedule on this runtime, so single-threading is fine.
-        ctx.rt
-            .block_on(async move {
-                let tcp_stream = tokio::net::TcpStream::from_std(std_stream)
-                    .map_err(|e| anyhow::anyhow!("tokio::TcpStream::from_std: {e}"))?;
-                process_socket(tcp_stream, None, handlers)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("pgwire process_socket: {e}"))?;
-                Ok::<(), anyhow::Error>(())
-            })?;
+        ctx.rt.block_on(async move {
+            let tcp_stream = tokio::net::TcpStream::from_std(std_stream)
+                .map_err(|e| anyhow::anyhow!("tokio::TcpStream::from_std: {e}"))?;
+            process_socket(tcp_stream, None, handlers)
+                .await
+                .map_err(|e| anyhow::anyhow!("pgwire process_socket: {e}"))?;
+            Ok::<(), anyhow::Error>(())
+        })?;
         Ok(())
     }
 }
@@ -149,14 +148,7 @@ impl SimpleQueryHandler for SimpleQuery {
         C: ClientInfo + ClientPortalStore + Unpin + Send + Sync,
         C::PortalStore: PortalStore,
     {
-        // Phase 4a: log the query and respond with an "OK" tag.
-        // Phase 4b replaces this with the SPI bridge so SELECT
-        // returns a real Query response with rows.
         pgrx::log!("pgwire-v3 simple query: {query:?}");
-        Ok(vec![Response::Execution(Tag::new("OK"))])
+        crate::backend::spi_bridge::execute_simple_query(query)
     }
 }
-
-// Quiet "unused" lint warning until phase 4b uses it.
-#[allow(dead_code)]
-fn _phantom_noop(_: NoopHandler) {}

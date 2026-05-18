@@ -10,6 +10,7 @@ set dotenv-load := true
 # Sub-files. `import` flat-merges into the same recipe namespace, so a
 # recipe `foo` in `just/x.just` is invoked as `just foo`.
 import 'just/doctor.just'
+import 'just/smoke.just'
 
 # Pin every cargo-pgrx invocation to a user-global Postgres install at
 # `~/.pgrx` so multiple pgrx repos on the same machine share the same

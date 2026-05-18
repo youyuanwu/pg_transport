@@ -40,6 +40,13 @@ use crate::wire::{Wire, WireCtx, pgwire_v3::PgwireV3};
 pub extern "C-unwind" fn pg_transport_slot_main(arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
 
+    // Initialize an SPI-capable backend connection. Required
+    // before any `Spi::*` call inside this bgworker; see
+    // backend-wire.md §6 (SPI bridge). Phase 4b hard-codes the
+    // target database to "postgres" — phase ≥ 7 will route based
+    // on the client's StartupMessage `database` parameter.
+    BackgroundWorker::connect_worker_to_spi(Some("postgres"), None);
+
     // SAFETY: `bgw_main_arg` is a plain 64-bit value; the FE-side
     // registration (see crate::_PG_init) put the slot id there as
     // `(slot_id as i32).into_datum()`. `Datum::value()` returns the

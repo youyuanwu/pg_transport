@@ -105,7 +105,7 @@ pub extern "C-unwind" fn _PG_init() {
             .set_argument((slot_id as i32).into_datum())
             .set_start_time(BgWorkerStartTime::RecoveryFinished)
             .set_restart_time(Some(Duration::from_secs(1)))
-            .enable_shmem_access(None)
+            .enable_spi_access()
             .load();
     }
 }
