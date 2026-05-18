@@ -68,6 +68,7 @@ and [backend-wire.md](backend-wire.md).
 | [comparison.md](comparison.md) | active | How `pg_transport` relates to pgbouncer, Odyssey, `pg_background`, Omnigres, and default PG |
 | [roadmap.md](roadmap.md) | active | Phased build plan, open questions, risks, references |
 | [testing.md](testing.md) | active | Correctness testing strategy: subsystem risk register, test seams the design must provide, harness shape, error injection, per-phase acceptance criteria |
+| [bench.md](bench.md) | active | Performance bench harness — `just bench` (custom tokio-postgres harness) and `just pgbench` (TPC-B-like via PG-shipped pgbench); per-recipe args, output, what the numbers can and cannot tell you, known limitations |
 
 Companion docs (outside this design dir):
 

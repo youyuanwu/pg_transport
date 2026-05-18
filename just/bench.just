@@ -16,24 +16,32 @@ BENCH_SOCKETS := "/tmp/pg_transport_sockets"
 
 # Run `bench compare` between pg_transport and vanilla PG.
 #
-# Parameters (just-syntax):
-#   pg=pg18        — Postgres major (matches the rest of the Justfile).
-#   iters=1000     — total measured iterations PER SIDE (split across
-#                    workers).
-#   connections=1  — concurrent worker connections per side.
-#   pool=""        — pg_transport.backend_pool_size; defaults to
-#                    `connections` so apples-to-apples (no contention).
-#                    Set explicitly higher than `connections` to test
-#                    underutilised pool, or lower to test contention
-#                    (each connection beyond pool_size queues on
-#                    slot availability).
-#   csv=""         — optional per-sample CSV path.
+# Positional parameters (just 1.51 does NOT support name=value kwargs
+# at the call site — args bind strictly by position):
+#   1. pg          (default pg18)  — Postgres major; matches the rest
+#                                    of the Justfile.
+#   2. iters       (default 1000)  — total measured iterations PER SIDE
+#                                    (split across workers).
+#   3. connections (default 1)     — concurrent worker connections per
+#                                    side.
+#   4. pool        (default "")    — pg_transport.backend_pool_size.
+#                                    Empty string ⇒ defaults to
+#                                    `connections` (apples-to-apples,
+#                                    no contention). Set higher than
+#                                    `connections` to test underutilised
+#                                    pool, or lower to test contention
+#                                    (each connection beyond pool_size
+#                                    queues on slot availability).
+#   5. csv         (default "")    — optional per-sample CSV path.
+#
+# To skip a middle parameter while setting a later one, pass an
+# explicit value or the default literally — there is no keyword form.
 #
 # Examples:
-#   just bench                                 # 1 conn, 1 slot
-#   just bench connections=4                   # 4 conns, 4 slots (no contention)
-#   just bench connections=16 pool=4           # 16 conns, 4 slots (contention)
-#   just bench iters=10000 connections=8 csv=/tmp/b.csv
+#   just bench                                # all defaults: 1 conn, 1 slot
+#   just bench pg18 1000 4                    # 4 conns, 4 slots (no contention)
+#   just bench pg18 1000 16 4                 # 16 conns, pool=4 (contention)
+#   just bench pg18 10000 8 "" /tmp/b.csv     # 8 conns, default pool, CSV out
 bench pg=default_pg iters="1000" connections="1" pool="" csv="":
     #!/usr/bin/env bash
     set -euo pipefail

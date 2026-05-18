@@ -17,7 +17,6 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use futures::stream;
-use pgrx::bgworkers::BackgroundWorker;
 use pgrx::pg_sys::panic::{CaughtError, ErrorReportWithLevel};
 use pgrx::pg_sys::{self};
 use pgwire::api::Type;
@@ -33,32 +32,77 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 ///   text-format `RowDescription` derived from the SPI tupdesc and
 ///   `DataRow` frames for every materialised row.
 pub fn execute_simple_query(query: &str) -> PgWireResult<Vec<Response>> {
-    // BackgroundWorker::transaction wraps the body in
-    // StartTransactionCommand / CommitTransactionCommand and a
-    // PgTryBuilder catch — without this, Spi::connect would assert
-    // (no active transaction snapshot). The query string is borrowed
-    // through an AssertUnwindSafe wrapper so the UnwindSafe bound
-    // doesn't require interior mutability.
+    // We can't use pgrx's `BackgroundWorker::transaction` directly:
+    // in pgrx 0.18 its `PopActiveSnapshot` + `CommitTransactionCommand`
+    // calls are OUTSIDE the `PgTryBuilder`, so a PG ERROR raised
+    // anywhere in the body leaks an open transaction (xact state =
+    // TBLOCK_STARTED + pushed active snapshot). The next call then
+    // asserts `"StartTransactionCommand: unexpected state STARTED"`,
+    // which we hit running pgbench against the slot. So we open and
+    // close the transaction ourselves with explicit panic cleanup.
     let query_owned = query.to_string();
+
+    unsafe {
+        pg_sys::SetCurrentStatementStartTimestamp();
+        pg_sys::StartTransactionCommand();
+        pg_sys::PushActiveSnapshot(pg_sys::GetTransactionSnapshot());
+    }
+
     let outcome: Result<Result<Vec<Response>, PgWireError>, Box<dyn Any + Send>> =
-        catch_unwind(AssertUnwindSafe(|| {
-            BackgroundWorker::transaction(|| run_via_spi(&query_owned))
-        }));
+        catch_unwind(AssertUnwindSafe(|| run_via_spi(&query_owned)));
 
     match outcome {
-        Ok(Ok(responses)) => Ok(responses),
-        Ok(Err(err)) => Err(err),
-        Err(panic_payload) => Err(panic_to_pgwire(panic_payload)),
+        Ok(Ok(responses)) => {
+            // SAFETY: matched Start/Push above; xact still
+            // TBLOCK_STARTED on the success path (SPI doesn't switch
+            // it), so Pop+Commit is the documented teardown.
+            unsafe {
+                pg_sys::PopActiveSnapshot();
+                pg_sys::CommitTransactionCommand();
+            }
+            Ok(responses)
+        }
+        Ok(Err(err)) => {
+            // Body returned a clean PgWireError (e.g. our SPI-error
+            // translation). Xact state is still TBLOCK_STARTED — no
+            // PG ERROR was raised — so Pop+Commit is the right
+            // teardown. We do NOT Abort here: the application-level
+            // error is not an SPI-level rollback request, and
+            // forcing one would mask the fact that nothing PG-side
+            // actually failed.
+            unsafe {
+                pg_sys::PopActiveSnapshot();
+                pg_sys::CommitTransactionCommand();
+            }
+            Err(err)
+        }
+        Err(panic_payload) => {
+            // A PG ERROR (or Rust panic) longjmp'd / unwound through
+            // the body. SPI cleanup is handled by PG's own xact-abort
+            // path inside AbortCurrentTransaction; we must NOT touch
+            // the active snapshot stack here (PG already popped it
+            // during abort).
+            //
+            // SAFETY: AbortCurrentTransaction is safe to call from
+            // any non-DEFAULT TBLOCK_* state; it resets state to
+            // DEFAULT and releases resources.
+            unsafe {
+                pg_sys::AbortCurrentTransaction();
+            }
+            Err(panic_to_pgwire(panic_payload))
+        }
     }
 }
 
 fn run_via_spi(query: &str) -> Result<Vec<Response>, PgWireError> {
-    // Spi::connect runs the closure inside an SPI_connect / SPI_finish
-    // pair. PG ERRORs from inside panic out; the outer
-    // `execute_simple_query` catches them.
-    pgrx::Spi::connect(|client| -> Result<Vec<Response>, PgWireError> {
+    // Spi::connect_mut runs the closure inside an SPI_connect /
+    // SPI_finish pair, with a read-write SPI session — required for
+    // DDL/DML (pgbench -i, UPDATE, etc.). PG ERRORs from inside
+    // panic out; the outer `execute_simple_query` catches them via
+    // catch_unwind + AbortCurrentTransaction.
+    pgrx::Spi::connect_mut(|client| -> Result<Vec<Response>, PgWireError> {
         client
-            .select(query, None, &[])
+            .update(query, None, &[])
             .map_err(|e| spi_error_to_pgwire(&e.to_string()))?;
 
         // After select succeeds we walk SPI's globals directly: it's
@@ -167,9 +211,8 @@ fn spi_error_to_pgwire(msg: &str) -> PgWireError {
 
 /// Convert a caught panic payload back into a pgwire `ErrorResponse`.
 ///
-/// pgrx's `PgTryBuilder` (used inside `BackgroundWorker::transaction`)
-/// catches PG ERROR longjmps and re-raises them via
-/// `resume_unwind(Box::new(CaughtError::…))`, so the outer
+/// pgrx's pg_guard machinery catches PG ERROR longjmps and re-raises
+/// them via `resume_unwind(Box::new(CaughtError::…))`, so the outer
 /// `catch_unwind` receives a `Box<dyn Any>` whose concrete type is
 /// `CaughtError`. We downcast to that first and extract the wrapped
 /// `ErrorReportWithLevel`; bare `panic_any(ErrorReportWithLevel)` and

@@ -12,6 +12,7 @@ set dotenv-load := true
 import 'just/doctor.just'
 import 'just/smoke.just'
 import 'just/bench.just'
+import 'just/pgbench.just'
 
 # Pin every cargo-pgrx invocation to a user-global Postgres install at
 # `~/.pgrx` so multiple pgrx repos on the same machine share the same
