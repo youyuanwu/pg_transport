@@ -27,8 +27,10 @@ pgrx-tests = { version = "=0.18.0" }
 tokio   = { version = "1", default-features = false }
 futures = { version = "0.3", default-features = false }
 
-# Wire layer (sunng87/pgwire). v0 only; not yet linked into stubs.
-pgwire = "0.30"
+# Wire layer (sunng87/pgwire). Phase 4 brings up the FE/BE v3
+# protocol; we pull in the server API but stay off the TLS feature
+# flags (aws-lc-rs / ring) — TLS lands phase 8 via tokio-openssl.
+pgwire = { version = "0.40", default-features = false, features = ["server-api"] }
 
 # TLS in the wire layer (Q12: rust-openssl). Not yet linked into stubs.
 openssl       = "0.10"
@@ -38,6 +40,8 @@ tokio-openssl = "0.6"
 thiserror   = "2"
 parking_lot = "0.12"
 anyhow      = "1"
+async-trait = "0.1"
+bytes       = "1"
 # CancellationToken for the ShutdownToken plumbing in api/. Tokio
 # core has watch / Notify but neither is quite the right shape;
 # tokio-util's CancellationToken is the idiomatic choice and a

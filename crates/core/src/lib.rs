@@ -28,6 +28,7 @@ mod backend;
 mod frontend;
 mod guc;
 mod handoff;
+mod wire;
 
 /// Postgres calls this once per backend when it loads the extension's
 /// shared library. In the postmaster (when `shared_preload_libraries`
