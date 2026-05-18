@@ -60,64 +60,9 @@ connection migration, RDMA protocol pairing, DPDK CPU budget) live in
 
 ### 2.1 Still open — v0 path
 
-*(One item identified during phase-1 implementation; does not block
-phase 1 — `_PG_init()` works around it via `ereport!(FATAL, …)` —
-but must be resolved before the phase-4 wire→SPI bridge lands.)*
-
-**Q24. `panic = "abort"` × pgrx error propagation.** The Q9
-resolution (`panic = "abort"` workspace-wide) interacts badly with
-pgrx 0.18's error-raising machinery and, more importantly, with its
-error-*catching* machinery. Concretely:
-
-- `pgrx::error!()` and `pgrx::ereport!(ERROR, …)` raise PG errors
-  by calling `std::panic::panic_any(report)` (see
-  `pgrx-pg-sys-0.18.0/src/submodules/panic.rs:158`). Under
-  `panic = "abort"` this is SIGABRT, not a readable error.
-  *Mitigation:* use `ereport!(FATAL, …)` for boundary errors
-  (FATAL routes through `do_ereport()` → `proc_exit(1)` directly,
-  no Rust panic involved). `_PG_init` already does this.
-- More serious: when PG raises an ERROR from inside a pgrx-mediated
-  call (e.g. SPI), pgrx's `cee-scape` wrapper catches the longjmp
-  and re-raises it as a Rust panic so `PgTryBuilder` (and `catch_unwind`)
-  can inspect it. Under `panic = "abort"` that catch never happens —
-  *any* PG ERROR aborts the bgworker. This is fine for our slot
-  bgworkers in the "panic = bug" sense (Q9 rationale) **except**
-  that the phase-4 wire→SPI bridge needs to catch user SQL errors
-  and convert them into wire `ErrorResponse` frames. That requires
-  catching the panic, which requires unwinding.
-
-Three options:
-
-- **(a) Reverse Q9 — switch to `panic = "unwind"`.** Cost: the
-  `catch_unwind` / `AssertUnwindSafe` boilerplate Q9 was avoiding,
-  and the more subtle issue that a panic in a non-PG-aware tokio
-  task can now half-unwind through the runtime. Benefit:
-  `PgTryBuilder` works; pgrx machinery behaves as documented.
-- **(b) Keep `panic = "abort"`; catch PG errors via raw
-  `pg_sys::PG_TRY()` / cee-scape ourselves.** The wire bridge wraps
-  every SPI call in a manual `cee_scape::call_with_setjmp` that
-  catches the longjmp before pgrx's panic re-raise has a chance to
-  fire. Cost: every SPI call site grows a wrapper; we duplicate
-  pgrx's catch machinery; we're now relying on undocumented
-  invariants of how pgrx decides whether to repanic.
-- **(c) Keep `panic = "abort"`; let SPI errors kill the slot.** A
-  user `SELECT 1/0` aborts the slot bgworker; the postmaster
-  respawns it; the frontend's next handoff to that slot sees
-  `EPIPE` and the client gets a connection drop instead of an
-  `ErrorResponse` frame. *Wire-protocol-incorrect* (a real PG
-  backend converts division-by-zero into `SQLSTATE 22012` on the
-  wire), so this fails the phase-4 acceptance ("`psql -c
-  'SELECT 1'` returns `1`") for any query that errors.
-
-Lean: **(a)**, reluctantly. (c) is wire-incorrect; (b) is too
-clever and brittle. (a) costs us the elegance argument in Q9 but
-keeps the whole pgrx contract working as documented. Re-litigates
-Q9. Affects [roadmap.md §2.3 Q9](#23-resolved) (would flip to
-"Resolved: unwind"), [workspace `Cargo.toml`](../../../Cargo.toml)
-([profile.dev] / [profile.release]), all current `pgrx::log!`
-sites (no change), and the phase-4 wire bridge design (which
-becomes implementable). Decision needed before phase 4 starts;
-phase 1 / 2 / 3 work regardless.
+*(None.)* All v0-path open questions have been resolved; see
+[§2.3](#23-resolved). New v0-path questions land here as they're
+identified.
 
 ### 2.2 Still open — deferred only
 
@@ -240,13 +185,16 @@ sub-questions, both decided:
   impossible by construction. The slot is pinned for the connection's
   lifetime.
 - *Failure model when a backend dies mid-session.* Determined by the
-  cluster Q9 + Q20 + Q21. With `panic = "abort"` (Q9) a fault in a
-  slot aborts the process; with the simplest `handoff()` error
-  contract (Q20) the dying slot doesn't surface a special error —
-  the future already returned `Ok(())`; with Q21 (accept silent loss)
-  the current client connection sees TCP RST and the slot is
-  respawned on the *next* `sendmsg → EPIPE`. Net: **dropped client
-  connection, slot respawn, no replay.**
+  cluster Q9 + Q20 + Q21. With `panic = "unwind"` (Q9 re-resolved
+  via Q24) a fault in a slot unwinds; the wire layer catches it via
+  `PgTryBuilder` and emits a wire `ErrorResponse` where it can,
+  otherwise the slot exits and the postmaster respawns; with the
+  simplest `handoff()` error contract (Q20) the dying slot doesn't
+  surface a special error — the future already returned `Ok(())`;
+  with Q21 (accept silent loss) the current client connection sees
+  TCP RST and the slot is respawned on the *next* `sendmsg → EPIPE`.
+  Net: **dropped client connection, slot respawn, no replay** for
+  uncaught panics; clean wire `ErrorResponse` for caught SPI errors.
 
 The deferred shm_mq path inherits the same pinning policy by default;
 see [backend-pool.md §7](deferred/backend-pool.md#7-slot-allocation-pinning-and-lifetime).
@@ -289,9 +237,14 @@ to native `async fn in traits` (drop `Box::pin`, change `RunFuture` to
 `impl Future<…>`) without first un-injecting `'async_trait` lifetime
 mangling. (Same call will apply to the deferred `SessionTransport`.)
 
-**Q9. Panic isolation in tokio tasks.** ~~Open~~ **Resolved:
-`panic = "abort"`.** Both the workspace `[profile.dev]` and
-`[profile.release]` set `panic = "abort"`. Rationale:
+**Q9. Panic isolation in tokio tasks.** ~~Open~~ ~~Resolved:
+`panic = "abort"`~~ **Re-resolved: `panic = "unwind"`** (after
+[Q24](#23-resolved) showed the original choice was incompatible with
+pgrx 0.18's error machinery). Both the workspace `[profile.dev]` and
+`[profile.release]` set `panic = "unwind"`.
+
+The original Q9 rationale for `abort` (kept here for the auditable
+record) was:
 
 - **Consistent with PG's posture.** `ereport(FATAL)` already exits
   the backend process; making Rust panics behave the same (process
@@ -312,21 +265,16 @@ mangling. (Same call will apply to the deferred `SessionTransport`.)
   doesn't need a `Drop`-guarded fallback path — a panicking slot
   just dies; the next handoff lands in a fresh one.
 
-The cost is: one panic anywhere in a slot bgworker takes that bgworker
-down (and orphans one client connection, per Q21). That's the same
-blast radius as a PG backend `FATAL`, and acceptable for a research
-framework where panics indicate genuine bugs that should be fixed, not
-papered over.
-
-> **Contested by [Q24](#21-still-open--v0-path)** (added during
-> phase-1 implementation). pgrx 0.18's error machinery uses Rust
-> panics for both raising (`error!` / `ereport!(ERROR, …)` →
-> `panic_any`) and catching (PG ERROR caught via cee-scape → re-raised
-> as panic so `PgTryBuilder` can inspect it). With `panic = "abort"`
-> both paths abort the process instead of doing what the docs say.
-> The boundary-error case is workable (use `ereport!(FATAL, …)`); the
-> catch case is fatal to the phase-4 wire bridge design. See Q24.
-
+Those arguments were correct in isolation but missed that pgrx
+itself uses Rust panics as its ERROR-propagation mechanism (see
+[Q24](#23-resolved)). Under `panic = "abort"` we get SIGABRT instead
+of readable errors, and `PgTryBuilder` / `catch_unwind` (which the
+phase-4 wire bridge needs to convert SPI errors into wire
+`ErrorResponse` frames) cannot fire. Q24 surveyed three options and
+picked option (a): switch to `unwind`. The cost is the
+`catch_unwind` / `AssertUnwindSafe` boilerplate Q9 was trying to
+avoid, applied where we deliberately want to capture (rather than
+propagate) a panic.
 **Q12. TLS implementation in the backend wire layer.** ~~Open~~
 **Resolved.** rust-openssl (`openssl` + `tokio-openssl` crates), by
 default. Reuses the same OpenSSL the rest of the cluster links
@@ -503,6 +451,46 @@ the metrics endpoint does). No doc updates required by this
 resolution: the [configuration.md](configuration.md) GUC list
 already enumerates only phase-≥2 knobs.
 
+**Q24. `panic = "abort"` × pgrx error propagation.** ~~Open~~
+**Resolved: option (a) — switch to `panic = "unwind"`.** The Q9
+resolution (`panic = "abort"`) was incompatible with pgrx 0.18's
+error machinery on two paths:
+
+- `pgrx::error!()` / `ereport!(ERROR, …)` raise via
+  `std::panic::panic_any(report)` (see
+  `pgrx-pg-sys-0.18.0/src/submodules/panic.rs:158`). Under
+  `panic = "abort"` this SIGABRTs instead of emitting a readable
+  error. **Workaround applied in phase 1**: use
+  `ereport!(FATAL, …)` for boundary errors (FATAL routes through
+  `do_ereport()` → `proc_exit(1)` directly, no Rust panic
+  involved). Now unnecessary, but kept where FATAL is the right
+  semantic.
+- When PG raises an ERROR from inside a pgrx-mediated call (e.g.
+  SPI), pgrx's `cee-scape` wrapper catches the longjmp and
+  re-raises as a Rust panic so `PgTryBuilder` / `catch_unwind` can
+  inspect it. Under `panic = "abort"` the catch never happens —
+  *any* PG ERROR aborts the bgworker. **Fatal for the phase-4 wire
+  bridge**, which needs to convert user SQL errors into wire
+  `ErrorResponse` frames.
+
+Option (a) (`unwind`) was the only one that keeps pgrx working as
+documented. Options (b) (raw `cee_scape::call_with_setjmp` per
+SPI call) and (c) (let SPI errors kill the slot, accept
+wire-protocol incorrectness) were considered and rejected; the
+phase-1 commit message captures the survey.
+
+The cost we accept: `catch_unwind` / `AssertUnwindSafe` boilerplate
+at boundaries where we deliberately want to capture (rather than
+propagate) a panic. Q9's original rationale arguments for `abort`
+are preserved verbatim in the Q9 entry above as the auditable
+record; they were correct in isolation but missed the pgrx-uses-
+panic invariant.
+
+Affects [Q9](#23-resolved) (re-resolved as "unwind"), workspace
+[Cargo.toml](../../../Cargo.toml) `[profile.dev]` / `[profile.release]`
+(now `panic = "unwind"`), and the phase-1/2/3 code comments that
+mentioned `abort` (updated in the same commit as this resolution).
+
 ---
 
 ## 3. Risks & mitigations
@@ -516,7 +504,7 @@ availability) live in
 | ----------------------------------------------------------------- | ---------- | ----------------------------------------------------------------------------- |
 | tokio current-thread runtime × pgrx bgworker interaction unproven | High       | Phase-1 spike validates signals, latch, postmaster-death; ADR before phase 2  |
 | `SCM_RIGHTS` semantics across PG versions / OSes                  | Medium     | Wrap behind a compat shim in `backend` crate; Unix-only in v0                |
-| Tokio task panics tear down the runtime                           | N/A        | Workspace sets `panic = "abort"` (Q9). A panic aborts the slot bgworker; the frontend detects `EPIPE` on next `sendmsg` and respawns (Q21). Same blast radius as PG `ereport(FATAL)`. |
+| Tokio task panics tear down the runtime                           | N/A        | Workspace sets `panic = "unwind"` (Q9 re-resolved via Q24). A panic in a tokio task unwinds and `LocalSet` / `JoinHandle` surfaces the error; the slot loop logs and exits, the postmaster respawns. Same blast radius as PG `ereport(FATAL)` for unhandled cases. |
 | Bench harness becomes its own quagmire                            | Medium     | Use `criterion` for in-process, plain `tokio-postgres` / raw clients for end-to-end |
 | Build matrix explosion across feature combinations                | N/A        | v0 has no Cargo features; only one transport (`tcp_handoff`) is compiled in. Re-evaluate when a second transport lands. |
 | Deferred shm_mq path drifts out of sync with v0 changes           | Low        | Treat [backend-pool.md](deferred/backend-pool.md) as a versioned design draft; touch it whenever v0 changes invalidate an assumption |

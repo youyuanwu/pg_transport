@@ -48,18 +48,18 @@ tokio-util  = { version = "0.7", default-features = false }
 # Profile settings
 # ---------------------------------------------------------------------------
 #
-# panic = "abort" workspace-wide (Q9 in docs/design/roadmap.md §2.3).
-# A panic anywhere in a slot bgworker aborts that bgworker; the
-# frontend detects EPIPE on next sendmsg and respawns the slot
-# (Q21). Same blast radius as PG ereport(FATAL); avoids
-# `catch_unwind`/`AssertUnwindSafe` boilerplate around every
-# `spawn_local` / `W::run` site.
+# panic = "unwind" workspace-wide. Q9 originally chose abort; Q24
+# overrode that during phase-1 implementation because pgrx 0.18
+# routes `error!()` / `ereport!(ERROR, …)` through `panic_any` and
+# catches PG ERRORs as Rust panics for `PgTryBuilder` — both paths
+# break under panic=abort. See roadmap.md §2.3 Q9 / Q24 for the
+# full reasoning.
 
 [profile.dev]
-panic = "abort"
+panic = "unwind"
 
 [profile.release]
-panic         = "abort"
+panic         = "unwind"
 opt-level     = 3
 lto           = "fat"
 codegen-units = 1

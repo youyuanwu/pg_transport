@@ -43,9 +43,11 @@ const PHASE_3_TCP_BIND: &str = "127.0.0.1:5454";
 /// `dlsym` once `BackgroundWorkerBuilder::set_function(
 /// "pg_transport_frontend_main")` resolves it at postmaster start.
 ///
-/// `panic = "abort"` is set workspace-wide (Q9), so any `panic!()`
-/// here aborts the bgworker; the postmaster respawns it after
-/// `bgw_restart_time` (1 s). Same blast radius as PG `FATAL`.
+/// Workspace sets `panic = "unwind"` (Q9 re-resolved via Q24). An
+/// uncaught panic here unwinds out of `block_on` and out of this
+/// `extern "C-unwind"` function; `#[pg_guard]` catches it at the C
+/// boundary and emits an ereport. The postmaster then respawns the
+/// bgworker after `bgw_restart_time` (1 s).
 #[unsafe(no_mangle)]
 #[pg_guard]
 pub extern "C-unwind" fn pg_transport_frontend_main(_arg: pg_sys::Datum) {
@@ -93,11 +95,10 @@ async fn frontend_main() {
     let pool = match BackendPool::start(pool_size, SLOT_ACCEPT_TIMEOUT).await {
         Ok(p) => p,
         Err(e) => {
-            // Don't `error!` here — it would `panic_any` and abort
-            // (Q24). A WARNING + clean exit lets the postmaster
-            // respawn us; if the pool just never comes up we'll
-            // loop on this error, which is the right operator
-            // signal that something is wrong (e.g. permissions on
+            // WARNING + clean exit lets the postmaster respawn us;
+            // if the pool just never comes up we'll loop on this
+            // error, which is the right operator signal that
+            // something is wrong (e.g. permissions on
             // the socket directory).
             pgrx::warning!(
                 "pg_transport frontend: BackendPool::start failed: {e}; exiting (will be respawned)"

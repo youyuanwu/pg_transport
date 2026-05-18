@@ -355,14 +355,17 @@ satisfy):
    - **Order.** Free portals first, then plans, then drop the name
      maps? Or drop the maps first and rely on the `SpiPlan` destructor?
      `SPI_freeplan` on a dangling pointer is UB.
-   - **Panic-safety.** Resolved by [roadmap.md §2 Q9](roadmap.md#2-open-questions):
-     the workspace sets `panic = "abort"`, so a panic in `SPI_execute`
-     (or anywhere else in the wire layer) aborts the bgworker process.
-     The slot dies, the frontend detects `EPIPE` on the next
-     `sendmsg` and respawns it (see
-     [backend-handoff.md §6](backend-handoff.md#6-slot-lifecycle));
+   - **Panic-safety.** Resolved by [roadmap.md §2.3 Q9](roadmap.md#23-resolved)
+     (re-resolved via [Q24](roadmap.md#23-resolved)): the workspace
+     sets `panic = "unwind"`. A panic in `SPI_execute` (or anywhere
+     in the wire layer) unwinds; the wire layer's `PgTryBuilder`
+     wrapper catches it and converts to a wire `ErrorResponse`. If a
+     panic escapes the wrapper, the slot bgworker exits, the
+     frontend detects `EPIPE` on the next `sendmsg` and respawns it
+     (see [backend-handoff.md §6](backend-handoff.md#6-slot-lifecycle));
      the next handoff lands in a fresh slot with no leaked plans or
-     portals. Reset therefore does *not* need to live in a `Drop` impl
+     portals. Reset is the wire layer's responsibility on the happy
+     path; the slot-respawn path is the safety net.
      on a guard — a line at the bottom of the slot loop is fine,
      because the only way that line gets skipped is process death,
      which already gives us a clean slate.

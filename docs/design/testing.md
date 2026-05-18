@@ -28,7 +28,7 @@ for a listed scenario blocks the phase's completion.
 | Wire layer — startup negotiation     | `SSLRequest` accept/decline; `CancelRequest` drop (v0); unsupported protocol versions emit clean `ErrorResponse` |
 | Wire layer — auth                    | Each method (`trust`, `reject`, `password`, `md5`, `scram-sha-256`) succeeds with correct creds and fails with `28P01` for wrong creds; method-not-in-v0 emits clear rejection; `auth_source = 'pg_hba'` and `auth_source = 'pg_transport'` give consistent results for equivalent rules |
 | Wire layer — TLS                     | `sslmode=require` over TCP and UDS; cert chain validation; min-protocol enforcement (`TLSv1.2`); TLS errors don't leak fd to next handoff |
-| SPI bridge                           | `SELECT 1` round-trip; multi-row result materialisation; SPI error → `ErrorResponse` with correct SQLSTATE; SPI panic aborts process (Q9) |
+| SPI bridge                           | `SELECT 1` round-trip; multi-row result materialisation; SPI error → `ErrorResponse` with correct SQLSTATE; uncaught SPI panic exits slot cleanly (Q9 re-resolved as unwind via Q24) |
 | Extended-query (phase 9)             | Per-handoff reset checklist from [backend-wire.md §8 Q1](backend-wire.md#8-open-questions): named prepared statement is cleared between handoffs; bound portal is dropped; `SET tz` does not survive |
 
 The three scenarios that the [SoT review](reviews/2026-05-17-base-design/REVIEW-SYNTHESIS.md)

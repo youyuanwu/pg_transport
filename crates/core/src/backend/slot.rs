@@ -29,9 +29,11 @@ use super::paths;
 /// `u32`.
 ///
 /// `#[unsafe(no_mangle)]` keeps the symbol callable by PG via `dlsym`.
-/// `panic = "abort"` (Q9 / [Q24](../../../../docs/design/roadmap.md))
-/// means an uncaught panic aborts the slot; the postmaster respawns
-/// us after `bgw_restart_time` (1 s).
+/// Workspace sets `panic = "unwind"` (Q9 re-resolved via
+/// [Q24](../../../../docs/design/roadmap.md)). An uncaught panic
+/// unwinds out of this function; `#[pg_guard]` catches it at the C
+/// boundary and emits an ereport. The postmaster respawns the slot
+/// after `bgw_restart_time` (1 s).
 #[unsafe(no_mangle)]
 #[pg_guard]
 pub extern "C-unwind" fn pg_transport_slot_main(arg: pg_sys::Datum) {
@@ -46,10 +48,11 @@ pub extern "C-unwind" fn pg_transport_slot_main(arg: pg_sys::Datum) {
     pgrx::log!("pg_transport slot {slot_id}: starting");
 
     if let Err(e) = run_slot(slot_id) {
-        // Logged at ERROR but not converted to PG ereport(ERROR) —
-        // the latter would `panic_any` under panic=abort (Q24).
-        // A bare log is fine: the slot is about to exit anyway and
-        // the postmaster will respawn it.
+        // WARNING is sufficient: the slot is exiting anyway and the
+        // postmaster will respawn it. We deliberately don't escalate
+        // to ereport(ERROR) which would just turn into a panic that
+        // pg_guard catches and re-emits as the same ereport —
+        // pointless extra hop.
         pgrx::warning!("pg_transport slot {slot_id} exited: {e}");
     } else {
         pgrx::log!("pg_transport slot {slot_id}: clean exit");
@@ -78,10 +81,10 @@ fn run_slot(slot_id: u32) -> io::Result<()> {
 
     let mut handoffs: u64 = 0;
     loop {
-        // Cheap shutdown check between handoffs. Under
-        // panic=abort + tokio::signal-less slot code, we rely on
-        // SIGTERM via `BackgroundWorker::sigterm_received` rather
-        // than tokio (the slot is pure sync, no runtime).
+        // Cheap shutdown check between handoffs. The slot is pure
+        // sync (no tokio runtime per backend-handoff.md §3), so we
+        // poll PG's signal-driven flag rather than using
+        // `tokio::signal`.
         if BackgroundWorker::sigterm_received() {
             pgrx::log!("pg_transport slot {slot_id}: SIGTERM, exiting");
             return Ok(());

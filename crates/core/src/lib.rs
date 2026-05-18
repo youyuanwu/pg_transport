@@ -40,12 +40,14 @@ mod handoff;
 /// registration (phase 2) lands in the same function alongside the
 /// frontend.
 ///
-/// `#[pg_guard]` converts PG errors into something Rust can observe.
-/// Workspace also sets `panic = "abort"` (Q9), so keep this body
-/// minimal: a Rust panic here aborts the postmaster. For boundary
-/// errors we use `ereport!(FATAL, …)` rather than `error!()`,
-/// because `error!()` → `panic_any()` interacts badly with
-/// `panic = "abort"` (see Q24 in `docs/design/roadmap.md`).
+/// `#[pg_guard]` converts panics into PG ereports rather than
+/// unwinding into PG's C frames. Workspace sets `panic = "unwind"`
+/// (Q9 re-resolved via Q24 in docs/design/roadmap.md). Boundary
+/// errors here use `ereport!(FATAL, …)` rather than `error!()`
+/// because the latter routes through `panic_any` — with unwind
+/// that's fine, but FATAL is the semantically correct level for
+/// startup-time failures that must terminate the process (rather
+/// than be longjmp'd to an outer handler).
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
     // SAFETY: `process_shared_preload_libraries_in_progress` is a
@@ -59,11 +61,11 @@ pub extern "C-unwind" fn _PG_init() {
         // proceed rather than silently degrade. Rationale + the
         // rejected lazy-spawn path: docs/design/roadmap.md Q4.
         //
-        // FATAL (not ERROR) deliberately: `ereport!(ERROR, …)`
-        // routes through `panic_any`, which under `panic = "abort"`
-        // aborts the backend with SIGABRT instead of emitting a
-        // readable error message. `ereport!(FATAL, …)` calls PG's C
-        // ereport(FATAL) directly → `proc_exit(1)` → clean.
+        // FATAL (not ERROR) deliberately: FATAL exits the backend
+        // process cleanly via `proc_exit(1)`, which is what we want
+        // for "you forgot to configure SPL". ERROR would just be
+        // longjmp'd to the CREATE EXTENSION call site and the user
+        // could keep retrying with the same misconfiguration.
         pgrx::ereport!(
             FATAL,
             PgSqlErrorCode::ERRCODE_CONFIG_FILE_ERROR,
