@@ -91,14 +91,37 @@ Registered on first use, à la `pg_background`:
 
 ### SQL surface
 
+The frontend bgworker is registered statically in `_PG_init()` (see
+[Q22 in roadmap.md §2.3](roadmap.md#23-resolved)) and is therefore
+running from postmaster start onward. The functions below operate
+on *listeners*, not on the frontend bgworker itself:
+
 ```sql
-SELECT pg_transport.start();
-SELECT pg_transport.stop();
-SELECT pg_transport.reload();           -- reload transport set from catalog
+SELECT pg_transport.start();    -- bind listeners for every row where enabled=true
+SELECT pg_transport.stop();     -- drop all live listeners (catalog rows untouched)
+SELECT pg_transport.reload();   -- reconcile live listeners against the catalog
 SELECT pg_transport.add_transport(...);
 SELECT * FROM pg_transport.available(); -- compile-time transport inventory
 SELECT * FROM pg_transport.list_v2();   -- live frontend state
 ```
+
+Semantics worth pinning:
+
+- `start()` is idempotent — calling it twice is a no-op on the
+  second call.
+- `stop()` drops listener fds; in-flight handoffs already past
+  `HandoffHandle::handoff()` are unaffected (the slot owns the fd).
+- `reload()` is `stop()` + `start()` with the catalog re-read in
+  between; it is the only operation that picks up changes to
+  `pg_transport.transports`.
+- The frontend bgworker itself only exits on postmaster shutdown
+  or `SIGTERM`; none of these SQL functions can take it down.
+
+> **Open — Q23 ([roadmap.md §2.1](roadmap.md#21-still-open--v0-path)).**
+> The GUC list above is the phase-≥2 surface. Phase 1 needs zero,
+> one, or two of {`frontend_heartbeat_interval`,
+> `postmaster_watchdog_interval`, `log_level`}. The leaning is
+> *zero* — hard-code the defaults until someone hits the wall.
 
 ---
 

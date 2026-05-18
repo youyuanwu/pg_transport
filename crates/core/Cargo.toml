@@ -40,6 +40,13 @@ api = { path = "../api" }
 tokio   = { workspace = true, features = ["rt", "net", "sync", "signal", "io-util", "macros", "time"] }
 futures = { workspace = true }
 
+# Used for the postmaster-death watchdog: PG 18 only exports
+# `postmaster_alive_fds[POSTMASTER_FD_WATCH]` (the watch end of the
+# self-pipe); `PostmasterIsAlive[Internal]` is a static inline that
+# bindgen omits. We replicate its non-blocking `read()` of 1 byte
+# inline — see frontend.rs.
+libc = "0.2"
+
 # v0 phase 0 stub — the wire and TLS deps land per-phase:
 #   pgwire        = { workspace = true }  # phase 4 (startup + simple query)
 #   openssl       = { workspace = true }  # phase 8 (TLS)

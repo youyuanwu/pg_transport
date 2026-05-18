@@ -3,34 +3,79 @@
 //! handing client fds via `SCM_RIGHTS`.
 //!
 //! See [`docs/design/README.md`](../../../docs/design/README.md) for
-//! the topic index; v0 scope is locked at phase 0 (this scaffold).
+//! the topic index.
 //!
 //! v0 surface (incremental, see `docs/design/roadmap.md`):
-//! * phase 0 — this scaffold: workspace compiles; `_PG_init`
-//!   registers nothing yet.
-//! * phase 1 — frontend bgworker boots a tokio current-thread
-//!   runtime; heartbeat; SIGHUP/SIGTERM.
+//! * phase 0 — scaffold: workspace compiles; `_PG_init` is a no-op.
+//! * phase 1 — **this phase**: `_PG_init` SPL-checks and registers the
+//!   frontend bgworker, which boots a tokio current-thread runtime
+//!   with heartbeat, SIGHUP/SIGTERM, and postmaster-death watchdog.
 //! * phase 2+ — backend pool, handoff, wire layer, SPI bridge.
 
+use std::time::Duration;
+
+use pgrx::bgworkers::{BackgroundWorkerBuilder, BgWorkerStartTime};
 use pgrx::prelude::*;
 
 ::pgrx::pg_module_magic!(name, version);
 
+mod frontend;
+
 /// Postgres calls this once per backend when it loads the extension's
-/// shared library. v0 phase 0: no-op. Subsequent phases will register
-/// GUCs (`guc::init()`), start the frontend bgworker
-/// (`BackgroundWorkerBuilder::load()`), and validate `auth_source`
-/// (see [`docs/design/backend-handoff.md`](../../../docs/design/backend-handoff.md)
-/// §1 and [`docs/design/configuration.md`](../../../docs/design/configuration.md)).
+/// shared library. In the postmaster (when `shared_preload_libraries`
+/// includes us) this is the only context where static
+/// `RegisterBackgroundWorker` calls are legal — see
+/// [`docs/design/backend-handoff.md`](../../../docs/design/backend-handoff.md) §1
+/// and the Q4 / Q22 resolutions in `docs/design/roadmap.md` §2.3.
 ///
-/// Must be `#[pg_guard]`'d so that any panic / `ereport(ERROR)` inside
-/// initialization is converted to a Postgres ERROR rather than
-/// unwinding into Postgres' C frames. (Workspace also sets
-/// `panic = "abort"` per docs/design/roadmap.md Q9, so an uncaught
-/// panic aborts the postmaster — keep this body minimal.)
+/// Phase 1: SPL check + frontend bgworker registration. Slot pool
+/// registration (phase 2) lands in the same function alongside the
+/// frontend.
+///
+/// `#[pg_guard]` converts PG errors into something Rust can observe.
+/// Workspace also sets `panic = "abort"` (Q9), so keep this body
+/// minimal: a Rust panic here aborts the postmaster. For boundary
+/// errors we use `ereport!(FATAL, …)` rather than `error!()`,
+/// because `error!()` → `panic_any()` interacts badly with
+/// `panic = "abort"` (see Q24 in `docs/design/roadmap.md`).
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
-    // Intentionally empty in phase 0.
+    // SAFETY: `process_shared_preload_libraries_in_progress` is a
+    // process-global PG flag set during postmaster startup; reading
+    // it is a plain memory load with no aliasing concerns.
+    let in_spl = unsafe { pg_sys::process_shared_preload_libraries_in_progress };
+    if !in_spl {
+        // Not in shared_preload_libraries — we're being loaded by a
+        // regular backend (e.g. on first `CREATE EXTENSION`). Static
+        // bgworker registration is illegal here, and we refuse to
+        // proceed rather than silently degrade. Rationale + the
+        // rejected lazy-spawn path: docs/design/roadmap.md Q4.
+        //
+        // FATAL (not ERROR) deliberately: `ereport!(ERROR, …)`
+        // routes through `panic_any`, which under `panic = "abort"`
+        // aborts the backend with SIGABRT instead of emitting a
+        // readable error message. `ereport!(FATAL, …)` calls PG's C
+        // ereport(FATAL) directly → `proc_exit(1)` → clean.
+        pgrx::ereport!(
+            FATAL,
+            PgSqlErrorCode::ERRCODE_CONFIG_FILE_ERROR,
+            "pg_transport must be in shared_preload_libraries",
+            "Set `shared_preload_libraries = 'pg_transport'` in postgresql.conf and restart."
+        );
+    }
+
+    // Frontend bgworker (Q22 → option (a)): registered statically so
+    // it comes up at postmaster start. Slot-pool registration lands
+    // here in phase 2; see the `_PG_init()` sketch in
+    // docs/design/backend-handoff.md §1 for the eventual full shape.
+    BackgroundWorkerBuilder::new("pg_transport frontend")
+        .set_type("pg_transport_frontend")
+        .set_library("pg_transport")
+        .set_function("pg_transport_frontend_main")
+        .set_start_time(BgWorkerStartTime::RecoveryFinished)
+        .set_restart_time(Some(Duration::from_secs(1)))
+        .enable_shmem_access(None)
+        .load();
 }
 
 /// Returns the extension version as a packed integer:
@@ -87,11 +132,9 @@ pub mod pg_test {
 
     #[must_use]
     pub fn postgresql_conf_options() -> Vec<&'static str> {
-        // Phase 0: empty. Future phases will add
-        //   "shared_preload_libraries = 'pg_transport'"
-        // here (required for static bgworker registration via
-        // BackgroundWorkerBuilder::load() — see
-        // docs/design/backend-handoff.md §1).
-        vec![]
+        // Required for the SPL check in `_PG_init()` to pass and for
+        // `BackgroundWorkerBuilder::load()` (static registration) to
+        // be legal — see docs/design/backend-handoff.md §1.
+        vec!["shared_preload_libraries = 'pg_transport'"]
     }
 }

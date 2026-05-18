@@ -60,9 +60,64 @@ connection migration, RDMA protocol pairing, DPDK CPU budget) live in
 
 ### 2.1 Still open — v0 path
 
-*(None.)* All v0-path open questions have been resolved; see
-[§2.3](#23-resolved). New v0-path questions land here as they're
-identified.
+*(One item identified during phase-1 implementation; does not block
+phase 1 — `_PG_init()` works around it via `ereport!(FATAL, …)` —
+but must be resolved before the phase-4 wire→SPI bridge lands.)*
+
+**Q24. `panic = "abort"` × pgrx error propagation.** The Q9
+resolution (`panic = "abort"` workspace-wide) interacts badly with
+pgrx 0.18's error-raising machinery and, more importantly, with its
+error-*catching* machinery. Concretely:
+
+- `pgrx::error!()` and `pgrx::ereport!(ERROR, …)` raise PG errors
+  by calling `std::panic::panic_any(report)` (see
+  `pgrx-pg-sys-0.18.0/src/submodules/panic.rs:158`). Under
+  `panic = "abort"` this is SIGABRT, not a readable error.
+  *Mitigation:* use `ereport!(FATAL, …)` for boundary errors
+  (FATAL routes through `do_ereport()` → `proc_exit(1)` directly,
+  no Rust panic involved). `_PG_init` already does this.
+- More serious: when PG raises an ERROR from inside a pgrx-mediated
+  call (e.g. SPI), pgrx's `cee-scape` wrapper catches the longjmp
+  and re-raises it as a Rust panic so `PgTryBuilder` (and `catch_unwind`)
+  can inspect it. Under `panic = "abort"` that catch never happens —
+  *any* PG ERROR aborts the bgworker. This is fine for our slot
+  bgworkers in the "panic = bug" sense (Q9 rationale) **except**
+  that the phase-4 wire→SPI bridge needs to catch user SQL errors
+  and convert them into wire `ErrorResponse` frames. That requires
+  catching the panic, which requires unwinding.
+
+Three options:
+
+- **(a) Reverse Q9 — switch to `panic = "unwind"`.** Cost: the
+  `catch_unwind` / `AssertUnwindSafe` boilerplate Q9 was avoiding,
+  and the more subtle issue that a panic in a non-PG-aware tokio
+  task can now half-unwind through the runtime. Benefit:
+  `PgTryBuilder` works; pgrx machinery behaves as documented.
+- **(b) Keep `panic = "abort"`; catch PG errors via raw
+  `pg_sys::PG_TRY()` / cee-scape ourselves.** The wire bridge wraps
+  every SPI call in a manual `cee_scape::call_with_setjmp` that
+  catches the longjmp before pgrx's panic re-raise has a chance to
+  fire. Cost: every SPI call site grows a wrapper; we duplicate
+  pgrx's catch machinery; we're now relying on undocumented
+  invariants of how pgrx decides whether to repanic.
+- **(c) Keep `panic = "abort"`; let SPI errors kill the slot.** A
+  user `SELECT 1/0` aborts the slot bgworker; the postmaster
+  respawns it; the frontend's next handoff to that slot sees
+  `EPIPE` and the client gets a connection drop instead of an
+  `ErrorResponse` frame. *Wire-protocol-incorrect* (a real PG
+  backend converts division-by-zero into `SQLSTATE 22012` on the
+  wire), so this fails the phase-4 acceptance ("`psql -c
+  'SELECT 1'` returns `1`") for any query that errors.
+
+Lean: **(a)**, reluctantly. (c) is wire-incorrect; (b) is too
+clever and brittle. (a) costs us the elegance argument in Q9 but
+keeps the whole pgrx contract working as documented. Re-litigates
+Q9. Affects [roadmap.md §2.3 Q9](#23-resolved) (would flip to
+"Resolved: unwind"), [workspace `Cargo.toml`](../../../Cargo.toml)
+([profile.dev] / [profile.release]), all current `pgrx::log!`
+sites (no change), and the phase-4 wire bridge design (which
+becomes implementable). Decision needed before phase 4 starts;
+phase 1 / 2 / 3 work regardless.
 
 ### 2.2 Still open — deferred only
 
@@ -263,6 +318,15 @@ blast radius as a PG backend `FATAL`, and acceptable for a research
 framework where panics indicate genuine bugs that should be fixed, not
 papered over.
 
+> **Contested by [Q24](#21-still-open--v0-path)** (added during
+> phase-1 implementation). pgrx 0.18's error machinery uses Rust
+> panics for both raising (`error!` / `ereport!(ERROR, …)` →
+> `panic_any`) and catching (PG ERROR caught via cee-scape → re-raised
+> as panic so `PgTryBuilder` can inspect it). With `panic = "abort"`
+> both paths abort the process instead of doing what the docs say.
+> The boundary-error case is workable (use `ereport!(FATAL, …)`); the
+> catch case is fatal to the phase-4 wire bridge design. See Q24.
+
 **Q12. TLS implementation in the backend wire layer.** ~~Open~~
 **Resolved.** rust-openssl (`openssl` + `tokio-openssl` crates), by
 default. Reuses the same OpenSSL the rest of the cluster links
@@ -375,6 +439,69 @@ runner, one `select!` arm in `handoff()`).
 This is the choice that lets [Q20](#23-resolved) keep `Ok(())` from
 `handoff()` meaning "kernel accepted the fd-pass" rather than
 "backend has the fd in hand".
+
+**Q22. Frontend bgworker spawn mechanism.** ~~Open~~ **Resolved:
+option (a) — static FE alongside the slots in `_PG_init()`.** The
+frontend bgworker is registered via `BackgroundWorkerBuilder::load()`
+at postmaster start, identically to the slot bgworkers. The
+operator workflow is "set `shared_preload_libraries =
+'pg_transport'` and restart"; nothing else is required to get a
+running frontend. Rationale:
+
+- **Phase-1 acceptance criterion is automatically met** ("FE
+  bgworker boots a tokio current-thread runtime") with no
+  additional spawn-path machinery to write.
+- **One spawn site, one mental model.** Both FE and slots are
+  registered in `_PG_init()`; the postmaster owns restart policy
+  for both via `bgw_restart_time`. No dynamic registration in v0.
+- **`pg_transport.reload()` becomes unambiguous.** It re-reads
+  `pg_transport.transports` from the catalog and reconciles the
+  set of live listeners; it does *not* bounce the FE process.
+  `start()` / `stop()` map to "enable listeners for all rows where
+  `enabled = true`" / "drop all live listeners" respectively
+  (drop ≠ disable: catalog state is untouched). Operationally,
+  `start()` after a fresh `CREATE EXTENSION` is the first time
+  any listener is bound; before that the FE is up but idle on its
+  `select!` loop.
+- **Cost accepted.** One extra bgworker even when no transports
+  are configured. For a research framework this is in the noise;
+  the operator can drop `pg_transport` from
+  `shared_preload_libraries` if they want zero overhead.
+
+Affects [backend-handoff.md §1](backend-handoff.md#1-pool-spawning-_pg_init--shared_preload_libraries)
+("does not register the frontend" bullet inverts),
+[architecture.md §2](architecture.md#2-runtime-integration-tokio--pgrx--pg-signals)
+(callout removed), [configuration.md](configuration.md) (SQL-surface
+semantics pinned). Option (b) "dynamic FE via start()" and option (c)
+"pause/resume" are kept in this entry for the record; if a
+later phase needs to defer FE startup (e.g. for multi-tenant
+clusters where most DBs don't enable the extension), option (c) is
+the natural follow-on.
+
+**Q23. Phase-1 GUC inventory.** ~~Open~~ **Resolved: phase 1 ships
+with zero new GUCs.** Heartbeat interval (1 s) and postmaster
+watchdog interval (500 ms) are hard-coded constants in the frontend
+bgworker; log routing uses `pgrx::log!` / `pgrx::info!` against PG's
+existing `log_min_messages`. Rationale:
+
+- **Phase-1 acceptance is operational, not configurable** —
+  "heartbeat logs every 1 s, SIGHUP / SIGTERM honoured" needs no
+  knob to verify.
+- **GUC surface starts at phase 2** with `auth_source` +
+  `backend_pool_size`, because those have no defensible default
+  (auth_source is policy; pool_size depends on workload). Phase 1
+  has no comparable forced choice.
+- **YAGNI applies hard to research-framework knobs.** Every GUC
+  is a forever-API; the cost of adding one now and changing the
+  default later is higher than the cost of adding one later when
+  someone actually wants a different value.
+
+If phase-1 operational experience surfaces a need, the knob lands
+in its phase — same precedent as `pg_transport.tls_min_proto`
+(arrives in phase 8) and `pg_transport.metrics_port` (arrives when
+the metrics endpoint does). No doc updates required by this
+resolution: the [configuration.md](configuration.md) GUC list
+already enumerates only phase-≥2 knobs.
 
 ---
 

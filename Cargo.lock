@@ -961,6 +961,7 @@ version = "0.0.1"
 dependencies = [
  "api",
  "futures",
+ "libc",
  "pgrx",
  "pgrx-tests",
  "tokio",

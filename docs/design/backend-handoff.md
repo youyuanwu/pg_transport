@@ -95,12 +95,27 @@ pub extern "C" fn _PG_init() {
             .enable_shmem_access(None)
             .load();   // ← static; calls RegisterBackgroundWorker under the hood
     }
+
+    // The frontend bgworker (Q22 → option (a) in roadmap.md §2.3).
+    // Registered statically here so the operational story is "set
+    // shared_preload_libraries and restart"; pg_transport.start() is
+    // a listener-set operation, not a process-spawn operation.
+    BackgroundWorkerBuilder::new("pg_transport frontend")
+        .set_type("pg_transport_frontend")
+        .set_library("pg_transport")
+        .set_function("pg_transport_frontend_main")
+        .set_start_time(BgWorkerStartTime::RecoveryFinished)
+        .set_restart_time(Some(Duration::from_secs(1)))
+        .enable_shmem_access(None)
+        .load();
 }
 ```
 
 Once `PostmasterMain` finishes recovery, the postmaster spawns all
-`pool_size` workers; each runs `pg_transport_slot_main(slot_id)` which
-is the entry point for the slot runner loop in §2 below.
+`pool_size` slot workers (each running `pg_transport_slot_main(slot_id)`,
+the entry point for the slot runner loop in §2 below) plus the single
+frontend worker (running `pg_transport_frontend_main`, the entry point
+in [architecture.md §2](architecture.md#2-runtime-integration-tokio--pgrx--pg-signals)).
 
 ### Why static (not `load_dynamic()`)
 
@@ -125,14 +140,13 @@ bench harness.
 ### What `_PG_init()` does *not* do
 
 - It does not start the tokio runtime in the postmaster. Runtimes
-  are per-slot, created inside each bgworker's `pg_transport_slot_main`
-  (see [§3 Async / threading model](#3-async--threading-model)).
-- It does not register the frontend bgworker — the frontend is
-  spawned dynamically by `pg_transport.start()` from a SQL backend
-  (the FE/IPC-side mechanics live in
-  [frontend-handoff.md](frontend-handoff.md)).
+  are per-bgworker, created inside each bgworker's `*_main`
+  entry point (see [§3 Async / threading model](#3-async--threading-model)
+  for slots; [architecture.md §2](architecture.md#2-runtime-integration-tokio--pgrx--pg-signals)
+  for the frontend).
 - It does not bind any sockets or read the catalog. All of that is
-  deferred to the frontend bgworker.
+  deferred to the frontend bgworker, which lazily binds on
+  `pg_transport.start()` (see [Q22 in roadmap.md §2.3](roadmap.md#23-resolved)).
 
 ---
 

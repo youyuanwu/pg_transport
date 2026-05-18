@@ -103,8 +103,7 @@ The frontend's bgworker entry point is roughly:
 
 ```rust
 #[pg_guard]
-pub extern "C" fn pg_transport_frontend_main(_arg: pg_sys::Datum) {
-    BackgroundWorker::attach_signal_handlers(
+pub extern "C" fn pg_transport_frontend_main(_arg: pg_sys::Datum) {    BackgroundWorker::attach_signal_handlers(
         SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM,
     );
     BackgroundWorker::connect_worker_to_spi(Some("postgres"), None);
