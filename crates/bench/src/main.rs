@@ -27,27 +27,31 @@
 //!
 //! ```text
 //! bench --target HOST:PORT [--iterations N] [--warmup N]
-//!       [--user USER] [--db DB] [--csv FILE] [--label LABEL]
-//! bench compare [--iterations N] [--warmup N]
+//!       [--connections N] [--user USER] [--db DB] [--csv FILE]
+//!       [--label LABEL]
+//! bench compare [--iterations N] [--warmup N] [--connections N]
 //!       [--pt-port P] [--pg-port P] [--user USER] [--db DB]
 //!       [--csv FILE]
 //! ```
 //!
-//! Defaults: iterations=1000, warmup=100, user=postgres,
-//! db=postgres, host=127.0.0.1, pt-port=5454, pg-port=54329.
+//! Defaults: iterations=1000 (TOTAL across all workers), warmup=100
+//! (per worker), connections=1, user=postgres, db=postgres,
+//! host=127.0.0.1, pt-port=5454, pg-port=54329.
 //!
-//! Phase ≥ 6 will grow this: concurrency knob, multiple statement
-//! shapes, baseline matrix (TCP/UDS, cold/warm slot).
+//! Phase ≥ 6 will grow this: multiple statement shapes, baseline
+//! matrix (TCP/UDS, cold/warm slot), histogram CDF dump.
 
 use std::env;
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+use tokio::sync::Barrier;
 use tokio_postgres::NoTls;
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() -> Result<()> {
     let mut args = env::args();
     let prog = args.next().unwrap_or_else(|| "bench".to_string());
@@ -75,25 +79,18 @@ async fn run_single(args: &[String]) -> Result<()> {
     let conn_str = cfg.conn_string();
 
     eprintln!(
-        "bench: target={} iterations={} warmup={}",
-        cfg.target, cfg.iterations, cfg.warmup
+        "bench: target={} iterations={} warmup={} connections={}",
+        cfg.target, cfg.iterations, cfg.warmup, cfg.connections
     );
 
-    let samples = run_workload(&conn_str, cfg.iterations, cfg.warmup).await?;
-    let summary = summarize(&samples);
-    print_summary(
-        &cfg.label.clone().unwrap_or_else(|| cfg.target.clone()),
-        &summary,
-    );
+    let (samples, wall) =
+        run_workload(&conn_str, cfg.iterations, cfg.warmup, cfg.connections).await?;
+    let summary = summarize(&samples, wall);
+    let label = cfg.label.clone().unwrap_or_else(|| cfg.target.clone());
+    print_summary(&label, cfg.connections, &summary);
 
     if let Some(path) = &cfg.csv {
-        write_csv(
-            path,
-            &[(
-                cfg.label.clone().unwrap_or_else(|| cfg.target.clone()),
-                samples.clone(),
-            )],
-        )?;
+        write_csv(path, &[(label, samples.clone())])?;
         eprintln!("bench: wrote {} samples to {}", samples.len(), path);
     }
 
@@ -107,6 +104,7 @@ struct SingleArgs {
     db: String,
     iterations: usize,
     warmup: usize,
+    connections: usize,
     csv: Option<String>,
     label: Option<String>,
 }
@@ -119,6 +117,7 @@ impl Default for SingleArgs {
             db: "postgres".to_string(),
             iterations: 1000,
             warmup: 100,
+            connections: 1,
             csv: None,
             label: None,
         }
@@ -159,6 +158,12 @@ impl SingleArgs {
                         .context("--warmup must be a non-negative integer")?;
                     i += 2;
                 }
+                "--connections" => {
+                    self.connections = val()?
+                        .parse()
+                        .context("--connections must be a positive integer")?;
+                    i += 2;
+                }
                 "--csv" => {
                     self.csv = Some(val()?.clone());
                     i += 2;
@@ -176,6 +181,16 @@ impl SingleArgs {
         }
         if self.iterations == 0 {
             bail!("--iterations must be > 0");
+        }
+        if self.connections == 0 {
+            bail!("--connections must be > 0");
+        }
+        if self.connections > self.iterations {
+            bail!(
+                "--connections ({}) > --iterations ({}); each worker needs at least one query",
+                self.connections,
+                self.iterations
+            );
         }
         Ok(())
     }
@@ -201,11 +216,12 @@ async fn run_compare(args: &[String]) -> Result<()> {
     cfg.parse(args)?;
 
     eprintln!(
-        "bench compare: pt={} pg={} iterations={} warmup={}",
+        "bench compare: pt={} pg={} iterations={} warmup={} connections={}",
         cfg.pt_target(),
         cfg.pg_target(),
         cfg.iterations,
         cfg.warmup,
+        cfg.connections,
     );
 
     let pt_conn = format!(
@@ -220,17 +236,17 @@ async fn run_compare(args: &[String]) -> Result<()> {
     // Run vanilla first as the baseline reference, then pg_transport.
     // Sequential (not parallel) so the two share no contention; the
     // numbers should be a clean delta.
-    let pg_samples = run_workload(&pg_conn, cfg.iterations, cfg.warmup)
+    let (pg_samples, pg_wall) = run_workload(&pg_conn, cfg.iterations, cfg.warmup, cfg.connections)
         .await
         .context("vanilla PG bench")?;
-    let pt_samples = run_workload(&pt_conn, cfg.iterations, cfg.warmup)
+    let (pt_samples, pt_wall) = run_workload(&pt_conn, cfg.iterations, cfg.warmup, cfg.connections)
         .await
         .context("pg_transport bench")?;
 
-    let pg_sum = summarize(&pg_samples);
-    let pt_sum = summarize(&pt_samples);
+    let pg_sum = summarize(&pg_samples, pg_wall);
+    let pt_sum = summarize(&pt_samples, pt_wall);
 
-    print_compare(&pg_sum, &pt_sum);
+    print_compare(cfg.connections, &pg_sum, &pt_sum);
 
     if let Some(path) = &cfg.csv {
         write_csv(
@@ -257,6 +273,7 @@ struct CompareArgs {
     db: String,
     iterations: usize,
     warmup: usize,
+    connections: usize,
     csv: Option<String>,
 }
 
@@ -269,6 +286,7 @@ impl Default for CompareArgs {
             db: "postgres".to_string(),
             iterations: 1000,
             warmup: 100,
+            connections: 1,
             csv: None,
         }
     }
@@ -308,6 +326,10 @@ impl CompareArgs {
                     self.warmup = val()?.parse().context("--warmup")?;
                     i += 2;
                 }
+                "--connections" => {
+                    self.connections = val()?.parse().context("--connections")?;
+                    i += 2;
+                }
                 "--csv" => {
                     self.csv = Some(val()?.clone());
                     i += 2;
@@ -321,6 +343,16 @@ impl CompareArgs {
         }
         if self.iterations == 0 {
             bail!("--iterations must be > 0");
+        }
+        if self.connections == 0 {
+            bail!("--connections must be > 0");
+        }
+        if self.connections > self.iterations {
+            bail!(
+                "--connections ({}) > --iterations ({}); each worker needs at least one query",
+                self.connections,
+                self.iterations
+            );
         }
         Ok(())
     }
@@ -337,10 +369,103 @@ impl CompareArgs {
 // Workload + summary
 // ---------------------------------------------------------------------------
 
-/// Run `iterations` simple-query `SELECT 1` round-trips on a fresh
-/// connection, after `warmup` warm-up round-trips. Returns the raw
-/// latency samples (one per measured iteration).
-async fn run_workload(conn_str: &str, iterations: usize, warmup: usize) -> Result<Vec<Duration>> {
+/// Top-level workload runner: spawn `connections` workers, each
+/// with its own tokio-postgres connection. Each worker connects,
+/// runs `warmup` SELECT 1 round-trips to prime its slot + plan
+/// cache, then BARRIERS with the others. Wall clock starts on
+/// barrier release, ends when every worker has finished its share
+/// of `iterations` measured round-trips. Returns (all per-query
+/// latencies, wall clock of the measured phase).
+///
+/// QPS is computed by the caller as `iterations / wall_clock` — NOT
+/// `iterations / sum(samples)` (which over-counts under concurrency,
+/// since per-worker samples overlap in real time).
+///
+/// Barrier timeout: with v0's one-connection-per-slot model
+/// ([Q10 in roadmap.md](../../docs/design/roadmap.md) deferred),
+/// `connections > backend_pool_size` will deadlock — extra
+/// connections queue on a busy slot's UDS and can't even complete
+/// their TCP startup, so they never reach the barrier. We time the
+/// barrier wait out at 30 s and surface the misconfig as a
+/// readable error rather than hanging.
+const BARRIER_TIMEOUT: Duration = Duration::from_secs(30);
+
+async fn run_workload(
+    conn_str: &str,
+    iterations: usize,
+    warmup: usize,
+    connections: usize,
+) -> Result<(Vec<Duration>, Duration)> {
+    let per_worker_base = iterations / connections;
+    let extra = iterations % connections;
+    // `+1` accounts for the coordinator that releases the barrier
+    // and then awaits worker completion.
+    let barrier = Arc::new(Barrier::new(connections + 1));
+
+    let mut handles = Vec::with_capacity(connections);
+    for worker_id in 0..connections {
+        let iters = per_worker_base + if worker_id < extra { 1 } else { 0 };
+        let conn_str = conn_str.to_string();
+        let barrier = barrier.clone();
+        handles.push(tokio::spawn(async move {
+            run_one_worker(&conn_str, iters, warmup, barrier).await
+        }));
+    }
+
+    // Wait for every worker to reach the barrier (i.e. finish its
+    // warmup and be ready to measure). Time out if they don't —
+    // see BARRIER_TIMEOUT above.
+    match tokio::time::timeout(BARRIER_TIMEOUT, barrier.wait()).await {
+        Ok(_) => {}
+        Err(_) => {
+            // Don't abort the workers explicitly; let them stay
+            // pending so any in-flight queries don't leak. The
+            // process exit on Err return takes them with it.
+            bail!(
+                "barrier timeout after {:?}: only some workers finished warmup. \
+                 If `--connections` ({}) > pg_transport.backend_pool_size, the \
+                 extra connections queue on a busy slot's UDS and can never \
+                 complete startup (v0 limitation; see Q10 in \
+                 docs/design/roadmap.md).",
+                BARRIER_TIMEOUT,
+                connections
+            );
+        }
+    }
+    let wall_start = Instant::now();
+
+    let mut all_samples = Vec::with_capacity(iterations);
+    let mut first_err: Option<anyhow::Error> = None;
+    for h in handles {
+        match h.await {
+            Ok(Ok(samples)) => all_samples.extend(samples),
+            Ok(Err(e)) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+            Err(join_err) => {
+                if first_err.is_none() {
+                    first_err = Some(anyhow::anyhow!("worker join: {join_err}"));
+                }
+            }
+        }
+    }
+    let wall = wall_start.elapsed();
+
+    if let Some(e) = first_err {
+        return Err(e);
+    }
+    Ok((all_samples, wall))
+}
+
+/// One worker: connect, warmup, barrier, measured iters, teardown.
+async fn run_one_worker(
+    conn_str: &str,
+    iterations: usize,
+    warmup: usize,
+    barrier: Arc<Barrier>,
+) -> Result<Vec<Duration>> {
     let (client, conn) = tokio_postgres::connect(conn_str, NoTls)
         .await
         .with_context(|| format!("connect: {conn_str}"))?;
@@ -363,6 +488,9 @@ async fn run_workload(conn_str: &str, iterations: usize, warmup: usize) -> Resul
             .context("warmup query")?;
     }
 
+    // Wait for every other worker to also finish warmup.
+    barrier.wait().await;
+
     let mut samples = Vec::with_capacity(iterations);
     for _ in 0..iterations {
         let t = Instant::now();
@@ -383,7 +511,7 @@ async fn run_workload(conn_str: &str, iterations: usize, warmup: usize) -> Resul
 #[derive(Debug, Clone, Copy)]
 struct Summary {
     n: usize,
-    total: Duration,
+    wall: Duration,
     min: Duration,
     p50: Duration,
     p95: Duration,
@@ -393,7 +521,7 @@ struct Summary {
     qps: f64,
 }
 
-fn summarize(samples: &[Duration]) -> Summary {
+fn summarize(samples: &[Duration], wall: Duration) -> Summary {
     assert!(
         !samples.is_empty(),
         "summarize requires at least one sample"
@@ -401,7 +529,6 @@ fn summarize(samples: &[Duration]) -> Summary {
     let mut sorted: Vec<Duration> = samples.to_vec();
     sorted.sort();
     let n = sorted.len();
-    let total: Duration = samples.iter().copied().sum();
     let mean = Duration::from_nanos(
         (samples.iter().map(|d| d.as_nanos()).sum::<u128>() / n as u128) as u64,
     );
@@ -412,14 +539,14 @@ fn summarize(samples: &[Duration]) -> Summary {
     };
     Summary {
         n,
-        total,
+        wall,
         min: sorted[0],
         p50: pct(50),
         p95: pct(95),
         p99: pct(99),
         max: sorted[n - 1],
         mean,
-        qps: n as f64 / total.as_secs_f64(),
+        qps: n as f64 / wall.as_secs_f64(),
     }
 }
 
@@ -429,11 +556,11 @@ fn fmt_us(d: Duration) -> String {
     format!("{:.1}", d.as_secs_f64() * 1_000_000.0)
 }
 
-fn print_summary(label: &str, s: &Summary) {
+fn print_summary(label: &str, connections: usize, s: &Summary) {
     eprintln!();
-    eprintln!("--- {label} ---");
+    eprintln!("--- {label} (connections={connections}) ---");
     eprintln!("n        : {}", s.n);
-    eprintln!("total    : {:?}", s.total);
+    eprintln!("wall     : {:?}", s.wall);
     eprintln!("qps      : {:>8.1}", s.qps);
     eprintln!("min      : {:>8} µs", fmt_us(s.min));
     eprintln!("p50      : {:>8} µs", fmt_us(s.p50));
@@ -443,7 +570,7 @@ fn print_summary(label: &str, s: &Summary) {
     eprintln!("mean     : {:>8} µs", fmt_us(s.mean));
 }
 
-fn print_compare(pg: &Summary, pt: &Summary) {
+fn print_compare(connections: usize, pg: &Summary, pt: &Summary) {
     let ratio = |a: Duration, b: Duration| {
         if b.as_nanos() == 0 {
             "n/a".to_string()
@@ -452,6 +579,7 @@ fn print_compare(pg: &Summary, pt: &Summary) {
         }
     };
     eprintln!();
+    eprintln!("connections={connections}");
     eprintln!(
         "{:<10}  {:>10}  {:>14}  {:>14}  {:>10}",
         "stat", "vanilla µs", "pg_transport µs", "diff µs", "pt/pg"
@@ -520,17 +648,20 @@ bench — pg_transport latency / throughput harness.
 
 USAGE:
     {prog} --target HOST:PORT [--iterations N] [--warmup N]
-                [--user U] [--db D] [--csv FILE] [--label L]
+                [--connections N] [--user U] [--db D]
+                [--csv FILE] [--label L]
 
     {prog} compare [--pt-port P] [--pg-port P] [--iterations N]
-                [--warmup N] [--user U] [--db D] [--csv FILE]
+                [--warmup N] [--connections N]
+                [--user U] [--db D] [--csv FILE]
 
-Defaults: iterations=1000, warmup=100, user=postgres, db=postgres,
-          host=127.0.0.1, pt-port=5454, pg-port=54329.
+Defaults: iterations=1000 (TOTAL across workers), warmup=100 (per
+worker), connections=1, user=postgres, db=postgres, host=127.0.0.1,
+pt-port=5454, pg-port=54329.
 
 Examples:
     bench --target 127.0.0.1:5454 --iterations 5000
-    bench compare --iterations 5000 --csv /tmp/bench.csv
+    bench compare --iterations 5000 --connections 4 --csv /tmp/b.csv
 "
     );
 }

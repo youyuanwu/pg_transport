@@ -139,10 +139,12 @@ fn run_slot(slot_id: u32) -> io::Result<()> {
 }
 
 fn connect_with_retry(path: &std::path::Path, slot_id: u32) -> io::Result<UnixStream> {
-    // Total budget: 30 retries × 100 ms = 3 s. Enough to ride out
-    // the postmaster spawning FE and slots concurrently; if the FE
-    // really isn't coming up that's a hard error worth aborting on.
-    const MAX_RETRIES: u32 = 30;
+    // Total budget: 100 retries × 100 ms = 10 s. The postmaster
+    // spawns large bgworker batches sequentially, so a late slot
+    // may not even exist when the first slot has already started
+    // retrying. 10 s comfortably covers the GUC's upper pool size
+    // (64) on every machine we've tested.
+    const MAX_RETRIES: u32 = 100;
     const BACKOFF: Duration = Duration::from_millis(100);
 
     for attempt in 0..MAX_RETRIES {

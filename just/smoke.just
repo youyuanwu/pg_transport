@@ -54,6 +54,12 @@ smoke pg=default_pg:
     unix_socket_directories = '/tmp/pg_transport_smoke'
     logging_collector = off
     log_min_messages = log
+    # max_worker_processes default is 8 — covers our 1 FE + 2 slots
+    # + PG-internal bgworkers comfortably. Bump explicitly here so
+    # someone editing `backend_pool_size` higher in this file
+    # doesn't silently lose registrations (see bench.just for the
+    # phase-5 framing of this).
+    max_worker_processes = 16
     EOF
 
     # Step 3 — start. The cluster pid file lives in $SMOKE_PGDATA so

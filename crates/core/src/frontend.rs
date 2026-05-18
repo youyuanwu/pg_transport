@@ -28,10 +28,11 @@ use crate::handoff::tcp::{TcpHandoff, TcpHandoffCfg};
 
 /// How long we wait for any single slot bgworker to connect to its
 /// listener before giving up. Static registration spawns slots
-/// concurrently with the FE; the slot side retries `connect()` for
-/// 3 s (see `backend::slot::connect_with_retry`), so 5 s here has
-/// comfortable margin.
-const SLOT_ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
+/// concurrently with the FE, but the postmaster can serialise
+/// large bgworker batches over a few hundred ms. 30 s comfortably
+/// covers pool sizes through `pg_transport.backend_pool_size`'s
+/// upper bound (currently 64; see guc.rs).
+const SLOT_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Phase-3 hard-coded bind address for the single `tcp_handoff`
 /// transport. Phase ≥ 7 reads this from `pg_transport.transports`.

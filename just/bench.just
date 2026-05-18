@@ -16,13 +16,25 @@ BENCH_SOCKETS := "/tmp/pg_transport_sockets"
 
 # Run `bench compare` between pg_transport and vanilla PG.
 #
-# `iters` defaults to 1000 measured iterations per side (after
-# 100 warmup). For a longer run pass e.g. `just bench iters=10000`.
-# `csv` writes a per-sample CSV if set: `just bench csv=/tmp/b.csv`.
+# Parameters (just-syntax):
+#   pg=pg18        — Postgres major (matches the rest of the Justfile).
+#   iters=1000     — total measured iterations PER SIDE (split across
+#                    workers).
+#   connections=1  — concurrent worker connections per side.
+#   pool=""        — pg_transport.backend_pool_size; defaults to
+#                    `connections` so apples-to-apples (no contention).
+#                    Set explicitly higher than `connections` to test
+#                    underutilised pool, or lower to test contention
+#                    (each connection beyond pool_size queues on
+#                    slot availability).
+#   csv=""         — optional per-sample CSV path.
 #
-# pg=pg18 selects the Postgres major (matches the rest of the
-# Justfile).
-bench pg=default_pg iters="1000" csv="":
+# Examples:
+#   just bench                                 # 1 conn, 1 slot
+#   just bench connections=4                   # 4 conns, 4 slots (no contention)
+#   just bench connections=16 pool=4           # 16 conns, 4 slots (contention)
+#   just bench iters=10000 connections=8 csv=/tmp/b.csv
+bench pg=default_pg iters="1000" connections="1" pool="" csv="":
     #!/usr/bin/env bash
     set -euo pipefail
 
@@ -32,6 +44,13 @@ bench pg=default_pg iters="1000" csv="":
         exit 1
     fi
     pg_bin="$(dirname "$pgcfg")"
+
+    # Pool size: default to == connections (apples-to-apples), else
+    # whatever the caller asked for.
+    pool_size="{{pool}}"
+    if [[ -z "$pool_size" ]]; then
+        pool_size="{{connections}}"
+    fi
 
     # Step 1 — install the extension into PGRX_HOME ($PGRX_HOME's
     # share / lib trees). Also build the bench binary in release —
@@ -48,6 +67,15 @@ bench pg=default_pg iters="1000" csv="":
     "$pg_bin/initdb" -D {{BENCH_PGDATA}} -U postgres \
         --auth-local=trust --auth-host=trust --no-instructions >/dev/null
 
+    # PG's `max_worker_processes` defaults to 8 — that ceiling
+    # covers OUR FE bgworker + N slot bgworkers + PG's own
+    # bgworker users (logical replication launcher, etc).
+    # `BackgroundWorkerBuilder::load()` silently drops
+    # registrations beyond this limit; symptom is "slot N did not
+    # connect within 30s" from BackendPool::start. Give us pool +
+    # 8 slack: covers FE + PG-internal bgworkers with margin.
+    mwp=$(( pool_size + 8 ))
+
     cat >>{{BENCH_PGDATA}}/postgresql.conf <<EOF
     shared_preload_libraries = 'pg_transport'
     port = 54329
@@ -55,6 +83,8 @@ bench pg=default_pg iters="1000" csv="":
     listen_addresses = '127.0.0.1'
     logging_collector = off
     log_min_messages = warning
+    pg_transport.backend_pool_size = $pool_size
+    max_worker_processes = $mwp
     EOF
 
     "$pg_bin/pg_ctl" -D {{BENCH_PGDATA}} -l {{BENCH_LOG}} -w start >/dev/null
@@ -77,10 +107,13 @@ bench pg=default_pg iters="1000" csv="":
     }
     trap cleanup EXIT
 
+    echo "bench: backend_pool_size=$pool_size connections={{connections}} iters={{iters}}"
+
     # Step 3 — run the bench. `bench compare` connects to both
-    # ports, runs the workload sequentially (no contention), prints
-    # the comparison table to stderr.
-    args=(compare --iterations {{iters}})
+    # ports, runs the workload sequentially per side (no contention
+    # between vanilla and pg_transport), prints the comparison
+    # table to stderr.
+    args=(compare --iterations {{iters}} --connections {{connections}})
     if [[ -n "{{csv}}" ]]; then
         args+=(--csv "{{csv}}")
     fi

@@ -96,6 +96,17 @@ pub extern "C-unwind" fn _PG_init() {
     // restart policy. Per-slot UDS listener creation is the FE's
     // job and happens once the FE bgworker boots. See
     // docs/design/backend-handoff.md §1.
+    //
+    // CAPACITY NOTE: pgrx's `.load()` calls `RegisterBackgroundWorker`
+    // which silently fails (returns false, dropped by pgrx)
+    // when the postmaster's bgworker table is full. The table
+    // size is bounded by `max_worker_processes` (PG default = 8).
+    // Our footprint is 1 FE + `backend_pool_size` slots + PG's
+    // own bgworkers (logical replication launcher, etc.). For
+    // pool_size > ~6 the operator must bump max_worker_processes
+    // in postgresql.conf; the just/{smoke,bench}.just recipes do
+    // this automatically. A future phase may check the return
+    // value via raw pg_sys and emit a clear FATAL.
     let pool_size = guc::backend_pool_size();
     for slot_id in 0..pool_size {
         BackgroundWorkerBuilder::new(&format!("pg_transport slot {slot_id}"))
