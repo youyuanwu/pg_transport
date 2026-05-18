@@ -1,0 +1,20 @@
+# Workspace cargo config.
+#
+# Centralised so every `cargo …` invocation (and rust-analyzer)
+# sees the same setup — not just commands routed through `just`.
+
+[env]
+# Point pgrx at the repo-local Postgres install created by
+# `just init`. `relative = true` resolves the path against this
+# file's parent (the workspace root), so the value is portable.
+# `force = false` (the default) means an externally-set PGRX_HOME
+# still wins, matching the Justfile's `env_var_or_default`
+# behavior — useful for sharing a single ~/.pgrx across repos.
+PGRX_HOME = { value = ".pgrx", relative = true }
+
+[target.'cfg(target_os="macos")']
+# Postgres symbols are not available until runtime on macOS; tell
+# the linker to defer resolution rather than error out at link
+# time. Applies workspace-wide because every cdylib loaded into
+# the backend needs it.
+rustflags = ["-Clink-arg=-Wl,-undefined,dynamic_lookup"]

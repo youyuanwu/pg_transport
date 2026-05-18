@@ -6,7 +6,7 @@
 Transport plugins are regular Rust crates in the workspace, linked into
 the `core` extension at build time. v0 ships a single transport
 (`tcp_handoff`) compiled in directly — there are no Cargo features in
-v0 (see [workspace.md §2](workspace.md#2-cargo-features--deliberately-none-in-v0)).
+v0 (see [workspace.md §2](workspace.md#2-cargo-features--deliberately-minimal)).
 No dynamic loading, no FFI ABI, no `libloading`, no `unsafe extern "C"`.
 Within that build model, the framework standardises **only what must
 talk to PostgreSQL**:
@@ -175,13 +175,13 @@ further role for that connection.)
 
 ## 4. Example transport: `tcp_handoff`
 
-With the `handoff-listener` helper (see
+With the in-tree `handoff::listener` helper (see
 [transports.md §2.1](transports.md)), the body of `run` is six lines
 — build a listener, hand it to the shared loop:
 
 ```rust
-// crates/transport-tcp-handoff/src/lib.rs
-use handoff_listener::{run_handoff_loop, tcp_incoming};
+// crates/core/src/handoff/tcp.rs
+use crate::handoff::listener::{run_handoff_loop, tcp_incoming};
 
 pub struct TcpHandoff { cfg: TcpHandoffCfg }
 
@@ -211,7 +211,7 @@ trait method returns a `Pin<Box<dyn Future>>` rather than using the
 `#[async_trait]` macro — see §1 and
 [roadmap.md §2 Q8](roadmap.md#2-open-questions)). The accept loop
 itself, including shutdown discipline and per-accept error logging,
-lives in `handoff-listener` and is shared across every fd-producing
+lives in `handoff::listener` and is shared across every fd-producing
 transport (today and future ones). No FE/BE parsing, no
 auth code, no TLS code, no per-conn state machine: the backend
 ([backend-handoff.md](backend-handoff.md) slot runner +

@@ -1,0 +1,59 @@
+# Workspace root for pg_transport.
+#
+# Member crates live in crates/. Shared dependency versions are hoisted
+# into [workspace.dependencies] so member manifests can `workspace = true`.
+# See docs/design/workspace.md ("Cargo workspace layout") for the rationale.
+
+[workspace]
+members  = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version      = "0.0.1"
+edition      = "2024"
+rust-version = "1.95"
+license      = "MIT"
+repository   = "https://github.com/example/pg_transport"
+authors      = ["pg_transport contributors"]
+
+[workspace.dependencies]
+# pgrx requires exact-version pinning; bump in lockstep across the workspace.
+pgrx       = { version = "=0.18.0" }
+pgrx-tests = { version = "=0.18.0" }
+
+# Async runtime + Stream trait. Backend uses current-thread `block_on`
+# per handoff; frontend uses current-thread + LocalSet. See
+# docs/design/backend-handoff.md and docs/design/architecture.md.
+tokio   = { version = "1", default-features = false }
+futures = { version = "0.3", default-features = false }
+
+# Wire layer (sunng87/pgwire). v0 only; not yet linked into stubs.
+pgwire = "0.30"
+
+# TLS in the wire layer (Q12: rust-openssl). Not yet linked into stubs.
+openssl       = "0.10"
+tokio-openssl = "0.6"
+
+# Misc.
+thiserror   = "2"
+parking_lot = "0.12"
+
+# ---------------------------------------------------------------------------
+# Profile settings
+# ---------------------------------------------------------------------------
+#
+# panic = "abort" workspace-wide (Q9 in docs/design/roadmap.md §2.3).
+# A panic anywhere in a slot bgworker aborts that bgworker; the
+# frontend detects EPIPE on next sendmsg and respawns the slot
+# (Q21). Same blast radius as PG ereport(FATAL); avoids
+# `catch_unwind`/`AssertUnwindSafe` boilerplate around every
+# `spawn_local` / `W::run` site.
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic         = "abort"
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1

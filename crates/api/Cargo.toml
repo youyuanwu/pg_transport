@@ -1,0 +1,19 @@
+[package]
+name         = "api"
+description  = "Public traits for pg_transport plugins (HandoffTransport, types)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[lib]
+# Plain rlib — no pgrx, no PG headers, no proc-macro deps. A plugin
+# author writes pure Rust against these trait definitions without
+# dragging in the extension toolchain. See docs/design/workspace.md
+# and docs/design/api.md.
+
+[dependencies]
+tokio   = { workspace = true, features = ["net"] }
+futures = { workspace = true }

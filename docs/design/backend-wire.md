@@ -29,7 +29,7 @@ on the socket are ours from accept-after-handoff to disconnect.
 ## 1. The `Wire` trait
 
 ```rust
-// crates/backend/src/wire.rs
+// crates/core/src/wire/mod.rs
 use std::os::fd::OwnedFd;
 
 /// Pluggable wire-protocol implementation. The slot runner instantiates
@@ -87,7 +87,7 @@ COPY, FunctionCall, error/notice frames, parameter-status. What we add:
   honoured. The full cross-slot cancel-routing design is captured in
   [deferred/cancel-routing.md](deferred/cancel-routing.md).
 - **SPI bridge** — `pgwire`'s `QueryHandler` / `ExtendedQueryHandler`
-  trait bodies call into a small `crates/backend/src/spi_bridge.rs`
+  trait bodies call into a small `crates/core/src/backend/spi_bridge.rs`
   module that translates between FE/BE message intent and `SPI_*` calls
   (see §6).
 
@@ -264,7 +264,7 @@ blocks v0.
 ## 6. SPI bridge
 
 Once the wire layer has a parsed FE message (`Q`, `P`, `B`, `E`, …) it
-calls into `crates/backend/src/spi_bridge.rs`. The bridge:
+calls into `crates/core/src/backend/spi_bridge.rs`. The bridge:
 
 - For `Query` (`'Q'`): `SPI_connect` → `SPI_execute` → walk result
   tuples → emit `RowDescription` + `DataRow…` + `CommandComplete` +

@@ -64,17 +64,17 @@ trivial. This is a hard requirement on the [api.md §1](api.md) and
 Three concentric levels; each phase delivers at least the inner level
 and adds the next when its subsystem lands.
 
-### 3.1 Unit (per-crate, no PG)
+### 3.1 Unit (per-module, no PG)
 
 - `crates/api`: trait-level shape tests; no I/O.
-- `crates/handoff-listener`: drive `run_handoff_loop` with a
+- `core::handoff::listener`: drive `run_handoff_loop` with a
   fake `Stream<Item = io::Result<OwnedFd>>` + mock `HandoffHandle`.
   Assert accept-error backoff and shutdown drain behaviour.
-- `crates/wire-pgwire-v3`: drive `Wire::run` with `socketpair()` fds
+- `core::wire::pgwire_v3`: drive `Wire::run` with `socketpair()` fds
   loaded with recorded FE byte streams (captured via `psql` /
   tcpdump). Mock SPI bridge returns canned `SpiTupleTable`-shaped
   results. Mock HBA bridge returns canned rules.
-- `crates/transport-tcp-handoff`: trivial — verify `build()` parses
+- `core::handoff::tcp`: trivial — verify `build()` parses
   config and `run()` calls the listener-loop helper.
 
 ### 3.2 Integration (in-process PG via pgrx-tests)
@@ -106,7 +106,9 @@ and adds the next when its subsystem lands.
 
 The risk register above hinges on being able to inject specific
 failure modes. The seams from §2 must support the following injections,
-each provided as a trait adapter in `crates/testutil`:
+each provided as a trait adapter in `crates/core/tests/common/` (or a
+`crates/testutil/` rlib if a non-pgrx-test consumer ever needs them —
+see [workspace.md §1](workspace.md#1-cargo-workspace-layout)):
 
 | Failure mode                | How to inject                                                                                  |
 | --------------------------- | ---------------------------------------------------------------------------------------------- |

@@ -32,7 +32,7 @@ shared-slot policy, etc. — see [backend-pool.md](deferred/backend-pool.md).)
 
 There is **no** `plugins` catalog table — the set of available
 transports is fixed at compile time. v0 has no Cargo features (see
-[workspace.md §2](workspace.md#2-cargo-features--deliberately-none-in-v0));
+[workspace.md §2](workspace.md#2-cargo-features--deliberately-minimal));
 the registry is a single `insert` in `core` for `tcp_handoff`. A
 read-only function surfaces what's compiled in:
 

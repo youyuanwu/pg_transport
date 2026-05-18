@@ -139,7 +139,7 @@ bench harness.
 ## 2. The slot runner loop
 
 ```rust
-// crates/backend/src/slot.rs (sketch; pgrx + raw pg_sys + our wire trait)
+// crates/core/src/backend/slot.rs (sketch; pgrx + raw pg_sys + our wire trait)
 
 fn run_slot<W: Wire>(slot: SlotCtx) -> anyhow::Result<()> {
     loop {

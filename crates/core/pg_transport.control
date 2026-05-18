@@ -1,0 +1,6 @@
+comment          = 'pg_transport: framework for experimenting with alternative network transports'
+default_version  = '@CARGO_VERSION@'
+module_pathname  = '$libdir/pg_transport'
+relocatable      = false
+superuser        = true
+trusted          = false

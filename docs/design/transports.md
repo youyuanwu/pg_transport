@@ -14,7 +14,7 @@ or support a `SessionTransport` — see
 plays with the fd* (handoff) on *what kind of socket* (tcp / uds /
 future iouring / …). They deliberately do **not** name a wire protocol:
 the bgworker decides what to speak on the handed-off fd. In v0 that's
-always FE/BE v3 via our [`wire-pgwire-v3`](backend-wire.md) impl
+always FE/BE v3 via our [pgwire-v3 wire](backend-wire.md) impl
 (built on the `pgwire` crate, with rust-openssl TLS and
 `hba_getauthmethod`-driven auth), but the transport doesn't claim or
 care. Forward-compatible: a future HTTP/2 + SQL transport on TCP would
@@ -25,7 +25,7 @@ be a `SessionTransport` named `tcp_http2_sql`, not in conflict with
 
 v0 ships exactly **one** transport (`tcp_handoff`). No Cargo features
 gate it; it's compiled into `core` directly (see
-[workspace.md §2](workspace.md#2-cargo-features--deliberately-none-in-v0)).
+[workspace.md §2](workspace.md#2-cargo-features--deliberately-minimal)).
 
 | Transport         | Trait               | Bundles                                                       | Helper crates used                       | Notes                                                  |
 | ----------------- | ------------------- | ------------------------------------------------------------- | ---------------------------------------- | ------------------------------------------------------ |
@@ -38,28 +38,32 @@ on TCP), and every transport in
 second transport is what reopens the Cargo-features question (see
 [roadmap.md §2 Q5](roadmap.md#2-open-questions)).
 
-## 2. Helper crates the framework ships
+## 2. In-tree helpers the framework ships
 
-These are plain Rust libraries — not framework plugins. Transports that
-want them depend on them directly.
+These live as modules under `crates/core/src/` (see
+[workspace.md §1](workspace.md#1-cargo-workspace-layout)) — not as
+separate crates. Transports use them via `use crate::…`. The
+"helper crate" framing is reserved for the deferred shm_mq /
+`SessionTransport` path, where external transports may want them
+without the pgrx toolchain.
 
-| Helper                | Wraps                                  | Used by                                                         |
-| --------------------- | -------------------------------------- | --------------------------------------------------------------- |
-| `handoff-listener`    | (none — small std + tokio glue)        | **`tcp_handoff`** in v0                                          |
-| `protocol-pgwire-v3`  | [`pgwire`](https://github.com/sunng87/pgwire) (sunng87) | *(none in v0)* — reserved for deferred shm_mq-path FE/BE transports |
-| `protocol-http2`      | [`h2`](https://github.com/hyperium/h2) | *(none in v0)* — reserved for deferred `http2_sql`              |
-| `tls-rustls`          | [`tokio-rustls`](https://github.com/rustls/tokio-rustls) | *(none in v0)* — reserved for deferred shm_mq-path transports that terminate TLS themselves; v0 handoff transports use backend-side TLS instead |
-| `polled-bridge` (later) | data-plane-thread ↔ main-thread eventfd bridge | Future polled transports (DPDK / AF_XDP / RDMA-CM)        |
+| Helper                       | Wraps                                  | Used by                                                                 |
+| ---------------------------- | -------------------------------------- | ----------------------------------------------------------------------- |
+| `handoff::listener` (module) | (none — small std + tokio glue)        | **`handoff::tcp` (`tcp_handoff`)** in v0                                |
+| `wire::pgwire_v3` (module)   | [`pgwire`](https://github.com/sunng87/pgwire) (sunng87) | the slot runner in v0; reserved for deferred shm_mq-path FE/BE transports too |
+| `protocol-http2` (deferred crate) | [`h2`](https://github.com/hyperium/h2) | *(none in v0)* — reserved for deferred `http2_sql`                      |
+| `tls-rustls` (deferred crate) | [`tokio-rustls`](https://github.com/rustls/tokio-rustls) | *(none in v0)* — reserved for deferred shm_mq-path transports that terminate TLS themselves; v0 handoff transports use backend-side TLS instead |
+| `polled-bridge` (deferred)   | data-plane-thread ↔ main-thread eventfd bridge | Future polled transports (DPDK / AF_XDP / RDMA-CM)                   |
 
-### 2.1 `handoff-listener`
+### 2.1 `handoff::listener`
 
 The entire accept loop — `select!` on shutdown, drain the listener, hand
 each fd to `HandoffHandle::handoff`, log accept errors — is the same in
-every handoff transport. Rather than duplicate it per crate, we ship it
-in one helper that takes a generic stream of incoming fds:
+every handoff transport. Rather than duplicate it per transport module,
+we keep it in one module that takes a generic stream of incoming fds:
 
 ```rust
-// crates/handoff-listener/src/lib.rs
+// crates/core/src/handoff/listener.rs
 use api::{HandoffHandle, ShutdownToken};
 use futures::Stream;
 use std::{io, os::fd::OwnedFd};

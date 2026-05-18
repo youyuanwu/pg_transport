@@ -153,7 +153,7 @@ Five things are worth pulling out of the picture:
 ## 3. Frontend side: pseudocode
 
 ```rust
-// crates/backend/src/pool.rs
+// crates/core/src/backend/pool.rs
 
 pub struct Pool {
     slots: Vec<Arc<Slot>>,
@@ -238,7 +238,7 @@ the session's underlying mpsc is preserved for the next call.
 ## 4. Backend side: pseudocode
 
 ```rust
-// crates/backend/src/worker_main.rs (pgrx, sync, runs in the bgworker child)
+// crates/core/src/backend/worker_main.rs (pgrx, sync, runs in the bgworker child)
 
 #[pg_guard]
 pub extern "C" fn pg_transport_backend_main(arg: pg_sys::Datum) {

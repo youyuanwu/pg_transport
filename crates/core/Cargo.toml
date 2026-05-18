@@ -1,0 +1,49 @@
+[package]
+# The Cargo package name is `pg_transport` so the resulting `.so` and
+# `.control` files are named for the user-facing extension. The crate
+# directory is `crates/core/` because this is the "core" extension
+# (everything that statically links into the cdylib lives here). See
+# docs/design/workspace.md.
+name         = "pg_transport"
+description  = "Postgres extension framework for experimenting with alternative network transports."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[lib]
+crate-type = ["cdylib"]
+
+# v0 ships PG 18 only. The `pg18` feature is required by pgrx to
+# select the headers/symbols. `pg_test` is required by `cargo pgrx
+# test`. There are deliberately no *transport* features — the single
+# v0 transport (`tcp_handoff`) is an unconditional dependency. See
+# docs/design/workspace.md §2.
+[features]
+default = ["pg18"]
+pg18    = ["pgrx/pg18", "pgrx-tests/pg18"]
+pg_test = []
+
+[dependencies]
+pgrx = { workspace = true }
+
+# The only workspace-internal dep: the trait surface that plugin
+# authors compile against. Everything else (pool, slot, wire,
+# handoff, tcp transport) lives as modules under src/ in this
+# crate — see docs/design/workspace.md §1.
+api = { path = "../api" }
+
+# Async runtime + Stream trait. Used by the frontend (current-thread +
+# LocalSet), the per-slot `block_on`, and the handoff accept loop.
+tokio   = { workspace = true, features = ["rt", "net", "sync", "signal", "io-util", "macros", "time"] }
+futures = { workspace = true }
+
+# v0 phase 0 stub — the wire and TLS deps land per-phase:
+#   pgwire        = { workspace = true }  # phase 4 (startup + simple query)
+#   openssl       = { workspace = true }  # phase 8 (TLS)
+#   tokio-openssl = { workspace = true }  # phase 8
+
+[dev-dependencies]
+pgrx-tests = { workspace = true }
