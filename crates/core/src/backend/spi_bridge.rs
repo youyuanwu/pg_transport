@@ -9,6 +9,21 @@
 //! PG ERRORs raised inside the SPI call (re-raised as Rust panics
 //! by pgrx's cee-scape wrapper per [Q24](../../../../docs/design/roadmap.md))
 //! are caught and converted into pgwire `ErrorResponse` frames.
+//!
+//! **Known gap — multi-statement simple-query (Q25 in roadmap.md).**
+//! pgwire's `'Q'` body may contain multiple SQL statements separated
+//! by `;` (psql `-c 'SELECT 1; SELECT 2'` sends one `'Q'`). We pass
+//! the whole string to SPI today, which parses and runs all of them
+//! but only keeps the *last* `SPI_tuptable` — so leading SELECT
+//! results are silently dropped and the wire frames are wrong (one
+//! RowDescription instead of one per statement). And the
+//! [`parse_xact_control`] bare-keyword match doesn't recognise
+//! multi-statement strings, so `BEGIN; SELECT 1; COMMIT` falls
+//! through to SPI and trips atomic-mode's `SPI_ERROR_TRANSACTION`
+//! on the BEGIN. Proper fix is the `pg_query` (libpg_query) crate —
+//! same parser PG itself uses; gives us `split_with_parser` for the
+//! splitting half and `TransactionStmt` node classification for the
+//! [`parse_xact_control`] half. See `docs/design/roadmap.md` Q25.
 
 use std::any::Any;
 use std::ffi::CStr;
@@ -31,7 +46,24 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 /// * SELECT-like statements yield `Response::Query` with a
 ///   text-format `RowDescription` derived from the SPI tupdesc and
 ///   `DataRow` frames for every materialised row.
+/// * Transaction-control statements (`BEGIN`, `COMMIT`, `ROLLBACK`,
+///   and aliases) are intercepted *before* SPI sees them and routed
+///   through PG's xact-block API directly — SPI in atomic mode
+///   rejects xact-control commands with `SPI_ERROR_TRANSACTION`, so
+///   we never let them reach `SPI_execute`. See [`parse_xact_control`].
+///
+/// **Limitation: single statement per call.** The `query` argument
+/// is treated as one statement. If it contains multiple statements
+/// (`SELECT 1; SELECT 2` in one `'Q'` message body) SPI runs them
+/// all but only the LAST result reaches the wire — the rest are
+/// silently dropped. Unblocking requires a real SQL splitter (PG's
+/// `'Q'` semantics yield one CommandComplete per statement plus
+/// one ReadyForQuery at the end); tracked as Q25 in roadmap.md.
 pub fn execute_simple_query(query: &str) -> PgWireResult<Vec<Response>> {
+    if let Some(cmd) = parse_xact_control(query) {
+        return handle_xact_control(cmd);
+    }
+
     // We can't use pgrx's `BackgroundWorker::transaction` directly:
     // in pgrx 0.18 its `PopActiveSnapshot` + `CommitTransactionCommand`
     // calls are OUTSIDE the `PgTryBuilder`, so a PG ERROR raised
@@ -40,6 +72,13 @@ pub fn execute_simple_query(query: &str) -> PgWireResult<Vec<Response>> {
     // asserts `"StartTransactionCommand: unexpected state STARTED"`,
     // which we hit running pgbench against the slot. So we open and
     // close the transaction ourselves with explicit panic cleanup.
+    //
+    // This works for both implicit (auto-commit between queries) and
+    // explicit (inside an open `BEGIN` block) entry states:
+    // `StartTransactionCommand` is a no-op for xact-start when called
+    // from `TBLOCK_INPROGRESS`, and `CommitTransactionCommand` from
+    // `TBLOCK_INPROGRESS` does `CommandCounterIncrement` rather than
+    // an actual commit. See PG `src/backend/access/transam/xact.c`.
     let query_owned = query.to_string();
 
     unsafe {
@@ -53,9 +92,11 @@ pub fn execute_simple_query(query: &str) -> PgWireResult<Vec<Response>> {
 
     match outcome {
         Ok(Ok(responses)) => {
-            // SAFETY: matched Start/Push above; xact still
-            // TBLOCK_STARTED on the success path (SPI doesn't switch
-            // it), so Pop+Commit is the documented teardown.
+            // SAFETY: matched Start/Push above. From TBLOCK_STARTED
+            // (implicit-xact entry) Pop+Commit returns to DEFAULT;
+            // from TBLOCK_INPROGRESS (inside an open BEGIN) Pop
+            // unstacks our snapshot and Commit just bumps the
+            // command counter.
             unsafe {
                 pg_sys::PopActiveSnapshot();
                 pg_sys::CommitTransactionCommand();
@@ -64,12 +105,12 @@ pub fn execute_simple_query(query: &str) -> PgWireResult<Vec<Response>> {
         }
         Ok(Err(err)) => {
             // Body returned a clean PgWireError (e.g. our SPI-error
-            // translation). Xact state is still TBLOCK_STARTED — no
-            // PG ERROR was raised — so Pop+Commit is the right
-            // teardown. We do NOT Abort here: the application-level
-            // error is not an SPI-level rollback request, and
-            // forcing one would mask the fact that nothing PG-side
-            // actually failed.
+            // translation). Xact state hasn't been corrupted — no PG
+            // ERROR was raised — so Pop+Commit is the right teardown.
+            // We do NOT Abort here: the application-level error is
+            // not an SPI-level rollback request, and forcing one
+            // would mask the fact that nothing PG-side actually
+            // failed.
             unsafe {
                 pg_sys::PopActiveSnapshot();
                 pg_sys::CommitTransactionCommand();
@@ -86,6 +127,137 @@ pub fn execute_simple_query(query: &str) -> PgWireResult<Vec<Response>> {
             // SAFETY: AbortCurrentTransaction is safe to call from
             // any non-DEFAULT TBLOCK_* state; it resets state to
             // DEFAULT and releases resources.
+            //
+            // Deviation from real PG: PG would set state to
+            // TBLOCK_ABORT (forcing the client to issue ROLLBACK to
+            // clean up) and reject every subsequent statement until
+            // ROLLBACK. We collapse that to DEFAULT, so subsequent
+            // statements run as if in a fresh auto-commit context.
+            // This is incorrect in spec terms but harmless for the
+            // pgbench workloads we target; phase ≥ 9 (extended-query
+            // + proper xact state machine) can fix this when it
+            // matters.
+            unsafe {
+                pg_sys::AbortCurrentTransaction();
+            }
+            Err(panic_to_pgwire(panic_payload))
+        }
+    }
+}
+
+/// Subset of PG's `TransactionStmt` (gram.y) we sniff at the
+/// simple-query layer to keep SPI's atomic mode out of the picture.
+///
+/// We deliberately match only the bare-keyword forms (no
+/// transaction-mode list, no `SAVEPOINT`, no chained `AND` clauses);
+/// anything more elaborate flows through SPI and gets rejected with
+/// `SPI_ERROR_TRANSACTION`. pgbench's TPC-B script only emits the
+/// bare forms.
+///
+/// **Limitations the bare-keyword match has** (tracked as Q25 in
+/// roadmap.md, to be fixed by adopting `pg_query` / libpg_query):
+///
+/// * Misses `BEGIN ISOLATION LEVEL SERIALIZABLE`,
+///   `START TRANSACTION READ ONLY`, `BEGIN TRANSACTION READ WRITE`,
+///   and every other form that carries a transaction-mode list.
+/// * Misses `SAVEPOINT name` / `RELEASE [SAVEPOINT] name` /
+///   `ROLLBACK TO [SAVEPOINT] name` entirely — these are also
+///   `TransactionStmt` in PG's grammar but we don't try to match
+///   them; they hit SPI and fail.
+/// * Doesn't recognise multi-statement strings
+///   (`BEGIN; SELECT 1; COMMIT` in one `'Q'`) — the trim+match below
+///   sees the whole string and returns `None`, so the batch falls
+///   through to SPI which errors on BEGIN.
+#[derive(Debug, Clone, Copy)]
+enum XactCmd {
+    Begin,
+    Commit,
+    Rollback,
+}
+
+fn parse_xact_control(query: &str) -> Option<XactCmd> {
+    // Strip leading whitespace, trailing semicolons + whitespace,
+    // and normalise case. The bare-keyword forms below cover what
+    // pgbench's tpcb script emits; we deliberately don't try to
+    // parse `BEGIN ISOLATION LEVEL …` etc. — anything fancier flows
+    // through SPI and emits a clear error.
+    let trimmed = query
+        .trim()
+        .trim_end_matches(';')
+        .trim()
+        .to_ascii_uppercase();
+    match trimmed.as_str() {
+        "BEGIN" | "BEGIN WORK" | "BEGIN TRANSACTION" | "START TRANSACTION" => Some(XactCmd::Begin),
+        "COMMIT" | "COMMIT WORK" | "COMMIT TRANSACTION" | "END" | "END WORK"
+        | "END TRANSACTION" => Some(XactCmd::Commit),
+        "ROLLBACK" | "ROLLBACK WORK" | "ROLLBACK TRANSACTION" | "ABORT" | "ABORT WORK"
+        | "ABORT TRANSACTION" => Some(XactCmd::Rollback),
+        _ => None,
+    }
+}
+
+fn handle_xact_control(cmd: XactCmd) -> PgWireResult<Vec<Response>> {
+    // Pre-check state. `IsTransactionBlock()` returns false from both
+    // TBLOCK_DEFAULT (between auto-commit queries) and TBLOCK_STARTED
+    // (mid-implicit-xact, which shouldn't be reachable between simple
+    // queries given our Start/Commit pairing). It returns true only
+    // for TBLOCK_*INPROGRESS — i.e. inside an explicit BEGIN block.
+    let in_block = unsafe { pg_sys::IsTransactionBlock() };
+
+    // Run the xact API call inside a catch_unwind so a PG ERROR
+    // (e.g. nested-xact rejection) becomes a clean PgWireError
+    // instead of unwinding past the wire layer. On panic we reset to
+    // DEFAULT via AbortCurrentTransaction.
+    let outcome = catch_unwind(AssertUnwindSafe(|| -> Tag {
+        match cmd {
+            XactCmd::Begin => {
+                if in_block {
+                    // PG would emit `WARNING: there is already a
+                    // transaction in progress` here and still report
+                    // CommandTag "BEGIN". We skip the WARNING for
+                    // v0 simplicity — pgbench doesn't observe it.
+                    return Tag::new("BEGIN");
+                }
+                unsafe {
+                    pg_sys::SetCurrentStatementStartTimestamp();
+                    pg_sys::StartTransactionCommand();
+                    pg_sys::BeginTransactionBlock();
+                    pg_sys::CommitTransactionCommand();
+                }
+                Tag::new("BEGIN")
+            }
+            XactCmd::Commit => {
+                if !in_block {
+                    // PG would WARN; we just return COMMIT.
+                    return Tag::new("COMMIT");
+                }
+                unsafe {
+                    pg_sys::SetCurrentStatementStartTimestamp();
+                    pg_sys::StartTransactionCommand();
+                    let _committed = pg_sys::EndTransactionBlock(false);
+                    pg_sys::CommitTransactionCommand();
+                }
+                Tag::new("COMMIT")
+            }
+            XactCmd::Rollback => {
+                if !in_block {
+                    // PG would WARN; we just return ROLLBACK.
+                    return Tag::new("ROLLBACK");
+                }
+                unsafe {
+                    pg_sys::SetCurrentStatementStartTimestamp();
+                    pg_sys::StartTransactionCommand();
+                    pg_sys::UserAbortTransactionBlock(false);
+                    pg_sys::CommitTransactionCommand();
+                }
+                Tag::new("ROLLBACK")
+            }
+        }
+    }));
+
+    match outcome {
+        Ok(tag) => Ok(vec![Response::Execution(tag)]),
+        Err(panic_payload) => {
             unsafe {
                 pg_sys::AbortCurrentTransaction();
             }

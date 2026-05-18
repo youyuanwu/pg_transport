@@ -6,12 +6,16 @@
 # Scope: install the extension into $PGRX_HOME, spin up a fresh
 # temporary cluster with `shared_preload_libraries = 'pg_transport'`,
 # initialise the pgbench tables via the cluster's VANILLA Postgres
-# listener (54329) — pgbench `-i` uses COPY + explicit transaction
-# blocks which the v0 SPI bridge does not yet support (see
-# docs/design/bench.md §2.5) — then run the actual benchmark
-# (default: `pgbench -S`, select-only) against BOTH the
-# pg_transport listener (5454) AND the vanilla listener, printing
-# the two reports back-to-back for comparison.
+# listener (54329) — pgbench `-i` uses extended-query protocol for
+# its `regclass` lookup, which is phase-9 territory in our wire
+# layer (see docs/design/roadmap.md §1 phase 9) — then run the
+# actual benchmark against BOTH the pg_transport listener (5454)
+# AND the vanilla listener, printing the two reports back-to-back
+# for comparison.
+#
+# tpcb mode itself uses only simple-query messages (BEGIN / UPDATE
+# / SELECT / INSERT / END), all of which the v0 wire + SPI bridge
+# handle.
 
 PGBENCH_PGDATA  := "/tmp/pg_transport_pgbench/pgdata"
 PGBENCH_LOG     := "/tmp/pg_transport_pgbench/server.log"
@@ -23,11 +27,11 @@ PGBENCH_SOCKETS := "/tmp/pg_transport_sockets"
 # just/bench.just for the same restriction):
 #   1. pg          (default pg18)  — Postgres major.
 #   2. mode        (default select) — `select` runs `pgbench -S`
-#                                    (read-only). `tpcb` is
-#                                    rejected by v0 (BEGIN/COMMIT
-#                                    via SPI atomic mode raises
-#                                    SPI_ERROR_TRANSACTION; see
-#                                    docs/design/bench.md §2.5).
+#                                    (read-only). `tpcb` (alias
+#                                    `tpcb-rw`) runs the default
+#                                    TPC-B-like workload (BEGIN +
+#                                    3 UPDATEs + SELECT + INSERT +
+#                                    END per transaction).
 #   3. duration    (default 10)    — seconds; `pgbench -T`.
 #   4. clients     (default 4)     — concurrent clients per side
 #                                    (`pgbench -c -j`); bound by
@@ -38,28 +42,14 @@ PGBENCH_SOCKETS := "/tmp/pg_transport_sockets"
 # Examples:
 #   just pgbench                              # 10s select, 4 clients
 #   just pgbench pg18 select 30 8             # 30s select, 8 clients
+#   just pgbench pg18 tpcb 30 8               # 30s tpcb-like, 8 clients
 #   just pgbench pg18 select 10 16 16         # 16 clients & 16-slot pool
 pgbench pg=default_pg mode="select" duration="10" clients="4" pool="":
     #!/usr/bin/env bash
     set -euo pipefail
 
     case "{{mode}}" in
-        select) ;;
-        tpcb|tpcb-rw)
-            cat >&2 <<EOF
-    pgbench: mode '{{mode}}' is not yet supported on the pg_transport
-    listener. pgbench's TPC-B-like workload sends BEGIN / END as
-    standalone simple queries; the v0 SPI bridge calls SPI in atomic
-    mode (default), which rejects transaction-control statements with
-    "SPI error: Transaction". Unblocking this needs either:
-      (a) non-atomic SPI + per-handoff xact state tracking, or
-      (b) query-string sniffing for BEGIN / COMMIT / ROLLBACK and
-          calling PG's BeginTransactionBlock / EndTransactionBlock
-          / UserAbortTransactionBlock directly.
-    See docs/design/bench.md §2.5 for the tracking item.
-    EOF
-            exit 2
-            ;;
+        select|tpcb|tpcb-rw) ;;
         *)
             echo "pgbench: unknown mode '{{mode}}' (expected: select|tpcb|tpcb-rw)" >&2
             exit 2
@@ -124,15 +114,19 @@ pgbench pg=default_pg mode="select" duration="10" clients="4" pool="":
     }
     trap cleanup EXIT
 
-    # Step 3 — pgbench -i via VANILLA port. The bench tables live in
-    # PG's heap; pg_transport reads them via SPI without needing its
-    # own -i pass.
+    # Step 3 — pgbench -i via VANILLA port. pgbench's `-i` uses the
+    # extended-query protocol for its `regclass` lookup
+    # (`SELECT relkind FROM pg_catalog.pg_class WHERE oid=$1::regclass`),
+    # which the v0 wire layer doesn't yet implement — phase 9.
+    # The bench tables live in PG's heap; pg_transport reads/writes
+    # them via SPI without needing its own -i pass.
     echo "pgbench: initialising via vanilla port (54329) ..."
     "$pg_bin/pgbench" -i -h 127.0.0.1 -p 54329 -U postgres -d postgres 2>&1 | tail -2
 
     common_args=(-T {{duration}} -c {{clients}} -j {{clients}} --no-vacuum -M simple)
     case "{{mode}}" in
         select) common_args+=(-S) ;;
+        tpcb|tpcb-rw) ;;
     esac
 
     echo ""

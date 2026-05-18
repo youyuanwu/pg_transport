@@ -60,9 +60,60 @@ connection migration, RDMA protocol pairing, DPDK CPU budget) live in
 
 ### 2.1 Still open — v0 path
 
-*(None.)* All v0-path open questions have been resolved; see
-[§2.3](#23-resolved). New v0-path questions land here as they're
-identified.
+**Q25. SQL parsing in the wire layer (multi-statement simple-query
+and full xact-control classification).** Two related correctness
+gaps in [`crates/core/src/backend/spi_bridge.rs`](../../crates/core/src/backend/spi_bridge.rs)
+that share one root cause — we have no SQL parser:
+
+- **Multi-statement simple-query.** pgwire's `'Q'` message body can
+  contain multiple statements separated by `;` (real PG handles
+  this; `psql -c 'SELECT 1; SELECT 2'` sends one `'Q'`). Today we
+  pass the entire string to `Spi::connect_mut(|c| c.update(query, …))`
+  — SPI parses and runs all statements but only retains the *last*
+  `SPI_tuptable`, so `SELECT 1; SELECT 2` returns `2` only (the
+  `1` is silently dropped) and the wire frames are wrong
+  (single RowDescription instead of one per statement).
+- **Partial xact-control classification.** `parse_xact_control`
+  matches bare-keyword forms only (`BEGIN`, `COMMIT`, …). Anything
+  fancier — `BEGIN ISOLATION LEVEL SERIALIZABLE`,
+  `START TRANSACTION READ ONLY`, `SAVEPOINT s1`, `RELEASE s1`,
+  `ROLLBACK TO s1` — falls through to SPI and gets rejected with
+  `SPI_ERROR_TRANSACTION` from atomic mode.
+- **Multi-statement + xact-control** (`BEGIN; SELECT 1; COMMIT` as
+  one `'Q'`) hits both gaps: the keyword match doesn't recognise
+  the multi-statement string, SPI sees the whole thing, BEGIN
+  hits SPI atomic-mode rejection.
+
+Options:
+
+- **(a) Reject multi-statement** (`Vec<&str>` of length > 1 from a
+  lexer = error). Conservative interim fix; doesn't address the
+  partial-classification gap.
+- **(b) Adopt `pg_query` (libpg_query bindings)** — PG's own parser
+  extracted as a C library by pganalyze. Provides
+  `split_with_parser(&str) -> Vec<String>` for the splitting
+  problem (handles dollar-quoting, `--` / `/* */` comments,
+  string literals correctly by definition since it IS PG's
+  lexer) AND a parse-tree API that gives us `TransactionStmt`
+  node classification for free, covering every xact-control
+  variant the grammar accepts. Compile cost: ~5 MB of vendored
+  C parser source, ~60–90 s on first clean build, cached
+  thereafter.
+- **(c) Adopt `sqlparser-rs`** — pure-Rust SQL parser with a
+  Postgres dialect. Real lexer, but the grammar is not
+  byte-compatible with PG's (disagrees on edge cases like
+  operator-class precedence and some PG-only DDL). Lighter
+  compile cost than libpg_query; slightly worse fidelity.
+
+**Lean (b) — `pg_query`.** Phase 9 (extended query) needs to parse
+query strings anyway when handling the `Parse` message, so adding
+libpg_query now is also phase-9 infrastructure. Until this is
+resolved, the SPI bridge keeps the bare-keyword `parse_xact_control`
+sniff and the inline TODO comments documenting the gap; the bench
+recipe avoids multi-statement queries (each `'Q'` sends one
+statement).
+
+New v0-path questions land here as they're identified.
 
 ### 2.2 Still open — deferred only
 

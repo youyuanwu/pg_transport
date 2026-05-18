@@ -174,7 +174,7 @@ a deterministic baseline.
 | `mode`    | pgbench script             | What it exercises that `just bench` does not                                                       |
 | --------- | -------------------------- | --------------------------------------------------------------------------------------------------- |
 | `select`  | `<builtin: select only>`   | Real index lookup on `pgbench_accounts` instead of `SELECT 1` — moves the cost from "framework hop only" toward "framework hop + real query work".                |
-| `tpcb`    | `<builtin: TPC-B (sort of)>` | **NOT YET SUPPORTED.** Adds writes (`UPDATE`, `INSERT`), explicit transaction blocks (`BEGIN`/`END`), and 4 statements per transaction. Blocked by SPI atomicity — see §2.5. |
+| `tpcb`    | `<builtin: TPC-B (sort of)>` | Adds writes (`UPDATE`, `INSERT`), explicit transaction blocks (`BEGIN` / `END`), and 4 statements per transaction. Tests the SPI bridge's read-write path, the xact-control sniff that routes `BEGIN` / `COMMIT` around SPI's atomic mode (see [`spi_bridge.rs`](../../crates/core/src/backend/spi_bridge.rs) `parse_xact_control`), and per-transaction latency under realistic workload shape. |
 
 ### 2.3 Output
 
@@ -197,37 +197,44 @@ investigate, do not paper over.
 
 ### 2.4 What pgbench can tell you that `just bench` cannot
 
-- **Real query cost**: pgbench's select-only script is `SELECT abalance FROM pgbench_accounts WHERE aid = :aid` — a real index lookup, not `SELECT 1`. Moves the cost mix from "100% framework hop" toward "hop + real query work".
-- **Per-transaction latency at realistic granularity**: pgbench measures wall-clock per transaction (one statement + protocol bookkeeping in `-S` mode), not per-round-trip.
+- **Real query cost (`-S`)**: pgbench's select-only script is `SELECT abalance FROM pgbench_accounts WHERE aid = :aid` — a real index lookup, not `SELECT 1`. Moves the cost mix from "100% framework hop" toward "hop + real query work".
+- **Write path (`tpcb`)**: `UPDATE pgbench_accounts SET abalance = abalance + :delta WHERE aid = :aid` plus two more updates plus an INSERT into `pgbench_history`. The `SELECT 1` bench never touches the write path.
+- **Explicit transaction blocks (`tpcb`)**: `tpcb` wraps four statements in `BEGIN`/`END`. The xact-control sniff in the SPI bridge intercepts these before SPI sees them; a regression in that sniff (or in PG's `BeginTransactionBlock` / `EndTransactionBlock` dance) is invisible to `just bench`.
+- **Per-transaction latency at realistic granularity**: pgbench measures wall-clock per transaction (4 statements + 2 xact boundary commands in `tpcb`), not per-round-trip. Closer to what an application sees.
 - **Comparable to PG community numbers**: pgbench is the conventional yardstick; results are roughly comparable to anyone else's published numbers on similar hardware.
-
-(When `tpcb` mode lands, it will also exercise the write path, explicit `BEGIN`/`END` blocks, and 4-statement transactions — see §2.5.)
 
 ### 2.5 Known limitations (v0)
 
-Limitations the recipe surfaces today. These are the next things to fix if you want pgbench coverage beyond `-S`.
+Limitations the recipe surfaces today. These are the next things to fix if you want pgbench coverage beyond the current scope.
 
-- **`tpcb` / `tpcb-rw` modes are rejected.** The default pgbench workload sends `BEGIN` / `END` as standalone simple queries. Our SPI bridge calls SPI in **atomic mode** (the pgrx default), which raises `"SPI error: Transaction"` (`SPI_ERROR_TRANSACTION`) the instant any transaction-control statement reaches `SPI_execute`. Unblocking needs either:
-  - **(a)** non-atomic SPI via `SPI_connect_ext(SPI_OPT_NONATOMIC)` plus per-handoff xact state tracking so subsequent queries don't double-`StartTransactionCommand` into a `TBLOCK_STARTED` assert; or
-  - **(b)** query-string sniffing for `BEGIN` / `COMMIT` / `ROLLBACK` and calling PG's `BeginTransactionBlock` / `EndTransactionBlock` / `UserAbortTransactionBlock` directly, leaving SPI in atomic mode for everything else.
-
-  PG's own `postgres.c exec_simple_query` uses approach (b) via `ProcessUtility`; that's the cleaner long-term path. Tracking item for phase 9 alongside the extended-query work.
-- **`pgbench -i` runs against the vanilla port, not pg_transport.** It uses `COPY` for bulk insert plus explicit `BEGIN` / `COMMIT` around it — both hit the SPI-atomic-mode wall above. The recipe always initialises via the vanilla port; both listeners share the same data files.
-- **`-M simple` only.** `-M extended` and `-M prepared` need phase 9.
+- **`pgbench -i` runs against the vanilla port, not pg_transport.** pgbench's `-i` uses the extended-query protocol for its `regclass` lookup (`SELECT relkind FROM pg_catalog.pg_class WHERE oid=$1::regclass`); the v0 wire layer only handles simple-query messages — phase 9 territory. The recipe always initialises via the vanilla port; both listeners share the same data files. The actual benchmark phase (`-S` or `tpcb`) runs against pg_transport via simple-query.
+- **`-M simple` only.** `-M extended` and `-M prepared` need phase 9 for the same reason as `-i`.
+- **Multi-statement simple-query is broken** (tracked as Q25 in [roadmap.md](roadmap.md#21-still-open--v0-path)). A single `'Q'` message body with multiple statements separated by `;` (e.g. `psql -c 'SELECT 1; SELECT 2'`) returns only the last result; leading SELECT rows are silently dropped, and multi-statement strings containing `BEGIN`/`COMMIT` fall through to SPI atomic-mode rejection. pgbench is unaffected — each statement in its scripts is sent as its own `'Q'` — but `psql -c 'A; B'` users will hit it. Fix needs a real SQL splitter (`pg_query` / libpg_query).
+- **Error inside an explicit `BEGIN` block collapses to `TBLOCK_DEFAULT`, not `TBLOCK_ABORT`.** Real PG marks the transaction as aborted and rejects every subsequent statement until `ROLLBACK`; we auto-abort to `DEFAULT` so subsequent statements run as if in a fresh auto-commit context. Harmless for pgbench (which has no expected error paths); phase ≥ 9 fixes when a real client cares.
 - **No auth.** All connections use `-U postgres -d postgres` with trust. Phase 7 plumbs real auth.
 - **No TLS.** Phase 8.
 - **Bench tables live in database `postgres`.** v0 slots hard-code the SPI database to `postgres` (see [`crates/core/src/backend/slot.rs`](../../crates/core/src/backend/slot.rs)). Phase 7 routes by `StartupMessage.database`.
 
 ### 2.6 What current numbers look like
 
-`pgbench -S -T 5 -c 4 -j 4` against a fresh cluster, post-fix:
+`pgbench -T 10 -c 4 -j 4` against a fresh cluster, post-fix:
 
 ```
-vanilla PG       :  17974 tps   latency_avg 0.223 ms
-pg_transport     :  17588 tps   latency_avg 0.227 ms     (97.9% of vanilla)
+mode=select (pgbench -S)
+  vanilla PG       :  17047 tps   latency_avg 0.235 ms
+  pg_transport     :  16416 tps   latency_avg 0.244 ms     (96.3% of vanilla)
+
+mode=tpcb
+  vanilla PG       :   2249 tps   latency_avg 1.779 ms
+  pg_transport     :   2358 tps   latency_avg 1.696 ms     (104.9% of vanilla)
 ```
 
-Mechanism: pgbench-S is a real single-row index lookup; vanilla PG does the work and replies, pg_transport does the same work plus the extra hop. The hop is a fixed cost; relative overhead shrinks as the underlying query gets heavier. Concrete numbers from recent runs live in [`reviews/`](reviews/); design decisions that change them should re-run and update.
+Mechanism:
+
+- `-S` is a real single-row index lookup; vanilla does the work and replies, pg_transport does the same work plus the extra hop. Hop cost is fixed; relative overhead shrinks as underlying query gets heavier but selects this cheap are roughly the worst case for the architecture.
+- `tpcb` per transaction does ~4 statements + `BEGIN` + `END`. The 6 round-trips amortise the per-message framework cost, and pg_transport's pre-warmed bgworker pool absorbs jitter that vanilla eats fresh per connection — net result, pg_transport beats vanilla on this workload at this scale. This is the architecture's headline workload.
+
+Concrete numbers from recent runs live in [`reviews/`](reviews/); design decisions that change the SPI bridge or wire layer should re-run and update.
 
 ---
 
