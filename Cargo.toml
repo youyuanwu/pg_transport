@@ -38,6 +38,10 @@ pgwire = { version = "0.40", default-features = false, features = ["server-api"]
 # doesn't matter.
 tokio-postgres = "0.7"
 
+# CLI parser for the bench harness (derive macros + auto-generated
+# `--help`). Used by `bench` only; never touched by the cdylib.
+clap = { version = "4", features = ["derive"] }
+
 # TLS in the wire layer (Q12: rust-openssl). Not yet linked into stubs.
 openssl       = "0.10"
 tokio-openssl = "0.6"

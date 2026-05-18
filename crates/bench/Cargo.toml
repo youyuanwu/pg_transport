@@ -15,6 +15,7 @@ name = "bench"
 path = "src/main.rs"
 
 [dependencies]
-tokio          = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }
+tokio          = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
 tokio-postgres = { workspace = true }
 anyhow         = { workspace = true }
+clap           = { workspace = true }
