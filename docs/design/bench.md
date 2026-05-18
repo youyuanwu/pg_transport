@@ -216,23 +216,23 @@ Limitations the recipe surfaces today. These are the next things to fix if you w
 
 ### 2.6 What current numbers look like
 
-`pgbench -T 10 -c 4 -j 4` against a fresh cluster, post-Q25:
+`pgbench -T 10 -c 4 -j 4` against a fresh cluster, post-Q25 (`raw_parser`):
 
 ```
 mode=select (pgbench -S)
   vanilla PG       :  ~16500 tps   latency_avg ~0.24 ms
-  pg_transport     :  ~15700 tps   latency_avg ~0.25 ms     (~95% of vanilla)
+  pg_transport     :  ~16500 tps   latency_avg ~0.24 ms     (~100% of vanilla)
 
 mode=tpcb
   vanilla PG       :   ~2200 tps   latency_avg ~1.80 ms
-  pg_transport     :   ~2150 tps   latency_avg ~1.85 ms     (~98% of vanilla)
+  pg_transport     :   ~2280 tps   latency_avg ~1.75 ms     (~104% of vanilla)
 ```
 
 Mechanism:
 
-- `-S` is a real single-row index lookup; vanilla does the work and replies, pg_transport does the same work plus the extra hop AND a per-query sqlparser parse (resolves Q25 — needed to split multi-statement strings and classify xact-control). Hop + parse is a fixed cost (~15 µs per query in current code); relative overhead shrinks as underlying query gets heavier but selects this cheap surface both costs prominently.
+- `-S` is a real single-row index lookup; vanilla does the work and replies, pg_transport does the same work plus the extra hop AND a per-query parse via PG's `raw_parser` (resolves Q25 — needed to split multi-statement strings and classify xact-control). The parse cost is ~5 µs/query; hop dominates the remaining delta.
 - `tpcb` per transaction does ~4 statements + `BEGIN` + `END`. The 6 round-trips amortise the per-message framework cost, including the per-query parse; pg_transport's pre-warmed bgworker pool absorbs jitter that vanilla eats fresh per connection.
-- **Q25 perf cost:** the sqlparser overhead is ~15 µs per simple-query message. Before Q25 landed pg_transport was at parity or slightly ahead of vanilla on `tpcb`; we've traded ~5% throughput for correct multi-statement handling and grammar-accurate xact-control classification. A future optimisation could pre-filter likely non-xact statements via a cheap byte check before invoking sqlparser — phase 9 (when extended-query needs the parser too) is the natural time to revisit.
+- **Q25 resolution path**: an earlier attempt at sqlparser-rs cost ~15 µs/query (~5% throughput regression). Replaced with PG's in-process `raw_parser` (3-5× faster, perfect grammar fidelity, zero new deps); see [roadmap.md §2.3 Q25](roadmap.md). We still parse twice (once in our classifier, once inside SPI) but both are PG's own ~5 µs parser. Getting to "parse once" requires bypassing SPI with a direct `Portal`/`pg_analyze_and_rewrite_fixedparams`/`pg_plan_queries` path; deferred to phase 9.
 
 Concrete numbers from recent runs live in [`reviews/`](reviews/); design decisions that change the SPI bridge or wire layer should re-run and update.
 

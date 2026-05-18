@@ -208,10 +208,7 @@ async fn run_compare(args: CompareArgs) -> Result<()> {
                 ("pg_transport".to_string(), pt_samples),
             ],
         )?;
-        eprintln!(
-            "bench: wrote {} samples per target to {path}",
-            w.iterations
-        );
+        eprintln!("bench: wrote {} samples per target to {path}", w.iterations);
     }
 
     Ok(())

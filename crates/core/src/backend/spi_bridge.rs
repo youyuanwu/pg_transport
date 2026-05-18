@@ -10,18 +10,18 @@
 //! by pgrx's cee-scape wrapper per [Q24](../../../../docs/design/roadmap.md))
 //! are caught and converted into pgwire `ErrorResponse` frames.
 //!
-//! Multi-statement simple-query bodies are split via sqlparser's
-//! tokenizer (a pure-Rust PostgreSQL tokenizer; handles
-//! dollar-quoting, string literals, and comments correctly) and
-//! each statement runs through the per-statement path independently.
-//! Transaction-control statements are classified via sqlparser's
-//! `Statement` AST — covering every grammar variant we recognise
-//! including transaction-mode lists — and routed around SPI's
-//! atomic mode through PG's xact-block API. Resolves Q25 in
+//! Multi-statement simple-query bodies are split via PG's own
+//! [`pg_sys::raw_parser`] — the same in-process bison-generated
+//! parser SPI uses internally, so dollar-quoting, string literals,
+//! comments, and every grammar variant are by-definition handled
+//! correctly. The same parse pass yields `TransactionStmt` nodes,
+//! which we classify to route `BEGIN` / `COMMIT` / `ROLLBACK` (and
+//! all their mode-list variants) around SPI's atomic-mode rejection
+//! through PG's xact-block API. Resolves Q25 in
 //! [roadmap.md](../../../../docs/design/roadmap.md).
 
 use std::any::Any;
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
@@ -32,10 +32,6 @@ use pgrx::pg_sys::{self};
 use pgwire::api::Type;
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
-use sqlparser::ast::Statement;
-use sqlparser::dialect::PostgreSqlDialect;
-use sqlparser::parser::Parser;
-use sqlparser::tokenizer::{Token, Tokenizer};
 
 /// Run a simple-query string through SPI and shape the result into
 /// pgwire `Response`s.
@@ -51,43 +47,35 @@ use sqlparser::tokenizer::{Token, Tokenizer};
 ///   are intercepted *before* SPI sees them and routed through PG's
 ///   xact-block API directly — SPI in atomic mode rejects xact-
 ///   control commands with `SPI_ERROR_TRANSACTION`, so we never let
-///   them reach `SPI_execute`. See [`classify_xact_control`].
+///   them reach `SPI_execute`. See [`parse_and_classify`].
 /// * Multi-statement bodies (`SELECT 1; SELECT 2` in one `'Q'`) are
-///   split via sqlparser's tokenizer and each piece runs through the
+///   split by the same parse pass and each piece runs through the
 ///   per-statement path independently. On first error the batch
 ///   stops — matches real PG's `'Q'` semantics.
 /// * Empty / whitespace-only / comment-only bodies return an empty
 ///   `Vec<Response>`; pgwire's SimpleQueryHandler renders that as a
 ///   single `EmptyQueryResponse` + `ReadyForQuery`.
 pub fn execute_simple_query(query: &str) -> PgWireResult<Vec<Response>> {
-    // sqlparser's tokenizer is more permissive than its parser —
-    // it just classifies bytes (handles string literals,
-    // dollar-quoting, line/block comments), so anything PG can
-    // tokenize survives the split. Statements that the *parser*
-    // chokes on still flow through to SPI with their original text
-    // intact via the parse-error fallback in classify_xact_control.
-    let statements = match split_statements(query) {
-        Ok(v) => v,
-        Err(e) => return Err(parse_error_to_pgwire(&e)),
-    };
-
+    let statements = parse_and_classify(query)?;
     let mut responses = Vec::with_capacity(statements.len());
-    for stmt in statements {
-        let trimmed = stmt.trim();
-        if trimmed.is_empty() {
-            // split_statements can return whitespace-only chunks
-            // around stray semicolons; PG drops them silently.
+    for (text, classification) in statements {
+        if text.trim().is_empty() {
+            // RawStmt slice with no executable content (just
+            // whitespace / comments); PG drops these silently.
             continue;
         }
-        responses.extend(execute_one_statement(trimmed)?);
+        responses.extend(execute_one_statement(text, classification)?);
     }
     Ok(responses)
 }
 
 /// Per-statement executor. Routes xact-control statements through
 /// the xact-block API; everything else through the SPI wrapper.
-fn execute_one_statement(query: &str) -> PgWireResult<Vec<Response>> {
-    if let Some(cmd) = classify_xact_control(query) {
+fn execute_one_statement(
+    query: &str,
+    classification: Option<XactCmd>,
+) -> PgWireResult<Vec<Response>> {
+    if let Some(cmd) = classification {
         return handle_xact_control(cmd);
     }
     run_spi_statement(query)
@@ -178,10 +166,11 @@ fn run_spi_statement(query: &str) -> PgWireResult<Vec<Response>> {
 }
 
 /// Subset of PG's `TransactionStmt` (gram.y) we route around SPI.
-/// v0 covers BEGIN / START / COMMIT / END / ROLLBACK / ABORT and
-/// the transaction-mode-list forms of each. SAVEPOINT / RELEASE /
-/// ROLLBACK TO / PREPARE TRANSACTION / COMMIT|ROLLBACK PREPARED are
-/// also `TransactionStmt` nodes in PG's grammar, but we deliberately
+/// v0 covers BEGIN / START / COMMIT / ROLLBACK (and their mode-list
+/// forms, since `raw_parser` returns the same `TransactionStmtKind`
+/// regardless of mode list). SAVEPOINT / RELEASE / ROLLBACK TO /
+/// PREPARE TRANSACTION / COMMIT|ROLLBACK PREPARED are also
+/// `TransactionStmt` nodes in PG's grammar, but we deliberately
 /// don't intercept them — they flow through SPI and get the
 /// `SPI_ERROR_TRANSACTION` rejection with a clear message. Phase ≥9
 /// may revisit savepoints if a real workload needs them.
@@ -192,92 +181,151 @@ enum XactCmd {
     Rollback,
 }
 
-/// Classify the first statement of `stmt`. Returns `Some(cmd)` for
-/// v0-supported xact-control commands and `None` for anything else,
-/// including statements the parser can't handle — those flow through
-/// SPI which sees the original text and emits its own error if any.
+/// Parse `query` with PG's in-process `raw_parser` and return one
+/// `(slice, classification)` tuple per top-level statement.
 ///
-/// Coverage via sqlparser's `Statement` variants:
-/// * `Statement::StartTransaction { .. }` — covers `BEGIN`,
-///   `BEGIN WORK`, `BEGIN TRANSACTION [mode…]`, `START TRANSACTION
-///   [mode…]`, and every transaction-mode-list combination.
-/// * `Statement::Commit { end: false, .. }` — covers `COMMIT`,
-///   `COMMIT WORK`, `COMMIT TRANSACTION`. Also `END` / `END WORK` /
-///   `END TRANSACTION` (sqlparser parses these as `Commit { end:
-///   true, .. }`; same semantics for us).
-/// * `Statement::Rollback { savepoint: None, .. }` — covers
-///   `ROLLBACK`, `ROLLBACK WORK`, `ROLLBACK TRANSACTION`, `ABORT`.
-///   `ROLLBACK TO [SAVEPOINT] name` falls through to SPI (we don't
-///   implement savepoints in v0).
+/// The same parse pass solves both the splitting problem (each
+/// `RawStmt` carries `stmt_location` + `stmt_len`, giving us a
+/// byte slice into the original `query` for SPI) and the
+/// classification problem (for nodes of `T_TransactionStmt` we
+/// inspect `kind` and map BEGIN / START / COMMIT / ROLLBACK into
+/// `XactCmd`; everything else returns `None` to flow through SPI).
 ///
-/// `Statement::Savepoint`, `Statement::ReleaseSavepoint`, and
-/// `Statement::Prepare` (PG `PREPARE TRANSACTION`) also fall through
-/// to SPI today — v0 doesn't intercept them. The bare-keyword
-/// classifier this replaces missed all the modes; we're now
-/// grammar-accurate for the cases we handle.
-fn classify_xact_control(stmt: &str) -> Option<XactCmd> {
-    let asts = Parser::parse_sql(&PostgreSqlDialect {}, stmt).ok()?;
-    match asts.first()? {
-        Statement::StartTransaction { .. } => Some(XactCmd::Begin),
-        Statement::Commit { .. } => Some(XactCmd::Commit),
-        Statement::Rollback {
-            savepoint: None, ..
-        } => Some(XactCmd::Rollback),
+/// Memory: the parse tree is palloc'd in a scratch `MemoryContext`
+/// owned by this function; we extract the spans + classifications
+/// into Rust-owned values and delete the context before returning,
+/// so nothing leaks into the slot's long-lived TopMemoryContext.
+///
+/// Errors: `raw_parser` raises PG ERRORs for syntax errors. We
+/// wrap the call in `pgrx::PgTryBuilder` (cee-scape `sigsetjmp`)
+/// so the longjmp is caught locally rather than escaping to the
+/// bgworker's outer `pg_guard`. The `CaughtError` is converted to
+/// a wire `ErrorResponse` via the existing
+/// [`extract_report`] helper.
+#[allow(clippy::result_large_err)] // CaughtError is 232 B and lives only
+// across this function; boxing would gain nothing.
+fn parse_and_classify(query: &str) -> PgWireResult<Vec<(&str, Option<XactCmd>)>> {
+    use pgrx::PgTryBuilder;
+
+    let cstr = CString::new(query)
+        .map_err(|_| generic_error("pg_transport", "query string contains a NUL byte"))?;
+
+    let outcome: Result<Vec<(usize, usize, Option<XactCmd>)>, CaughtError> =
+        PgTryBuilder::new(AssertUnwindSafe(|| unsafe {
+            let saved_ctx = pg_sys::CurrentMemoryContext;
+            let scratch = pg_sys::AllocSetContextCreateInternal(
+                saved_ctx,
+                c"pg_transport_raw_parse".as_ptr(),
+                pg_sys::ALLOCSET_DEFAULT_MINSIZE as pg_sys::Size,
+                pg_sys::ALLOCSET_DEFAULT_INITSIZE as pg_sys::Size,
+                pg_sys::ALLOCSET_DEFAULT_MAXSIZE as pg_sys::Size,
+            );
+            pg_sys::MemoryContextSwitchTo(scratch);
+
+            let list = pg_sys::raw_parser(cstr.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT);
+            let spans = extract_statement_spans(list, query.len());
+
+            pg_sys::MemoryContextSwitchTo(saved_ctx);
+            pg_sys::MemoryContextDelete(scratch);
+            Ok(spans)
+        }))
+        .catch_others(Err)
+        .execute();
+
+    let raw_spans = match outcome {
+        Ok(v) => v,
+        Err(caught) => return Err(error_report_to_pgwire(extract_report(&caught))),
+    };
+
+    // Slice the original query string by the locations PG reported.
+    Ok(raw_spans
+        .into_iter()
+        .map(|(loc, len, cmd)| (&query[loc..loc + len], cmd))
+        .collect())
+}
+
+/// Walk the `List*` returned by `raw_parser`, extracting one
+/// `(stmt_location, stmt_len, classification)` per `RawStmt`.
+/// Resolves `stmt_len == 0` (PG's "to end of input" sentinel)
+/// against `total_len`.
+///
+/// SAFETY: caller guarantees `list` is either null or a valid
+/// `*mut List` of `*mut RawStmt` elements (which is the documented
+/// `raw_parser` return shape).
+unsafe fn extract_statement_spans(
+    list: *mut pg_sys::List,
+    total_len: usize,
+) -> Vec<(usize, usize, Option<XactCmd>)> {
+    if list.is_null() {
+        return Vec::new();
+    }
+
+    let length = unsafe { (*list).length } as usize;
+    let elements = unsafe { (*list).elements };
+    let mut out = Vec::with_capacity(length);
+
+    for i in 0..length {
+        // SAFETY: elements[0..length] are valid ListCells per the
+        // List invariant; ptr_value union variant holds the actual
+        // RawStmt pointer for node-pointer lists.
+        let cell = unsafe { elements.add(i) };
+        let raw_stmt = unsafe { (*cell).ptr_value } as *mut pg_sys::RawStmt;
+        if raw_stmt.is_null() {
+            continue;
+        }
+
+        let loc = unsafe { (*raw_stmt).stmt_location } as i64;
+        let len = unsafe { (*raw_stmt).stmt_len } as i64;
+        // stmt_len == 0 is PG's "runs to end of input" sentinel; the
+        // standalone-statement single-input case also reports loc 0
+        // / len 0 (see PG src/backend/parser/scan.l).
+        let (slice_loc, slice_len) = if len == 0 {
+            let loc_usize = loc.max(0) as usize;
+            (loc_usize, total_len.saturating_sub(loc_usize))
+        } else {
+            (loc.max(0) as usize, len as usize)
+        };
+
+        let classification = unsafe { classify_raw_stmt(raw_stmt) };
+        out.push((slice_loc, slice_len, classification));
+    }
+    out
+}
+
+/// Inspect a `RawStmt`'s inner node; return `Some(cmd)` if it's a
+/// `TransactionStmt` we want to intercept, `None` otherwise.
+///
+/// SAFETY: caller guarantees `raw_stmt` points at a valid `RawStmt`
+/// inside a parse tree returned by `raw_parser`.
+unsafe fn classify_raw_stmt(raw_stmt: *mut pg_sys::RawStmt) -> Option<XactCmd> {
+    let node = unsafe { (*raw_stmt).stmt };
+    if node.is_null() {
+        return None;
+    }
+    if unsafe { (*node).type_ } != pg_sys::NodeTag::T_TransactionStmt {
+        return None;
+    }
+    let txn = node as *mut pg_sys::TransactionStmt;
+    match unsafe { (*txn).kind } {
+        pg_sys::TransactionStmtKind::TRANS_STMT_BEGIN
+        | pg_sys::TransactionStmtKind::TRANS_STMT_START => Some(XactCmd::Begin),
+        pg_sys::TransactionStmtKind::TRANS_STMT_COMMIT => Some(XactCmd::Commit),
+        pg_sys::TransactionStmtKind::TRANS_STMT_ROLLBACK => Some(XactCmd::Rollback),
+        // SAVEPOINT / RELEASE / ROLLBACK TO / PREPARE TRANSACTION /
+        // COMMIT|ROLLBACK PREPARED — not intercepted in v0; let SPI
+        // reject with its own error.
         _ => None,
     }
 }
 
-/// Split `query` at top-level semicolons via the PostgreSQL
-/// tokenizer. Returns substrings (each may still contain a trailing
-/// semicolon if the SQL ended with one) preserving the original
-/// text — so each statement reaches SPI exactly as the client sent
-/// it, modulo the split.
-///
-/// Empty / whitespace-only / comment-only segments are kept here;
-/// the caller trims and drops empties before executing.
-fn split_statements(query: &str) -> Result<Vec<&str>, String> {
-    let tokens = Tokenizer::new(&PostgreSqlDialect {}, query)
-        .tokenize_with_location()
-        .map_err(|e| format!("tokenizer: {e}"))?;
-
-    let mut out = Vec::new();
-    let mut start = 0usize;
-    for tok in &tokens {
-        // SemiColon is the only delimiter pgwire's `'Q'` recognises.
-        // The tokenizer has already excluded semicolons inside
-        // string literals / comments / dollar-quoted strings, so
-        // top-level is the only kind we see.
-        if matches!(tok.token, Token::SemiColon) {
-            // tok.span.end is exclusive; include the semicolon in
-            // the slice so SPI sees identical bytes to what was sent.
-            let end = byte_offset(query, tok.span.end.line, tok.span.end.column);
-            out.push(&query[start..end]);
-            start = end;
-        }
+/// Pull the `ErrorReportWithLevel` out of a `CaughtError` for
+/// conversion to a wire `ErrorResponse`. Centralises the variant
+/// match so callers don't repeat it.
+fn extract_report(caught: &CaughtError) -> &ErrorReportWithLevel {
+    match caught {
+        CaughtError::PostgresError(report) | CaughtError::ErrorReport(report) => report,
+        CaughtError::RustPanic { ereport, .. } => ereport,
     }
-    if start < query.len() {
-        out.push(&query[start..]);
-    }
-    Ok(out)
-}
-
-/// sqlparser's `Location` is 1-based `(line, column)` over UTF-8
-/// chars; convert to a byte offset into the original string.
-fn byte_offset(s: &str, line: u64, column: u64) -> usize {
-    let mut current_line: u64 = 1;
-    let mut current_col: u64 = 1;
-    for (idx, ch) in s.char_indices() {
-        if current_line == line && current_col == column {
-            return idx;
-        }
-        if ch == '\n' {
-            current_line += 1;
-            current_col = 1;
-        } else {
-            current_col += 1;
-        }
-    }
-    s.len()
 }
 
 fn handle_xact_control(cmd: XactCmd) -> PgWireResult<Vec<Response>> {
@@ -465,17 +513,6 @@ fn spi_error_to_pgwire(msg: &str) -> PgWireError {
     )))
 }
 
-/// sqlparser reported a tokenizer error (malformed input). Surface
-/// it with SQLSTATE `42601` (SYNTAX_ERROR) so clients see the same
-/// error class real PG would emit for a malformed statement.
-fn parse_error_to_pgwire(msg: &str) -> PgWireError {
-    PgWireError::UserError(Box::new(ErrorInfo::new(
-        "ERROR".to_string(),
-        "42601".to_string(),
-        format!("pg_transport parse error: {msg}"),
-    )))
-}
-
 /// Convert a caught panic payload back into a pgwire `ErrorResponse`.
 ///
 /// pgrx's pg_guard machinery catches PG ERROR longjmps and re-raises
@@ -502,10 +539,7 @@ fn panic_to_pgwire(payload: Box<dyn Any + Send>) -> PgWireError {
 
 fn caught_error_report(payload: &Box<dyn Any + Send>) -> Option<&ErrorReportWithLevel> {
     let caught = payload.downcast_ref::<CaughtError>()?;
-    match caught {
-        CaughtError::PostgresError(report) | CaughtError::ErrorReport(report) => Some(report),
-        CaughtError::RustPanic { ereport, .. } => Some(ereport),
-    }
+    Some(extract_report(caught))
 }
 
 fn error_report_to_pgwire(report: &ErrorReportWithLevel) -> PgWireError {

@@ -492,47 +492,92 @@ Affects [Q9](#23-resolved) (re-resolved as "unwind"), workspace
 mentioned `abort` (updated in the same commit as this resolution).
 
 **Q25. SQL parsing in the wire layer (multi-statement simple-query
-and full xact-control classification).** ~~Open~~ **Resolved:
-option (c) — adopt `sqlparser-rs`.** Originally leaned `pg_query`
-(libpg_query bindings) for grammar fidelity, but libpg_query bundles
-a chunky C parser with its own thread-local storage; when statically
-linked into our cdylib and `dlopen`'d by the postmaster it exceeds
-glibc's reserved static-TLS surplus and the cluster fails to start
-with `"cannot allocate memory in static TLS block"`. The
-`GLIBC_TUNABLES=glibc.rtld.optional_static_tls=…` workaround was
-ineffective on the test box. For a Postgres extension that has to
-load via `shared_preload_libraries`, "you need to tune glibc"
-deployment friction is worse than the grammar-fidelity gap.
+and full xact-control classification).** ~~Open~~ **Resolved: call
+PG's in-process `raw_parser` directly via `pgrx::pg_sys`.** Two
+correctness gaps in the SPI bridge that share one root cause — we
+have no SQL parser at the simple-query layer:
 
-sqlparser is pure-Rust, no TLS, no `dlopen` issues. Two pieces:
+- **Multi-statement simple-query.** pgwire's `'Q'` body can contain
+  multiple statements separated by `;`. Passing the whole string
+  to SPI's `client.update(...)` ran every statement but only
+  retained the last `SPI_tuptable`, so `SELECT 1; SELECT 2` silently
+  returned `2` only and the wire frames were wrong.
+- **Partial xact-control classification.** The bare-keyword
+  `parse_xact_control` missed every transaction-mode-list variant
+  (`BEGIN ISOLATION LEVEL SERIALIZABLE`, `START TRANSACTION READ
+  ONLY`, …) AND every multi-statement string containing xact-
+  control — both fell through to SPI's atomic-mode rejection.
 
-- **Splitting** via `sqlparser::tokenizer::Tokenizer` — runs the
-  PostgreSQL lexer over the input and we slice the original string
-  at top-level semicolon tokens. The tokenizer correctly handles
-  string literals, dollar-quoted strings, `--` and `/* */` comments,
-  so we don't synthesise the splitter ourselves.
-- **Classification** via `Parser::parse_sql(&PostgreSqlDialect, …)`
-  matched against `Statement::StartTransaction { .. }`,
-  `Statement::Commit { .. }`, `Statement::Rollback { savepoint:
-  None, .. }`. Covers the bare-keyword forms AND every
-  transaction-mode-list variant (`BEGIN ISOLATION LEVEL
-  SERIALIZABLE`, `START TRANSACTION READ ONLY`, etc.). On parse
-  failure we fall through to SPI with the *original* text, so any
-  PG-only grammar sqlparser doesn't understand still reaches the
-  executor as the user wrote it.
+Options considered, in order of attempt:
 
-Cost: ~15 µs per simple-query message for the parse, ~5% throughput
-regression on pgbench. Acceptable for the correctness wins (multi-
-statement `'Q'` works; all xact-mode variants intercepted) and the
-phase-9 readiness (the same parser will be needed for the `Parse`
-message). A future optimisation could pre-filter likely non-xact
-statements via a cheap byte check before invoking sqlparser; phase 9
-is the natural time to revisit.
+- **(a) `pg_query` / libpg_query bindings.** Tried first for
+  grammar fidelity. Built fine, classifier rewrite landed, but the
+  cluster failed to start with `"cannot allocate memory in static
+  TLS block"`. libpg_query bundles a chunky C parser with its own
+  `__thread`-style storage; when statically linked into our
+  cdylib and `dlopen`'d by the postmaster it exceeds glibc's
+  reserved static-TLS surplus. The
+  `GLIBC_TUNABLES=glibc.rtld.optional_static_tls=…` workaround
+  was ineffective on the test box. For a Postgres extension that
+  has to load via `shared_preload_libraries`, "you need to tune
+  glibc" deployment friction is worse than the grammar-fidelity
+  gap. **Abandoned.**
+- **(b) `sqlparser-rs`** (pure-Rust). Switched and shipped a
+  working version. No TLS / `dlopen` issues, slightly less
+  grammar fidelity, ~15 µs/query parse cost → ~5% throughput
+  regression on pgbench. Worked correctly but the perf cost was
+  noticeable. **Shipped briefly, then replaced.**
+- **(c) PG's `raw_parser` via `pgrx::pg_sys`.** The bison-
+  generated C parser that *PG itself* uses internally — and is
+  already loaded by every Postgres backend, so the libpg_query
+  TLS problem doesn't apply (it's the same parser, not a second
+  copy). Perfect grammar fidelity by definition; ~3-5× faster
+  than sqlparser (the parser is C and decades-tuned); ~10 µs/query
+  parse cost dropped to ~5 µs. **Adopted.**
+
+Implementation: `parse_and_classify(query)` in
+[`crates/core/src/backend/spi_bridge.rs`](../../crates/core/src/backend/spi_bridge.rs)
+calls `pg_sys::raw_parser` once per `'Q'` message. The returned
+`List*` of `RawStmt*` gives us both jobs in one pass:
+
+- Each `RawStmt` carries `stmt_location` + `stmt_len` → byte slice
+  into the original `query` string for SPI (no re-stringification;
+  SPI sees exactly the bytes the client sent).
+- Each `RawStmt->stmt` is a `Node*` whose `type` tag we check
+  against `T_TransactionStmt`. If matched, cast to
+  `TransactionStmt*` and inspect `kind` against
+  `TRANS_STMT_BEGIN` / `_START` / `_COMMIT` / `_ROLLBACK`.
+
+Memory: scratch `MemoryContext` per call (parented at
+`CurrentMemoryContext`) holds the palloc'd parse tree. We extract
+spans + classifications into Rust-owned values and delete the
+context before returning, so nothing leaks into the slot's
+long-lived `TopMemoryContext`.
+
+Errors: `raw_parser` raises PG ERRORs for syntax errors. The call
+is wrapped in `pgrx::PgTryBuilder` (cee-scape `sigsetjmp`) so the
+longjmp is caught locally rather than escaping to the bgworker's
+outer `pg_guard`. The `CaughtError` is converted to a wire
+`ErrorResponse` via the existing error-report helpers — bonus:
+the message is PG's actual syntax-error message (e.g. `"syntax
+error at or near \"SELECTT\""`), not a synthetic one.
+
+Note on the "parse once vs twice" question. SPI still parses the
+statement internally when executing it, so we DO parse twice — but
+both parses are PG's own ~5 µs parser, not the sqlparser ~15 µs
+parser. Getting to "parse once" would require bypassing SPI
+entirely (build `Portal` + `pg_analyze_and_rewrite_fixedparams` +
+`pg_plan_queries` + `PortalRun` directly, the way PG's `exec_simple_query`
+in `postgres.c` does). Estimated ~5 µs/query additional savings,
+~100 LOC of unsafe FFI; deferred to phase 9 (which needs the
+parse-tree-direct path for the extended-query `Parse` message
+anyway).
 
 Affects [`crates/core/src/backend/spi_bridge.rs`](../../crates/core/src/backend/spi_bridge.rs)
-(rewritten classifier, new tokenizer-based splitter), workspace
-[Cargo.toml](../../../Cargo.toml) (new `sqlparser` dep), and
-[bench.md §2.6](bench.md) (numbers updated post-Q25).
+(`parse_and_classify` replaces the sqlparser tokenizer + classifier),
+workspace [Cargo.toml](../../../Cargo.toml) (dropped `sqlparser`
+dep entirely; `raw_parser` is in `pg_sys`), and
+[bench.md §2.6](bench.md) (numbers restored to near-parity).
 
 ---
 

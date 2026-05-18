@@ -32,24 +32,6 @@ futures = { version = "0.3", default-features = false }
 # flags (aws-lc-rs / ring) — TLS lands phase 8 via tokio-openssl.
 pgwire = { version = "0.40", default-features = false, features = ["server-api"] }
 
-# Pure-Rust SQL parser used in the SPI bridge for (a) splitting
-# multi-statement simple-query bodies at statement boundaries via
-# the tokenizer (correctly handles string literals, dollar-quoting,
-# and comments) and (b) classifying TransactionStmt nodes so we
-# route BEGIN/COMMIT/ROLLBACK and their variants around SPI's
-# atomic-mode rejection. Q25 in docs/design/roadmap.md.
-#
-# Picked sqlparser over pg_query / libpg_query because libpg_query
-# bundles a chunky C parser with its own thread-local storage; when
-# statically linked into our cdylib and dlopen'd by the postmaster
-# it exceeds glibc's reserved static-TLS surplus and fails to load
-# ("cannot allocate memory in static TLS block"). sqlparser's
-# grammar isn't byte-compatible with PG's, but the gap doesn't
-# affect our use — splitter is tokenizer-only, and parse failures
-# on the classification step fall through to SPI which sees the
-# original text.
-sqlparser = "0.62"
-
 # Phase-5 bench client: tokio-postgres as the libpq-compatible
 # client driver. `default = ["runtime"]` is fine — bench is its
 # own binary, not the cdylib, so feature unification with `core`
