@@ -10,20 +10,15 @@
 //! by pgrx's cee-scape wrapper per [Q24](../../../../docs/design/roadmap.md))
 //! are caught and converted into pgwire `ErrorResponse` frames.
 //!
-//! **Known gap — multi-statement simple-query (Q25 in roadmap.md).**
-//! pgwire's `'Q'` body may contain multiple SQL statements separated
-//! by `;` (psql `-c 'SELECT 1; SELECT 2'` sends one `'Q'`). We pass
-//! the whole string to SPI today, which parses and runs all of them
-//! but only keeps the *last* `SPI_tuptable` — so leading SELECT
-//! results are silently dropped and the wire frames are wrong (one
-//! RowDescription instead of one per statement). And the
-//! [`parse_xact_control`] bare-keyword match doesn't recognise
-//! multi-statement strings, so `BEGIN; SELECT 1; COMMIT` falls
-//! through to SPI and trips atomic-mode's `SPI_ERROR_TRANSACTION`
-//! on the BEGIN. Proper fix is the `pg_query` (libpg_query) crate —
-//! same parser PG itself uses; gives us `split_with_parser` for the
-//! splitting half and `TransactionStmt` node classification for the
-//! [`parse_xact_control`] half. See `docs/design/roadmap.md` Q25.
+//! Multi-statement simple-query bodies are split via sqlparser's
+//! tokenizer (a pure-Rust PostgreSQL tokenizer; handles
+//! dollar-quoting, string literals, and comments correctly) and
+//! each statement runs through the per-statement path independently.
+//! Transaction-control statements are classified via sqlparser's
+//! `Statement` AST — covering every grammar variant we recognise
+//! including transaction-mode lists — and routed around SPI's
+//! atomic mode through PG's xact-block API. Resolves Q25 in
+//! [roadmap.md](../../../../docs/design/roadmap.md).
 
 use std::any::Any;
 use std::ffi::CStr;
@@ -37,6 +32,10 @@ use pgrx::pg_sys::{self};
 use pgwire::api::Type;
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use sqlparser::ast::Statement;
+use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::parser::Parser;
+use sqlparser::tokenizer::{Token, Tokenizer};
 
 /// Run a simple-query string through SPI and shape the result into
 /// pgwire `Response`s.
@@ -47,23 +46,56 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 ///   text-format `RowDescription` derived from the SPI tupdesc and
 ///   `DataRow` frames for every materialised row.
 /// * Transaction-control statements (`BEGIN`, `COMMIT`, `ROLLBACK`,
-///   and aliases) are intercepted *before* SPI sees them and routed
-///   through PG's xact-block API directly — SPI in atomic mode
-///   rejects xact-control commands with `SPI_ERROR_TRANSACTION`, so
-///   we never let them reach `SPI_execute`. See [`parse_xact_control`].
-///
-/// **Limitation: single statement per call.** The `query` argument
-/// is treated as one statement. If it contains multiple statements
-/// (`SELECT 1; SELECT 2` in one `'Q'` message body) SPI runs them
-/// all but only the LAST result reaches the wire — the rest are
-/// silently dropped. Unblocking requires a real SQL splitter (PG's
-/// `'Q'` semantics yield one CommandComplete per statement plus
-/// one ReadyForQuery at the end); tracked as Q25 in roadmap.md.
+///   and the full PG `TransactionStmt` variant set including
+///   transaction-mode lists like `BEGIN ISOLATION LEVEL SERIALIZABLE`)
+///   are intercepted *before* SPI sees them and routed through PG's
+///   xact-block API directly — SPI in atomic mode rejects xact-
+///   control commands with `SPI_ERROR_TRANSACTION`, so we never let
+///   them reach `SPI_execute`. See [`classify_xact_control`].
+/// * Multi-statement bodies (`SELECT 1; SELECT 2` in one `'Q'`) are
+///   split via sqlparser's tokenizer and each piece runs through the
+///   per-statement path independently. On first error the batch
+///   stops — matches real PG's `'Q'` semantics.
+/// * Empty / whitespace-only / comment-only bodies return an empty
+///   `Vec<Response>`; pgwire's SimpleQueryHandler renders that as a
+///   single `EmptyQueryResponse` + `ReadyForQuery`.
 pub fn execute_simple_query(query: &str) -> PgWireResult<Vec<Response>> {
-    if let Some(cmd) = parse_xact_control(query) {
+    // sqlparser's tokenizer is more permissive than its parser —
+    // it just classifies bytes (handles string literals,
+    // dollar-quoting, line/block comments), so anything PG can
+    // tokenize survives the split. Statements that the *parser*
+    // chokes on still flow through to SPI with their original text
+    // intact via the parse-error fallback in classify_xact_control.
+    let statements = match split_statements(query) {
+        Ok(v) => v,
+        Err(e) => return Err(parse_error_to_pgwire(&e)),
+    };
+
+    let mut responses = Vec::with_capacity(statements.len());
+    for stmt in statements {
+        let trimmed = stmt.trim();
+        if trimmed.is_empty() {
+            // split_statements can return whitespace-only chunks
+            // around stray semicolons; PG drops them silently.
+            continue;
+        }
+        responses.extend(execute_one_statement(trimmed)?);
+    }
+    Ok(responses)
+}
+
+/// Per-statement executor. Routes xact-control statements through
+/// the xact-block API; everything else through the SPI wrapper.
+fn execute_one_statement(query: &str) -> PgWireResult<Vec<Response>> {
+    if let Some(cmd) = classify_xact_control(query) {
         return handle_xact_control(cmd);
     }
+    run_spi_statement(query)
+}
 
+/// Execute one non-xact-control statement via SPI under our own
+/// transaction wrapper.
+fn run_spi_statement(query: &str) -> PgWireResult<Vec<Response>> {
     // We can't use pgrx's `BackgroundWorker::transaction` directly:
     // in pgrx 0.18 its `PopActiveSnapshot` + `CommitTransactionCommand`
     // calls are OUTSIDE the `PgTryBuilder`, so a PG ERROR raised
@@ -145,29 +177,14 @@ pub fn execute_simple_query(query: &str) -> PgWireResult<Vec<Response>> {
     }
 }
 
-/// Subset of PG's `TransactionStmt` (gram.y) we sniff at the
-/// simple-query layer to keep SPI's atomic mode out of the picture.
-///
-/// We deliberately match only the bare-keyword forms (no
-/// transaction-mode list, no `SAVEPOINT`, no chained `AND` clauses);
-/// anything more elaborate flows through SPI and gets rejected with
-/// `SPI_ERROR_TRANSACTION`. pgbench's TPC-B script only emits the
-/// bare forms.
-///
-/// **Limitations the bare-keyword match has** (tracked as Q25 in
-/// roadmap.md, to be fixed by adopting `pg_query` / libpg_query):
-///
-/// * Misses `BEGIN ISOLATION LEVEL SERIALIZABLE`,
-///   `START TRANSACTION READ ONLY`, `BEGIN TRANSACTION READ WRITE`,
-///   and every other form that carries a transaction-mode list.
-/// * Misses `SAVEPOINT name` / `RELEASE [SAVEPOINT] name` /
-///   `ROLLBACK TO [SAVEPOINT] name` entirely — these are also
-///   `TransactionStmt` in PG's grammar but we don't try to match
-///   them; they hit SPI and fail.
-/// * Doesn't recognise multi-statement strings
-///   (`BEGIN; SELECT 1; COMMIT` in one `'Q'`) — the trim+match below
-///   sees the whole string and returns `None`, so the batch falls
-///   through to SPI which errors on BEGIN.
+/// Subset of PG's `TransactionStmt` (gram.y) we route around SPI.
+/// v0 covers BEGIN / START / COMMIT / END / ROLLBACK / ABORT and
+/// the transaction-mode-list forms of each. SAVEPOINT / RELEASE /
+/// ROLLBACK TO / PREPARE TRANSACTION / COMMIT|ROLLBACK PREPARED are
+/// also `TransactionStmt` nodes in PG's grammar, but we deliberately
+/// don't intercept them — they flow through SPI and get the
+/// `SPI_ERROR_TRANSACTION` rejection with a clear message. Phase ≥9
+/// may revisit savepoints if a real workload needs them.
 #[derive(Debug, Clone, Copy)]
 enum XactCmd {
     Begin,
@@ -175,25 +192,92 @@ enum XactCmd {
     Rollback,
 }
 
-fn parse_xact_control(query: &str) -> Option<XactCmd> {
-    // Strip leading whitespace, trailing semicolons + whitespace,
-    // and normalise case. The bare-keyword forms below cover what
-    // pgbench's tpcb script emits; we deliberately don't try to
-    // parse `BEGIN ISOLATION LEVEL …` etc. — anything fancier flows
-    // through SPI and emits a clear error.
-    let trimmed = query
-        .trim()
-        .trim_end_matches(';')
-        .trim()
-        .to_ascii_uppercase();
-    match trimmed.as_str() {
-        "BEGIN" | "BEGIN WORK" | "BEGIN TRANSACTION" | "START TRANSACTION" => Some(XactCmd::Begin),
-        "COMMIT" | "COMMIT WORK" | "COMMIT TRANSACTION" | "END" | "END WORK"
-        | "END TRANSACTION" => Some(XactCmd::Commit),
-        "ROLLBACK" | "ROLLBACK WORK" | "ROLLBACK TRANSACTION" | "ABORT" | "ABORT WORK"
-        | "ABORT TRANSACTION" => Some(XactCmd::Rollback),
+/// Classify the first statement of `stmt`. Returns `Some(cmd)` for
+/// v0-supported xact-control commands and `None` for anything else,
+/// including statements the parser can't handle — those flow through
+/// SPI which sees the original text and emits its own error if any.
+///
+/// Coverage via sqlparser's `Statement` variants:
+/// * `Statement::StartTransaction { .. }` — covers `BEGIN`,
+///   `BEGIN WORK`, `BEGIN TRANSACTION [mode…]`, `START TRANSACTION
+///   [mode…]`, and every transaction-mode-list combination.
+/// * `Statement::Commit { end: false, .. }` — covers `COMMIT`,
+///   `COMMIT WORK`, `COMMIT TRANSACTION`. Also `END` / `END WORK` /
+///   `END TRANSACTION` (sqlparser parses these as `Commit { end:
+///   true, .. }`; same semantics for us).
+/// * `Statement::Rollback { savepoint: None, .. }` — covers
+///   `ROLLBACK`, `ROLLBACK WORK`, `ROLLBACK TRANSACTION`, `ABORT`.
+///   `ROLLBACK TO [SAVEPOINT] name` falls through to SPI (we don't
+///   implement savepoints in v0).
+///
+/// `Statement::Savepoint`, `Statement::ReleaseSavepoint`, and
+/// `Statement::Prepare` (PG `PREPARE TRANSACTION`) also fall through
+/// to SPI today — v0 doesn't intercept them. The bare-keyword
+/// classifier this replaces missed all the modes; we're now
+/// grammar-accurate for the cases we handle.
+fn classify_xact_control(stmt: &str) -> Option<XactCmd> {
+    let asts = Parser::parse_sql(&PostgreSqlDialect {}, stmt).ok()?;
+    match asts.first()? {
+        Statement::StartTransaction { .. } => Some(XactCmd::Begin),
+        Statement::Commit { .. } => Some(XactCmd::Commit),
+        Statement::Rollback {
+            savepoint: None, ..
+        } => Some(XactCmd::Rollback),
         _ => None,
     }
+}
+
+/// Split `query` at top-level semicolons via the PostgreSQL
+/// tokenizer. Returns substrings (each may still contain a trailing
+/// semicolon if the SQL ended with one) preserving the original
+/// text — so each statement reaches SPI exactly as the client sent
+/// it, modulo the split.
+///
+/// Empty / whitespace-only / comment-only segments are kept here;
+/// the caller trims and drops empties before executing.
+fn split_statements(query: &str) -> Result<Vec<&str>, String> {
+    let tokens = Tokenizer::new(&PostgreSqlDialect {}, query)
+        .tokenize_with_location()
+        .map_err(|e| format!("tokenizer: {e}"))?;
+
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    for tok in &tokens {
+        // SemiColon is the only delimiter pgwire's `'Q'` recognises.
+        // The tokenizer has already excluded semicolons inside
+        // string literals / comments / dollar-quoted strings, so
+        // top-level is the only kind we see.
+        if matches!(tok.token, Token::SemiColon) {
+            // tok.span.end is exclusive; include the semicolon in
+            // the slice so SPI sees identical bytes to what was sent.
+            let end = byte_offset(query, tok.span.end.line, tok.span.end.column);
+            out.push(&query[start..end]);
+            start = end;
+        }
+    }
+    if start < query.len() {
+        out.push(&query[start..]);
+    }
+    Ok(out)
+}
+
+/// sqlparser's `Location` is 1-based `(line, column)` over UTF-8
+/// chars; convert to a byte offset into the original string.
+fn byte_offset(s: &str, line: u64, column: u64) -> usize {
+    let mut current_line: u64 = 1;
+    let mut current_col: u64 = 1;
+    for (idx, ch) in s.char_indices() {
+        if current_line == line && current_col == column {
+            return idx;
+        }
+        if ch == '\n' {
+            current_line += 1;
+            current_col = 1;
+        } else {
+            current_col += 1;
+        }
+    }
+    s.len()
 }
 
 fn handle_xact_control(cmd: XactCmd) -> PgWireResult<Vec<Response>> {
@@ -378,6 +462,17 @@ fn spi_error_to_pgwire(msg: &str) -> PgWireError {
         "ERROR".to_string(),
         "XX000".to_string(),
         format!("pg_transport SPI error: {msg}"),
+    )))
+}
+
+/// sqlparser reported a tokenizer error (malformed input). Surface
+/// it with SQLSTATE `42601` (SYNTAX_ERROR) so clients see the same
+/// error class real PG would emit for a malformed statement.
+fn parse_error_to_pgwire(msg: &str) -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".to_string(),
+        "42601".to_string(),
+        format!("pg_transport parse error: {msg}"),
     )))
 }
 

@@ -60,60 +60,9 @@ connection migration, RDMA protocol pairing, DPDK CPU budget) live in
 
 ### 2.1 Still open — v0 path
 
-**Q25. SQL parsing in the wire layer (multi-statement simple-query
-and full xact-control classification).** Two related correctness
-gaps in [`crates/core/src/backend/spi_bridge.rs`](../../crates/core/src/backend/spi_bridge.rs)
-that share one root cause — we have no SQL parser:
-
-- **Multi-statement simple-query.** pgwire's `'Q'` message body can
-  contain multiple statements separated by `;` (real PG handles
-  this; `psql -c 'SELECT 1; SELECT 2'` sends one `'Q'`). Today we
-  pass the entire string to `Spi::connect_mut(|c| c.update(query, …))`
-  — SPI parses and runs all statements but only retains the *last*
-  `SPI_tuptable`, so `SELECT 1; SELECT 2` returns `2` only (the
-  `1` is silently dropped) and the wire frames are wrong
-  (single RowDescription instead of one per statement).
-- **Partial xact-control classification.** `parse_xact_control`
-  matches bare-keyword forms only (`BEGIN`, `COMMIT`, …). Anything
-  fancier — `BEGIN ISOLATION LEVEL SERIALIZABLE`,
-  `START TRANSACTION READ ONLY`, `SAVEPOINT s1`, `RELEASE s1`,
-  `ROLLBACK TO s1` — falls through to SPI and gets rejected with
-  `SPI_ERROR_TRANSACTION` from atomic mode.
-- **Multi-statement + xact-control** (`BEGIN; SELECT 1; COMMIT` as
-  one `'Q'`) hits both gaps: the keyword match doesn't recognise
-  the multi-statement string, SPI sees the whole thing, BEGIN
-  hits SPI atomic-mode rejection.
-
-Options:
-
-- **(a) Reject multi-statement** (`Vec<&str>` of length > 1 from a
-  lexer = error). Conservative interim fix; doesn't address the
-  partial-classification gap.
-- **(b) Adopt `pg_query` (libpg_query bindings)** — PG's own parser
-  extracted as a C library by pganalyze. Provides
-  `split_with_parser(&str) -> Vec<String>` for the splitting
-  problem (handles dollar-quoting, `--` / `/* */` comments,
-  string literals correctly by definition since it IS PG's
-  lexer) AND a parse-tree API that gives us `TransactionStmt`
-  node classification for free, covering every xact-control
-  variant the grammar accepts. Compile cost: ~5 MB of vendored
-  C parser source, ~60–90 s on first clean build, cached
-  thereafter.
-- **(c) Adopt `sqlparser-rs`** — pure-Rust SQL parser with a
-  Postgres dialect. Real lexer, but the grammar is not
-  byte-compatible with PG's (disagrees on edge cases like
-  operator-class precedence and some PG-only DDL). Lighter
-  compile cost than libpg_query; slightly worse fidelity.
-
-**Lean (b) — `pg_query`.** Phase 9 (extended query) needs to parse
-query strings anyway when handling the `Parse` message, so adding
-libpg_query now is also phase-9 infrastructure. Until this is
-resolved, the SPI bridge keeps the bare-keyword `parse_xact_control`
-sniff and the inline TODO comments documenting the gap; the bench
-recipe avoids multi-statement queries (each `'Q'` sends one
-statement).
-
-New v0-path questions land here as they're identified.
+*(None.)* All v0-path open questions have been resolved; see
+[§2.3](#23-resolved). New v0-path questions land here as they're
+identified.
 
 ### 2.2 Still open — deferred only
 
@@ -541,6 +490,49 @@ Affects [Q9](#23-resolved) (re-resolved as "unwind"), workspace
 [Cargo.toml](../../../Cargo.toml) `[profile.dev]` / `[profile.release]`
 (now `panic = "unwind"`), and the phase-1/2/3 code comments that
 mentioned `abort` (updated in the same commit as this resolution).
+
+**Q25. SQL parsing in the wire layer (multi-statement simple-query
+and full xact-control classification).** ~~Open~~ **Resolved:
+option (c) — adopt `sqlparser-rs`.** Originally leaned `pg_query`
+(libpg_query bindings) for grammar fidelity, but libpg_query bundles
+a chunky C parser with its own thread-local storage; when statically
+linked into our cdylib and `dlopen`'d by the postmaster it exceeds
+glibc's reserved static-TLS surplus and the cluster fails to start
+with `"cannot allocate memory in static TLS block"`. The
+`GLIBC_TUNABLES=glibc.rtld.optional_static_tls=…` workaround was
+ineffective on the test box. For a Postgres extension that has to
+load via `shared_preload_libraries`, "you need to tune glibc"
+deployment friction is worse than the grammar-fidelity gap.
+
+sqlparser is pure-Rust, no TLS, no `dlopen` issues. Two pieces:
+
+- **Splitting** via `sqlparser::tokenizer::Tokenizer` — runs the
+  PostgreSQL lexer over the input and we slice the original string
+  at top-level semicolon tokens. The tokenizer correctly handles
+  string literals, dollar-quoted strings, `--` and `/* */` comments,
+  so we don't synthesise the splitter ourselves.
+- **Classification** via `Parser::parse_sql(&PostgreSqlDialect, …)`
+  matched against `Statement::StartTransaction { .. }`,
+  `Statement::Commit { .. }`, `Statement::Rollback { savepoint:
+  None, .. }`. Covers the bare-keyword forms AND every
+  transaction-mode-list variant (`BEGIN ISOLATION LEVEL
+  SERIALIZABLE`, `START TRANSACTION READ ONLY`, etc.). On parse
+  failure we fall through to SPI with the *original* text, so any
+  PG-only grammar sqlparser doesn't understand still reaches the
+  executor as the user wrote it.
+
+Cost: ~15 µs per simple-query message for the parse, ~5% throughput
+regression on pgbench. Acceptable for the correctness wins (multi-
+statement `'Q'` works; all xact-mode variants intercepted) and the
+phase-9 readiness (the same parser will be needed for the `Parse`
+message). A future optimisation could pre-filter likely non-xact
+statements via a cheap byte check before invoking sqlparser; phase 9
+is the natural time to revisit.
+
+Affects [`crates/core/src/backend/spi_bridge.rs`](../../crates/core/src/backend/spi_bridge.rs)
+(rewritten classifier, new tokenizer-based splitter), workspace
+[Cargo.toml](../../../Cargo.toml) (new `sqlparser` dep), and
+[bench.md §2.6](bench.md) (numbers updated post-Q25).
 
 ---
 

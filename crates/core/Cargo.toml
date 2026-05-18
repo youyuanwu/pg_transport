@@ -48,6 +48,11 @@ pgwire      = { workspace = true }
 async-trait = { workspace = true }
 bytes       = { workspace = true }
 
+# Q25: sqlparser (pure-Rust) for splitting multi-statement simple-
+# query bodies and classifying TransactionStmt nodes in the SPI
+# bridge. See docs/design/roadmap.md §2.3 Q25.
+sqlparser   = { workspace = true }
+
 # Used for the postmaster-death watchdog: PG 18 only exports
 # `postmaster_alive_fds[POSTMASTER_FD_WATCH]` (the watch end of the
 # self-pipe); `PostmasterIsAlive[Internal]` is a static inline that

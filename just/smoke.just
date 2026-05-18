@@ -48,7 +48,7 @@ smoke pg=default_pg:
     "$pg_bin/initdb" -D {{SMOKE_PGDATA}} -U postgres \
         --auth-local=trust --auth-host=trust --no-instructions >/dev/null
 
-    cat >>{{SMOKE_PGDATA}}/postgresql.conf <<EOF
+    cat >>{{SMOKE_PGDATA}}/postgresql.conf <<'EOF'
     shared_preload_libraries = 'pg_transport'
     port = 54329
     unix_socket_directories = '/tmp/pg_transport_smoke'

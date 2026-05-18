@@ -209,7 +209,6 @@ Limitations the recipe surfaces today. These are the next things to fix if you w
 
 - **`pgbench -i` runs against the vanilla port, not pg_transport.** pgbench's `-i` uses the extended-query protocol for its `regclass` lookup (`SELECT relkind FROM pg_catalog.pg_class WHERE oid=$1::regclass`); the v0 wire layer only handles simple-query messages — phase 9 territory. The recipe always initialises via the vanilla port; both listeners share the same data files. The actual benchmark phase (`-S` or `tpcb`) runs against pg_transport via simple-query.
 - **`-M simple` only.** `-M extended` and `-M prepared` need phase 9 for the same reason as `-i`.
-- **Multi-statement simple-query is broken** (tracked as Q25 in [roadmap.md](roadmap.md#21-still-open--v0-path)). A single `'Q'` message body with multiple statements separated by `;` (e.g. `psql -c 'SELECT 1; SELECT 2'`) returns only the last result; leading SELECT rows are silently dropped, and multi-statement strings containing `BEGIN`/`COMMIT` fall through to SPI atomic-mode rejection. pgbench is unaffected — each statement in its scripts is sent as its own `'Q'` — but `psql -c 'A; B'` users will hit it. Fix needs a real SQL splitter (`pg_query` / libpg_query).
 - **Error inside an explicit `BEGIN` block collapses to `TBLOCK_DEFAULT`, not `TBLOCK_ABORT`.** Real PG marks the transaction as aborted and rejects every subsequent statement until `ROLLBACK`; we auto-abort to `DEFAULT` so subsequent statements run as if in a fresh auto-commit context. Harmless for pgbench (which has no expected error paths); phase ≥ 9 fixes when a real client cares.
 - **No auth.** All connections use `-U postgres -d postgres` with trust. Phase 7 plumbs real auth.
 - **No TLS.** Phase 8.
@@ -217,22 +216,23 @@ Limitations the recipe surfaces today. These are the next things to fix if you w
 
 ### 2.6 What current numbers look like
 
-`pgbench -T 10 -c 4 -j 4` against a fresh cluster, post-fix:
+`pgbench -T 10 -c 4 -j 4` against a fresh cluster, post-Q25:
 
 ```
 mode=select (pgbench -S)
-  vanilla PG       :  17047 tps   latency_avg 0.235 ms
-  pg_transport     :  16416 tps   latency_avg 0.244 ms     (96.3% of vanilla)
+  vanilla PG       :  ~16500 tps   latency_avg ~0.24 ms
+  pg_transport     :  ~15700 tps   latency_avg ~0.25 ms     (~95% of vanilla)
 
 mode=tpcb
-  vanilla PG       :   2249 tps   latency_avg 1.779 ms
-  pg_transport     :   2358 tps   latency_avg 1.696 ms     (104.9% of vanilla)
+  vanilla PG       :   ~2200 tps   latency_avg ~1.80 ms
+  pg_transport     :   ~2150 tps   latency_avg ~1.85 ms     (~98% of vanilla)
 ```
 
 Mechanism:
 
-- `-S` is a real single-row index lookup; vanilla does the work and replies, pg_transport does the same work plus the extra hop. Hop cost is fixed; relative overhead shrinks as underlying query gets heavier but selects this cheap are roughly the worst case for the architecture.
-- `tpcb` per transaction does ~4 statements + `BEGIN` + `END`. The 6 round-trips amortise the per-message framework cost, and pg_transport's pre-warmed bgworker pool absorbs jitter that vanilla eats fresh per connection — net result, pg_transport beats vanilla on this workload at this scale. This is the architecture's headline workload.
+- `-S` is a real single-row index lookup; vanilla does the work and replies, pg_transport does the same work plus the extra hop AND a per-query sqlparser parse (resolves Q25 — needed to split multi-statement strings and classify xact-control). Hop + parse is a fixed cost (~15 µs per query in current code); relative overhead shrinks as underlying query gets heavier but selects this cheap surface both costs prominently.
+- `tpcb` per transaction does ~4 statements + `BEGIN` + `END`. The 6 round-trips amortise the per-message framework cost, including the per-query parse; pg_transport's pre-warmed bgworker pool absorbs jitter that vanilla eats fresh per connection.
+- **Q25 perf cost:** the sqlparser overhead is ~15 µs per simple-query message. Before Q25 landed pg_transport was at parity or slightly ahead of vanilla on `tpcb`; we've traded ~5% throughput for correct multi-statement handling and grammar-accurate xact-control classification. A future optimisation could pre-filter likely non-xact statements via a cheap byte check before invoking sqlparser — phase 9 (when extended-query needs the parser too) is the natural time to revisit.
 
 Concrete numbers from recent runs live in [`reviews/`](reviews/); design decisions that change the SPI bridge or wire layer should re-run and update.
 
