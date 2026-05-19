@@ -14,4 +14,5 @@ pub mod fd_pass;
 pub mod paths;
 pub mod pool;
 pub mod slot;
+pub mod spi;
 pub mod spi_bridge;

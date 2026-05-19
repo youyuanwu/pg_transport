@@ -27,11 +27,13 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use futures::stream;
-use pgrx::pg_sys::panic::{CaughtError, ErrorReportWithLevel};
+use pgrx::pg_sys::panic::CaughtError;
 use pgrx::pg_sys::{self};
 use pgwire::api::Type;
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+
+use super::spi::{caught_error_to_pgwire, generic_error, panic_to_pgwire};
 
 /// Run a simple-query string through SPI and shape the result into
 /// pgwire `Response`s.
@@ -200,8 +202,7 @@ enum XactCmd {
 /// wrap the call in `pgrx::PgTryBuilder` (cee-scape `sigsetjmp`)
 /// so the longjmp is caught locally rather than escaping to the
 /// bgworker's outer `pg_guard`. The `CaughtError` is converted to
-/// a wire `ErrorResponse` via the existing
-/// [`extract_report`] helper.
+/// a wire `ErrorResponse` via [`super::spi::caught_error_to_pgwire`].
 #[allow(clippy::result_large_err)] // CaughtError is 232 B and lives only
 // across this function; boxing would gain nothing.
 fn parse_and_classify(query: &str) -> PgWireResult<Vec<(&str, Option<XactCmd>)>> {
@@ -234,7 +235,7 @@ fn parse_and_classify(query: &str) -> PgWireResult<Vec<(&str, Option<XactCmd>)>>
 
     let raw_spans = match outcome {
         Ok(v) => v,
-        Err(caught) => return Err(error_report_to_pgwire(extract_report(&caught))),
+        Err(caught) => return Err(caught_error_to_pgwire(&caught)),
     };
 
     // Slice the original query string by the locations PG reported.
@@ -315,16 +316,6 @@ unsafe fn classify_raw_stmt(raw_stmt: *mut pg_sys::RawStmt) -> Option<XactCmd> {
         // COMMIT|ROLLBACK PREPARED — not intercepted in v0; let SPI
         // reject with its own error.
         _ => None,
-    }
-}
-
-/// Pull the `ErrorReportWithLevel` out of a `CaughtError` for
-/// conversion to a wire `ErrorResponse`. Centralises the variant
-/// match so callers don't repeat it.
-fn extract_report(caught: &CaughtError) -> &ErrorReportWithLevel {
-    match caught {
-        CaughtError::PostgresError(report) | CaughtError::ErrorReport(report) => report,
-        CaughtError::RustPanic { ereport, .. } => ereport,
     }
 }
 
@@ -510,57 +501,6 @@ fn spi_error_to_pgwire(msg: &str) -> PgWireError {
         "ERROR".to_string(),
         "XX000".to_string(),
         format!("pg_transport SPI error: {msg}"),
-    )))
-}
-
-/// Convert a caught panic payload back into a pgwire `ErrorResponse`.
-///
-/// pgrx's pg_guard machinery catches PG ERROR longjmps and re-raises
-/// them via `resume_unwind(Box::new(CaughtError::…))`, so the outer
-/// `catch_unwind` receives a `Box<dyn Any>` whose concrete type is
-/// `CaughtError`. We downcast to that first and extract the wrapped
-/// `ErrorReportWithLevel`; bare `panic_any(ErrorReportWithLevel)` and
-/// bare `panic!("…")` are also handled as fallbacks.
-fn panic_to_pgwire(payload: Box<dyn Any + Send>) -> PgWireError {
-    if let Some(report) = caught_error_report(&payload) {
-        return error_report_to_pgwire(report);
-    }
-    if let Some(report) = payload.downcast_ref::<ErrorReportWithLevel>() {
-        return error_report_to_pgwire(report);
-    }
-    if let Some(s) = payload.downcast_ref::<String>() {
-        return generic_error("pg_transport panic", s);
-    }
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        return generic_error("pg_transport panic", s);
-    }
-    generic_error("pg_transport", "unknown panic payload in SPI bridge")
-}
-
-fn caught_error_report(payload: &Box<dyn Any + Send>) -> Option<&ErrorReportWithLevel> {
-    let caught = payload.downcast_ref::<CaughtError>()?;
-    Some(extract_report(caught))
-}
-
-fn error_report_to_pgwire(report: &ErrorReportWithLevel) -> PgWireError {
-    // `sql_error_code()` returns a `PgSqlErrorCode` enum; its `Debug`
-    // form is the variant name (e.g. `ERRCODE_DIVISION_BY_ZERO`).
-    // pgwire wants the 5-char SQLSTATE string for ErrorInfo. Phase 4b
-    // accepts the variant-name fallback; phase ≥ 7 will plumb the
-    // real 5-char code via a lookup table once the auth layer needs
-    // SQLSTATE handling anyway.
-    PgWireError::UserError(Box::new(ErrorInfo::new(
-        format!("{:?}", report.level()),
-        format!("{:?}", report.sql_error_code()),
-        report.message().to_string(),
-    )))
-}
-
-fn generic_error(prefix: &str, message: &str) -> PgWireError {
-    PgWireError::UserError(Box::new(ErrorInfo::new(
-        "ERROR".to_string(),
-        "XX000".to_string(),
-        format!("{prefix}: {message}"),
     )))
 }
 
