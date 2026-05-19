@@ -256,6 +256,102 @@ async fn auth_dispatch_log_line_present() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn auth_scram_stored_role_routes_to_scram_dispatch() -> Result<()> {
+    // Phase 7.2: the verifier loader reads pg_authid.rolpassword
+    // via SPI and routes to AuthMethod::ScramSha256 when the role
+    // has a SCRAM verifier. Phase 7.3 implements the actual SCRAM
+    // crypto; until then, the dispatch lands on the
+    // "method not implemented" branch (SQLSTATE 0A000). Asserting
+    // that branch proves the verifier loader fired correctly.
+    let c = Cluster::shared().await;
+    let admin = c.admin_connect("postgres").await?;
+
+    // Idempotent: drop the role if a prior run left it around.
+    let role = "e2e_scram_pending";
+    let _ = admin
+        .simple_query(&format!("DROP ROLE IF EXISTS {role}"))
+        .await?;
+
+    // PG 14+ default `password_encryption` is scram-sha-256, so
+    // CREATE ROLE … PASSWORD 'foo' stores a SCRAM verifier.
+    admin
+        .simple_query(&format!(
+            "CREATE ROLE {role} LOGIN PASSWORD 'pw' \
+             IN ROLE pg_read_all_data"
+        ))
+        .await?;
+
+    // Sanity: confirm the stored verifier is SCRAM-format (so the
+    // test would fail correctly if some future PG version flipped
+    // the default to MD5 or cleartext).
+    let row = admin
+        .query_one(
+            "SELECT substring(rolpassword from 1 for 13) FROM pg_authid WHERE rolname = $1",
+            &[&role],
+        )
+        .await?;
+    let prefix: &str = row.get(0);
+    assert_eq!(
+        prefix, "SCRAM-SHA-256",
+        "pg_authid stored verifier is not SCRAM-format ({prefix:?}); \
+         this test assumes PG 14+ default password_encryption"
+    );
+
+    // Attempt to connect through pg_transport. tokio-postgres
+    // will negotiate SASL; the server reports
+    // "method scram-sha-256 selected by pg_hba.conf is not
+    // implemented in this build" (FATAL, 0A000) at the auth step.
+    let err = c
+        .connect_as(role, "postgres", Some("pw"))
+        .await
+        .expect_err("scram-stored role should hit unimplemented-method reject in 7.2");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("0A000") || msg.contains("not implemented") || msg.contains("scram"),
+        "expected 0A000 / 'not implemented' / 'scram' in error, got: {msg}"
+    );
+
+    // Cleanup so re-runs are idempotent.
+    let _ = admin
+        .simple_query(&format!("DROP ROLE IF EXISTS {role}"))
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn auth_passwordless_role_routes_to_trust() -> Result<()> {
+    // Verifier loader returns RolPassword::None for a role with
+    // NULL rolpassword; hba::lookup maps that to AuthMethod::Trust,
+    // matching the v0 default. This pins that the loader handles
+    // NULL correctly (the SPI path otherwise raises an Err for
+    // empty result sets — see user-memory pgrx.md).
+    let c = Cluster::shared().await;
+    let admin = c.admin_connect("postgres").await?;
+    let role = "e2e_trust_user";
+    let _ = admin
+        .simple_query(&format!("DROP ROLE IF EXISTS {role}"))
+        .await?;
+    admin
+        .simple_query(&format!(
+            "CREATE ROLE {role} LOGIN IN ROLE pg_read_all_data"
+        ))
+        .await?;
+
+    let client = c.connect_as(role, "postgres", None).await?;
+    let msgs = client.simple_query("SELECT 1").await?;
+    assert!(
+        msgs.iter()
+            .any(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_))),
+        "passwordless role should trust-auth and run SELECT 1"
+    );
+
+    let _ = admin
+        .simple_query(&format!("DROP ROLE IF EXISTS {role}"))
+        .await?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Server-observability tests — ported from the legacy `just smoke` recipe.
 // ---------------------------------------------------------------------------

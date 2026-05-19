@@ -1,46 +1,52 @@
-//! `pg_hba.conf` lookup — placeholder for phase 7.2.
+//! Auth method lookup — v0 backend for `pg_transport.auth_source`.
 //!
 //! ## Status
 //!
-//! Phase 7.1 (this commit): [`lookup`] is a stub that returns
-//! [`AuthMethod::Trust`] for every connection. Combined with the
-//! database-name check in the startup handler, this means:
+//! Phase 7.2 (this commit): we look up the method by reading
+//! `pg_authid.rolpassword` via SPI and inferring the auth method
+//! from the credential format (see [`crate::wire::auth::verifier`]).
+//! This is **not** what PG's `hba_getauthmethod` does — that
+//! function consults `pg_hba.conf` and applies per-host /
+//! per-database rules. Full HBA matching needs `pg_sys::Port` /
+//! `hba_getauthmethod`, both of which are filtered out of pgrx's
+//! default bindings and would require a fragile hand-declared FFI
+//! or a C shim. Deferred until a real deployment needs HBA-rule
+//! granularity.
 //!
-//! - Connections claiming `database = "postgres"` are
-//!   trust-authenticated (current v0 behaviour, preserved).
-//! - Connections claiming any other database are rejected with a
-//!   clear `3D000` error before they reach auth.
-//! - The auth-dispatch *framework* is in place so phase 7.2 just
-//!   needs to swap this stub for a real `hba_getauthmethod` FFI
-//!   call (`pg_sys::hba_getauthmethod` takes a `*mut Port` struct
-//!   with `(user, database, raddr, peer_uid, ssl)` populated and
-//!   returns the matched `(method, options)` tuple).
+//! v0 mapping:
 //!
-//! ## Why a stub is acceptable for 7.1
+//! - `rolpassword IS NULL` or role unknown → [`AuthMethod::Trust`]
+//! - `SCRAM-SHA-256$…` → [`AuthMethod::ScramSha256`]
+//! - `md5<32-hex>` → [`AuthMethod::Md5`]
+//! - any other format → [`AuthMethod::Reject`]
+//! - SPI failure (extremely rare) → [`AuthMethod::Reject`] (fail
+//!   closed, not open)
 //!
-//! - **No security regression.** Before this commit the startup
-//!   handler used pgwire's `NoopStartupHandler` which trust-accepts
-//!   every connection unconditionally. Returning trust here is
-//!   strictly the same behaviour, but routed through the new
-//!   auth-dispatch surface that 7.2 will plug a real HBA into
-//!   without touching call sites.
-//! - **The new GUC still surfaces operator misconfiguration.**
-//!   `pg_transport.auth_source` is required at boot
-//!   ([`crate::guc::validate_required`]); a missing or invalid value
-//!   FATALs before the wire layer is ever reached. So operators
-//!   can't accidentally land on this stub in production thinking
-//!   they've configured HBA-based auth.
-//! - **The integration shape is what 7.2 needs to test.**
-//!   Constructing a `pg_sys::Port` carefully enough to pass to
-//!   `hba_getauthmethod` is the actual hard work; the dispatch
-//!   path around it is what we land here.
+//! ## Why this is acceptable for v0
+//!
+//! - **The acceptance criterion is method-based, not HBA-rule-based.**
+//!   Phase 7's [roadmap §1](../../../../../docs/design/roadmap.md)
+//!   acceptance is "`psql -c "…"` works with SCRAM-SHA-256 against
+//!   a SCRAM-stored role". That's a per-user thing, not a
+//!   per-host-allowlist thing.
+//! - **The GUC opt-in is preserved.** `pg_transport.auth_source` is
+//!   still required at boot; operators still have to know they're
+//!   wiring up a non-default auth source.
+//! - **Real HBA can drop in later.** The seam — `hba::lookup` taking
+//!   a populated [`HbaLookup`] and returning a single
+//!   [`AuthMethod`] — is exactly the shape that a real
+//!   `hba_getauthmethod` call would have. When operator demand
+//!   materialises, swap the body; call sites need no change.
 
 use super::AuthMethod;
+use super::verifier;
 
-/// Inputs to an HBA lookup. Mirrors the subset of PG's `Port`
-/// struct that `hba_getauthmethod` reads.
+/// Inputs to an auth-method lookup. Mirrors the subset of PG's
+/// `Port` struct that a real `hba_getauthmethod` call would read.
+/// Phase 7.2 only consumes `user`; `database` / `host` / `ssl` are
+/// retained for the seam.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields unread until phase 7.2 swaps in the real FFI.
+#[allow(dead_code)] // database/host/ssl unused until full HBA lookup lands.
 pub struct HbaLookup<'a> {
     pub user: &'a str,
     pub database: &'a str,
@@ -49,12 +55,18 @@ pub struct HbaLookup<'a> {
     pub ssl: bool,
 }
 
-/// Look up the auth method PG's `pg_hba.conf` would pick for this
-/// connection. v0.1 returns [`AuthMethod::Trust`] unconditionally;
-/// phase 7.2 swaps in the real FFI call.
+/// Look up the auth method for an incoming connection. See module
+/// docs for the v0 mapping rules and trade-offs.
 pub fn lookup(input: &HbaLookup<'_>) -> AuthMethod {
-    // Phase 7.1 stub. Caller's HBA-source GUC is already validated
-    // (`pg_hba` or `pg_transport`); both currently land here.
-    let _ = input;
-    AuthMethod::Trust
+    match verifier::infer_method(input.user) {
+        Ok(method) => method,
+        Err(msg) => {
+            // SPI failure during catalog read — fail closed. We
+            // log because this is unusual and operators should
+            // see it; the client gets a generic FATAL via the
+            // startup handler's reject path.
+            pgrx::warning!("pg_transport auth: rolpassword lookup failed for {input:?}: {msg}");
+            AuthMethod::Reject
+        }
+    }
 }

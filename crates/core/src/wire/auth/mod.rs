@@ -28,6 +28,7 @@
 //!   (needs TLS), peer.
 
 pub mod hba;
+pub mod verifier;
 
 /// Methods PG's `pg_hba.conf` can specify. Mirrors PG's `UserAuth`
 /// enum (`src/include/libpq/hba.h`). v0.1 implements [`Trust`] and

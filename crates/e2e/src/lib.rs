@@ -271,7 +271,24 @@ impl Cluster {
     /// onto the current tokio runtime; the returned `Client` is
     /// detached from it and remains valid until dropped.
     pub async fn connect(&self, dbname: &str) -> Result<Client> {
-        connect_at(PT_PORT, dbname).await
+        connect_at(PT_PORT, "postgres", dbname, None).await
+    }
+
+    /// Connect to the pg_transport listener as an arbitrary role.
+    /// `password` is sent via tokio-postgres' `password=` option;
+    /// pass `None` for roles that don't require a password (i.e.
+    /// trust auth).
+    ///
+    /// Useful for phase-7 auth tests — e.g. create a SCRAM-stored
+    /// role on the admin port, then connect through pg_transport as
+    /// that role to exercise the auth-dispatch path.
+    pub async fn connect_as(
+        &self,
+        user: &str,
+        dbname: &str,
+        password: Option<&str>,
+    ) -> Result<Client> {
+        connect_at(PT_PORT, user, dbname, password).await
     }
 
     /// Connect to the **vanilla PG** listener (port [`PG_PORT`]).
@@ -279,7 +296,7 @@ impl Cluster {
     /// `CREATE DATABASE`, `CREATE EXTENSION`, or assertions about
     /// real PG behaviour to compare against.
     pub async fn admin_connect(&self, dbname: &str) -> Result<Client> {
-        connect_at(PG_PORT, dbname).await
+        connect_at(PG_PORT, "postgres", dbname, None).await
     }
 
     /// Path of the cluster's server log. Tests may want to assert on
@@ -325,7 +342,7 @@ impl Cluster {
         #[allow(unused_assignments)]
         let mut last_err: Option<tokio_postgres::Error> = None;
         loop {
-            match connect_at(PT_PORT, "postgres").await {
+            match connect_at(PT_PORT, "postgres", "postgres", None).await {
                 Ok(client) => {
                     // Sanity-ping the wire to make sure SPI bridge is
                     // also live, not just the TCP accept loop.
@@ -379,12 +396,19 @@ impl Drop for Cluster {
     }
 }
 
-async fn connect_at(port: u16, dbname: &str) -> Result<Client> {
-    let conn_str =
-        format!("host={PT_HOST} port={port} user=postgres dbname={dbname} sslmode=disable");
+async fn connect_at(port: u16, user: &str, dbname: &str, password: Option<&str>) -> Result<Client> {
+    let mut conn_str =
+        format!("host={PT_HOST} port={port} user={user} dbname={dbname} sslmode=disable");
+    if let Some(pw) = password {
+        // tokio-postgres takes the password via a connection-string
+        // key=value pair; keep it OUTSIDE of any test log so it
+        // never leaks. (Cluster::psql does the same for parity.)
+        use std::fmt::Write;
+        write!(&mut conn_str, " password={pw}").expect("write to String");
+    }
     let (client, conn) = tokio_postgres::connect(&conn_str, NoTls)
         .await
-        .with_context(|| format!("tokio_postgres::connect to {PT_HOST}:{port}"))?;
+        .with_context(|| format!("tokio_postgres::connect to {PT_HOST}:{port} as {user}"))?;
     // Drive the connection in the background. If the task ends with
     // an error, log it to stderr — tests usually drop the Client at
     // end-of-scope and don't await this.

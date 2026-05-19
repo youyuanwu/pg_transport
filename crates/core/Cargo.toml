@@ -55,6 +55,13 @@ bytes       = { workspace = true }
 # inline — see frontend.rs.
 libc = "0.2"
 
+# Phase 7 (wire-layer auth) deps. base64 decodes pg_authid SCRAM
+# verifiers (`SCRAM-SHA-256$<iters>:<salt_b64>$<stored_b64>:<server_b64>`);
+# already in the tree via pgwire but listed here as a direct dep to
+# avoid relying on a transitive. hmac / sha2 / stringprep land in
+# phase 7.3 when the SCRAM crypto goes in.
+base64 = "0.22"
+
 # v0 phase 0 stub — the wire and TLS deps land per-phase:
 #   pgwire       = phase 4 (startup + simple query) — done
 #   openssl       = { workspace = true }  # phase 8 (TLS)
