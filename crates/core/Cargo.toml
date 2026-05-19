@@ -66,9 +66,14 @@ hmac   = "0.13"
 sha2   = "0.11"
 
 # v0 phase 0 stub — the wire and TLS deps land per-phase:
-#   pgwire       = phase 4 (startup + simple query) — done
-#   openssl       = { workspace = true }  # phase 8 (TLS)
-#   tokio-openssl = { workspace = true }  # phase 8
+#   pgwire        = phase 4 (startup + simple query) — done
+#   tokio-rustls  = phase 8 (TLS termination) — done
+#
+# Q26 (roadmap §2.3): pgwire 0.40 hard-binds TLS to tokio_rustls,
+# so we switched from the originally-planned rust-openssl path.
+tokio-rustls     = { workspace = true }
+rustls-pemfile   = { workspace = true }
+rustls-pki-types = { workspace = true }
 
 [dev-dependencies]
 pgrx-tests = { workspace = true }

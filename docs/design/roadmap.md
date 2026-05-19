@@ -579,6 +579,62 @@ workspace [Cargo.toml](../../../Cargo.toml) (dropped `sqlparser`
 dep entirely; `raw_parser` is in `pg_sys`), and
 [bench.md §2.6](bench.md) (numbers restored to near-parity).
 
+**Q26. TLS library choice — rust-openssl vs rustls.** ~~Open~~
+**Resolved: rustls (via `tokio_rustls` + ring), re-litigating Q12.**
+
+Q12 picked rust-openssl on the rationale that PG itself links
+against OpenSSL and reusing it would inherit FIPS modes, OS trust
+stores, and OpenSSL config files. During phase 8 implementation
+we found that **pgwire 0.40 hard-binds its TLS plumbing to
+`tokio_rustls`**: the `TlsAcceptor` type alias in
+[`pgwire-0.40.0/src/tokio/mod.rs`](../../../target/doc/pgwire/tokio/index.html)
+is gated on the `_ring` / `_aws-lc-rs` cargo features, and
+`process_socket`'s second arg is typed as that alias. There's no
+extension point for a different TLS backend.
+
+Options considered:
+
+- **(a) Switch to rustls** (adopted). One cargo feature flip
+  (`server-api` → `server-api-ring`) + a small `wire/tls.rs`
+  module that builds a `tokio_rustls::TlsAcceptor` from the
+  `pg_transport.tls_{cert,key}_file` GUCs. Plus a one-line
+  `_PG_init` call to install the rustls process-wide crypto
+  provider. ~150 LOC end-to-end.
+- **(b) Fork pgwire and plumb in tokio-openssl.** Would preserve
+  Q12's rationale but introduces a long-term maintenance burden
+  (every pgwire upstream change has to be re-applied) and
+  duplicates an upstream feature.
+- **(c) Implement the SSLRequest peek + handshake ourselves,
+  feed pgwire a wrapped stream.** Blocked by `process_socket`
+  taking a concrete `TcpStream` (not a generic stream type).
+  Would require reimplementing pgwire's full inner message-
+  dispatch loop. Worst cost.
+
+Q12's rationale survives criticism:
+
+- **FIPS modes:** rustls has ring (no FIPS) and aws-lc-rs (FIPS-
+  validated). v0 isn't a FIPS environment; aws-lc-rs is a
+  one-feature-flag swap later if needed.
+- **OS trust stores:** server-side TLS doesn't validate client
+  certs in v0 (mTLS lands later); we only present a server cert,
+  for which no trust store matters.
+- **OpenSSL config files:** specific to clients using libpq;
+  pg_transport's wire layer is server-side only.
+
+The cost we accept: server-side TLS material lives in
+`pg_transport.tls_{cert,key}_file` (independent of the cluster's
+`ssl_cert_file`). For v0 this is a single explicit-config burden;
+the design's "default from cluster `ssl_*`" path can be added
+later without a wire-layer change.
+
+Affects [Q12](#23-resolved) (re-resolved as rustls),
+[`crates/core/src/wire/tls.rs`](../../crates/core/src/wire/tls.rs)
+(new), [`crates/core/src/wire/pgwire_v3.rs`](../../crates/core/src/wire/pgwire_v3.rs)
+(passes `Some(acceptor)` to `process_socket`), workspace
+[Cargo.toml](../../../Cargo.toml) (drops `openssl` + `tokio-openssl`,
+adds `tokio-rustls` + `rustls-pemfile` + `rustls-pki-types`), and
+[backend-wire.md §5](backend-wire.md) (TLS lib reference updated).
+
 ---
 
 ## 3. Risks & mitigations

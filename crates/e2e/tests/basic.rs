@@ -454,3 +454,51 @@ async fn division_by_zero_does_not_fall_through_to_unknown_panic() -> Result<()>
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Phase 8 TLS tests
+// ---------------------------------------------------------------------------
+//
+// The e2e harness generates a self-signed cert at cluster boot
+// (see `Cluster::new`) and points `pg_transport.tls_{cert,key}_file`
+// at it. The wire layer's slot bgworkers load the cert once at
+// startup; the pgwire `process_socket` second arg is now
+// `Some(acceptor)` (was `None` pre-7.3).
+//
+// We test via `psql` because PG's built-in libpq has TLS built in
+// via libssl — provided pgrx's PG was built with `--with-openssl`
+// (see `just init`). tokio-postgres' default `NoTls` connector
+// can't do TLS, so this side of the test would otherwise need a
+// `tokio-postgres-rustls` dev-dep; psql is simpler.
+
+#[tokio::test]
+async fn tls_sslmode_require_succeeds() -> Result<()> {
+    // PGSSLMODE=require → psql sends SSLRequest, expects 'S' from
+    // the server, does the TLS handshake, then runs SELECT 1 over
+    // the encrypted stream. The self-signed cert is not validated
+    // (sslmode=require doesn't check the chain — use verify-ca /
+    // verify-full for that, which would need a CA bundle we don't
+    // ship in v0).
+    let c = Cluster::shared().await;
+    let out = c.psql_with_sslmode("postgres", "SELECT 1", "require")?;
+    assert!(
+        out.contains("(1 row)"),
+        "expected SELECT 1 to succeed over TLS; got:\n{out}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn tls_sslmode_disable_still_works() -> Result<()> {
+    // Sanity check: enabling TLS in the cluster must NOT break
+    // plaintext connections. pgwire's process_socket peeks for
+    // SSLRequest before doing anything TLS-specific, so a client
+    // that doesn't send SSLRequest just proceeds cleartext.
+    let c = Cluster::shared().await;
+    let out = c.psql_with_sslmode("postgres", "SELECT 1", "disable")?;
+    assert!(
+        out.contains("(1 row)"),
+        "expected plaintext SELECT 1 to still work; got:\n{out}"
+    );
+    Ok(())
+}

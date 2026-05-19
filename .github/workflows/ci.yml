@@ -96,19 +96,21 @@ jobs:
         run: cargo install --locked --version "=${PGRX_VERSION}" cargo-pgrx
 
       # The big one: `cargo pgrx init --pgN download` fetches the PG
-      # tarball and builds it with `--enable-cassert` (5–10 min,
-      # ~1.5 GB). Cache it across runs keyed on (OS, pgrx version,
-      # PG major) — a bump in any of those triggers a rebuild.
+      # tarball and builds it with `--enable-cassert` + `--with-openssl`
+      # (5–10 min, ~1.5 GB). Cache it across runs keyed on (OS, pgrx
+      # version, PG major, configure-flag suffix) — a bump in any of
+      # those triggers a rebuild. The `ssl` suffix in the key forces a
+      # rebuild over any pre-phase-8 cache that compiled without SSL.
       - name: Cache provisioned Postgres ($PGRX_HOME)
         id: pgrx-pg-cache
         uses: actions/cache@v5
         with:
           path: ${{ env.PGRX_HOME }}
-          key: pgrx-pg-${{ runner.os }}-${{ env.PGRX_VERSION }}-pg${{ matrix.pg-major }}
+          key: pgrx-pg-${{ runner.os }}-${{ env.PGRX_VERSION }}-pg${{ matrix.pg-major }}-ssl
 
       - name: Provision Postgres (cache miss)
         if: steps.pgrx-pg-cache.outputs.cache-hit != 'true'
-        run: cargo pgrx init --pg${{ matrix.pg-major }} download
+        run: cargo pgrx init --pg${{ matrix.pg-major }} download --configure-flag=--with-openssl
 
       # `just check` = fmt-check + clippy (warnings → errors) + cargo
       # test (workspace --lib --bins) + `cargo pgrx test pgN` (all

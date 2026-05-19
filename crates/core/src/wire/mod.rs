@@ -11,9 +11,13 @@
 
 pub mod auth;
 pub mod pgwire_v3;
+pub mod tls;
 
 use std::os::fd::OwnedFd;
 use std::rc::Rc;
+use std::sync::Arc;
+
+use tokio_rustls::TlsAcceptor;
 
 /// Pluggable wire-protocol implementation. The slot runner builds
 /// one `WireCtx` per handoff, calls `W::run`, then drops it.
@@ -40,4 +44,11 @@ pub struct WireCtx {
     /// `ctx.rt.block_on(...)`. See
     /// [backend-handoff.md §3](../../../../docs/design/backend-handoff.md).
     pub rt: Rc<tokio::runtime::Runtime>,
+    /// Per-slot TLS acceptor built once from
+    /// `pg_transport.tls_{cert,key}_file` GUCs (see
+    /// [`tls::build`]). `None` when TLS is disabled. `Arc` because
+    /// pgwire's `process_socket` takes ownership of the acceptor
+    /// per call — clones are cheap (the inner `ServerConfig` is
+    /// already `Arc`'d by `TlsAcceptor::from`).
+    pub tls_acceptor: Option<Arc<TlsAcceptor>>,
 }

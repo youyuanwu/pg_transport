@@ -43,14 +43,21 @@ default:
 # ---------------------------------------------------------------------------
 
 # Provision PG 18 in $PGRX_HOME (downloads source, builds with
-# --enable-cassert). One-time, ~5–10 min, ~1.5 GB.
+# --enable-cassert + --with-openssl). One-time, ~5–10 min, ~1.5 GB.
+#
+# --with-openssl is required for the phase-8 TLS path: pgrx's
+# default download build skips it, which makes psql refuse
+# `sslmode=require` with "SSL support is not compiled in" and
+# breaks the e2e TLS tests. The Rust wire layer doesn't need it
+# (rustls is self-contained) but the e2e harness drives psql,
+# which links libpq, which needs OpenSSL at build time.
 init:
     @echo "PGRX_HOME=$PGRX_HOME"
-    cargo pgrx init --pg18 download
+    cargo pgrx init --pg18 download --configure-flag=--with-openssl
 
 # Provision a single major. Usage: `just init-one pg=pg17`.
 init-one pg=default_pg:
-    cargo pgrx init --{{pg}} download
+    cargo pgrx init --{{pg}} download --configure-flag=--with-openssl
 
 # Print the resolved pg_config for each provisioned major.
 which-pg:

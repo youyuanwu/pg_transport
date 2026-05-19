@@ -64,10 +64,17 @@ impl Wire for PgwireV3 {
         // per-connection state. No cross-connection leakage.
         let handlers = Arc::new(PgTransportHandlers::default());
 
+        // Move the TLS acceptor out of ctx so we can pass it into
+        // `process_socket`. pgwire handles the SSLRequest peek +
+        // handshake transparently when `Some(acceptor)` is passed.
+        // `None` means TLS-disabled: pgwire replies 'N' to the
+        // SSLRequest magic and proceeds cleartext.
+        let tls_acceptor = ctx.tls_acceptor.map(|arc| (*arc).clone());
+
         ctx.rt.block_on(async move {
             let tcp_stream = tokio::net::TcpStream::from_std(std_stream)
                 .map_err(|e| anyhow::anyhow!("tokio::TcpStream::from_std: {e}"))?;
-            process_socket(tcp_stream, None, handlers)
+            process_socket(tcp_stream, tls_acceptor, handlers)
                 .await
                 .map_err(|e| anyhow::anyhow!("pgwire process_socket: {e}"))?;
             Ok::<(), anyhow::Error>(())

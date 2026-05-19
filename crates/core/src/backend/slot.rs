@@ -99,6 +99,16 @@ fn run_slot(slot_id: u32) -> io::Result<()> {
             .map_err(|e| io::Error::other(format!("tokio runtime: {e}")))?,
     );
 
+    // Per-slot TLS acceptor built once from pg_transport.tls_*
+    // GUCs (phase 8). None when TLS is disabled. We build at slot
+    // boot rather than per-handoff so cert-file IO + rustls config
+    // assembly happens off the handoff hot path; the only per-
+    // handoff cost is the TLS handshake itself.
+    let tls_acceptor = crate::wire::tls::build()?;
+    if tls_acceptor.is_some() {
+        pgrx::log!("pg_transport slot {slot_id}: TLS enabled");
+    }
+
     let mut handoffs: u64 = 0;
     loop {
         // Cheap shutdown check between handoffs. The slot is sync
@@ -126,7 +136,10 @@ fn run_slot(slot_id: u32) -> io::Result<()> {
                     "pg_transport slot {slot_id}: received fd {} (handoff #{handoffs})",
                     fd.as_raw_fd()
                 );
-                let ctx = WireCtx { rt: rt.clone() };
+                let ctx = WireCtx {
+                    rt: rt.clone(),
+                    tls_acceptor: tls_acceptor.clone(),
+                };
                 if let Err(e) = PgwireV3::run(fd, ctx) {
                     pgrx::warning!("pg_transport slot {slot_id}: wire run failed: {e}");
                 }

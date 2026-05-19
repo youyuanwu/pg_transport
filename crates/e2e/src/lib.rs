@@ -194,6 +194,47 @@ impl Cluster {
             );
         }
 
+        // Phase 8: generate a self-signed cert + PKCS#8 key for the
+        // wire-layer TLS test. openssl(1) is universally available on
+        // any host that can build PG (PG itself links against it).
+        // 1-day validity is more than enough for a CI run; the cert
+        // lives in the temp cluster dir and dies with it.
+        let cert_path = pgdata.join("pg_transport_tls.crt");
+        let key_path = pgdata.join("pg_transport_tls.key");
+        let out = Command::new("openssl")
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-keyout",
+                key_path.to_string_lossy().as_ref(),
+                "-out",
+                cert_path.to_string_lossy().as_ref(),
+                "-days",
+                "1",
+                "-nodes",
+                "-subj",
+                "/CN=localhost",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .context("spawn openssl req")?;
+        if !out.status.success() {
+            bail!(
+                "openssl req failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        // PG's standard `ssl_key_file` permission check expects 0600.
+        // pg_transport doesn't enforce it (rustls reads via std::fs
+        // which doesn't care), but matching PG's posture avoids
+        // surprise the day this gets reused.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+            .context("chmod 0600 on TLS key")?;
+
         // Append our overrides to the freshly-written postgresql.conf.
         // initdb wrote it; we want our settings to take precedence
         // (later settings win in PG), so append rather than rewrite.
@@ -210,8 +251,14 @@ impl Cluster {
              max_worker_processes = 32\n\
              pg_transport.backend_pool_size = {POOL_SIZE}\n\
              # auth_source is required by _PG_init() since phase 7.\n\
-             pg_transport.auth_source = 'pg_hba'\n",
+             pg_transport.auth_source = 'pg_hba'\n\
+             # Phase 8: TLS termination. Self-signed test cert lives\n\
+             # alongside pgdata; gone when the cluster is wiped.\n\
+             pg_transport.tls_cert_file = '{cert}'\n\
+             pg_transport.tls_key_file  = '{key}'\n",
             sockets = sockets.display(),
+            cert = cert_path.display(),
+            key = key_path.display(),
         );
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
@@ -310,6 +357,13 @@ impl Cluster {
     /// Returns combined stdout+stderr. Non-zero exit is not an error
     /// here — caller decides what to do.
     pub fn psql(&self, dbname: &str, sql: &str) -> Result<String> {
+        self.psql_with_sslmode(dbname, sql, "disable")
+    }
+
+    /// Like [`Cluster::psql`] but lets the caller pin `PGSSLMODE`.
+    /// Useful for phase-8 TLS tests that need `require`, or for
+    /// `prefer` to confirm the fallback path.
+    pub fn psql_with_sslmode(&self, dbname: &str, sql: &str, sslmode: &str) -> Result<String> {
         let out = Command::new(self.pg_bin.join("psql"))
             .args([
                 "-h",
@@ -323,7 +377,7 @@ impl Cluster {
                 "-c",
                 sql,
             ])
-            .env("PGSSLMODE", "disable")
+            .env("PGSSLMODE", sslmode)
             .output()
             .context("spawn psql")?;
         let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();

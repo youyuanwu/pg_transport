@@ -83,6 +83,16 @@ pub extern "C-unwind" fn _PG_init() {
     guc::register();
     guc::validate_required();
 
+    // Phase 8: install rustls' `ring` crypto provider process-wide.
+    // rustls 0.23 requires an explicit provider install; without
+    // this, `ServerConfig::builder()` panics at "no process-level
+    // CryptoProvider available". Idempotent — `install_default`
+    // returns Err if already set, which we ignore (covers the
+    // case where two bgworkers in the same postmaster process
+    // race; postmaster is single-process so they don't, but
+    // belt-and-suspenders).
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+
     // Frontend bgworker (Q22 → option (a)): registered statically so
     // it comes up at postmaster start.
     BackgroundWorkerBuilder::new("pg_transport frontend")

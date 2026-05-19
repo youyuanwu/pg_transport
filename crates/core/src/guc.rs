@@ -36,6 +36,23 @@ pub static BACKEND_POOL_SIZE: GucSetting<i32> = GucSetting::<i32>::new(2);
 /// decodes into the typed [`AuthSource`] enum.
 pub static AUTH_SOURCE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 
+/// `pg_transport.tls_cert_file` — path to the server TLS certificate
+/// in PEM format. Empty / unset disables TLS entirely (the wire
+/// layer responds `'N'` to `SSLRequest`). See
+/// [backend-wire.md §5](../../docs/design/backend-wire.md).
+///
+/// Phase 8: no default. The design ([configuration.md §3](../../docs/design/configuration.md))
+/// would have us inherit the cluster's `ssl_cert_file`, but that's
+/// another layer of GUC resolution to wire up; for v0 we accept the
+/// "operator names the cert explicitly" friction.
+pub static TLS_CERT_FILE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+
+/// `pg_transport.tls_key_file` — path to the server TLS private
+/// key in PEM (PKCS#8) format. Empty / unset disables TLS. Both
+/// `tls_cert_file` and `tls_key_file` must be set together; setting
+/// only one FATALs at slot boot.
+pub static TLS_KEY_FILE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
+
 /// Typed view of [`AUTH_SOURCE`]. See module-level docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthSource {
@@ -73,6 +90,28 @@ pub fn register() {
         // Backend) are wrong here — auth source is policy, not
         // per-session, and silently changing it mid-flight would
         // be a security-relevant surprise.
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        c"pg_transport.tls_cert_file",
+        c"Path to the server TLS certificate (PEM). Empty disables TLS.",
+        c"Both tls_cert_file and tls_key_file must be set to enable TLS.",
+        &TLS_CERT_FILE,
+        // Postmaster: cert is loaded once at slot startup. SIGHUP
+        // reload of cert/key is a phase ≥ 9 concern (would need
+        // tracking the SslAcceptor Arc in shared state with
+        // atomic swap; not worth the complexity for v0).
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        c"pg_transport.tls_key_file",
+        c"Path to the server TLS private key (PEM, PKCS#8). Empty disables TLS.",
+        c"Both tls_cert_file and tls_key_file must be set to enable TLS.",
+        &TLS_KEY_FILE,
         GucContext::Postmaster,
         GucFlags::default(),
     );
@@ -127,4 +166,31 @@ fn decode_auth_source() -> Result<AuthSource, String> {
 #[inline]
 pub fn backend_pool_size() -> u32 {
     BACKEND_POOL_SIZE.get() as u32
+}
+
+/// Read both TLS-file GUCs and return the typed pair
+/// `(cert_path, key_path)` if both are set, or `None` if TLS is
+/// disabled (both empty). Returns an error if exactly one is set —
+/// that's almost certainly an operator mistake (asymmetric config
+/// usually means "I forgot to set the other one"). The slot's TLS
+/// builder converts this to a FATAL at boot.
+pub fn tls_files() -> Result<Option<(String, String)>, String> {
+    let cert = TLS_CERT_FILE
+        .get()
+        .map(|c| c.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let key = TLS_KEY_FILE
+        .get()
+        .map(|c| c.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    match (cert.is_empty(), key.is_empty()) {
+        (true, true) => Ok(None),
+        (false, false) => Ok(Some((cert, key))),
+        (true, false) => Err(
+            "pg_transport.tls_key_file is set but pg_transport.tls_cert_file is not".to_string(),
+        ),
+        (false, true) => Err(
+            "pg_transport.tls_cert_file is set but pg_transport.tls_key_file is not".to_string(),
+        ),
+    }
 }

@@ -28,9 +28,10 @@ tokio   = { version = "1", default-features = false }
 futures = { version = "0.3", default-features = false }
 
 # Wire layer (sunng87/pgwire). Phase 4 brings up the FE/BE v3
-# protocol; we pull in the server API but stay off the TLS feature
-# flags (aws-lc-rs / ring) — TLS lands phase 8 via tokio-openssl.
-pgwire = { version = "0.40", default-features = false, features = ["server-api"] }
+# protocol; phase 8 enables TLS via tokio_rustls + ring (Q12
+# re-litigated as Q26 — pgwire 0.40 hard-binds TLS to tokio_rustls,
+# so the original rust-openssl plan would need a pgwire fork).
+pgwire = { version = "0.40", default-features = false, features = ["server-api-ring"] }
 
 # Phase-5 bench client: tokio-postgres as the libpq-compatible
 # client driver. `default = ["runtime"]` is fine — bench is its
@@ -42,9 +43,16 @@ tokio-postgres = "0.7"
 # `--help`). Used by `bench` only; never touched by the cdylib.
 clap = { version = "4", features = ["derive"] }
 
-# TLS in the wire layer (Q12: rust-openssl). Not yet linked into stubs.
-openssl       = "0.10"
-tokio-openssl = "0.6"
+# TLS in the wire layer. Q12 picked rust-openssl; Q26 re-litigated
+# to rustls (via tokio_rustls + ring) because pgwire 0.40 hard-binds
+# its TLS plumbing to tokio_rustls. tokio_rustls itself comes in
+# transitively via pgwire's `_ring` feature; we add it as a direct
+# dep here so our setup_tls() code can name the types without
+# reaching through pgwire's re-exports. rustls-pemfile +
+# rustls-pki-types are for loading PEM cert/key files.
+tokio-rustls    = { version = "0.26", default-features = false, features = ["ring"] }
+rustls-pemfile  = "2"
+rustls-pki-types = "1"
 
 # Misc.
 thiserror   = "2"
