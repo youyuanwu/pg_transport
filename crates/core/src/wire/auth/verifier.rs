@@ -214,19 +214,8 @@ fn parse_scram(body: &str) -> Option<ScramVerifier> {
     })
 }
 
-// Convenience: classify `role` into the auth method PG would pick
-// based on the credential format. Returns `Err` if SPI failed —
-// caller should reject the connection rather than fall back to
-// trust on internal error.
-pub fn infer_method(role: &str) -> Result<super::AuthMethod, String> {
-    use super::AuthMethod;
-    match load_rolpassword(role)? {
-        // No password / unknown role → trust (matches PG's typical
-        // pg_hba "host all all 0.0.0.0/0 trust" default for
-        // credential-less roles).
-        RolPassword::None | RolPassword::UnknownRole => Ok(AuthMethod::Trust),
-        RolPassword::Scram(_) => Ok(AuthMethod::ScramSha256),
-        RolPassword::Md5(_) => Ok(AuthMethod::Md5),
-        RolPassword::Unsupported => Ok(AuthMethod::Reject),
-    }
-}
+// (Earlier 7.2 versions exposed an `infer_method(role) -> AuthMethod`
+// helper that combined load_rolpassword + variant-to-method mapping.
+// Removed in 7.3: the startup handler dispatches on RolPassword
+// directly because the SCRAM path needs the full verifier in hand,
+// not just the method tag — avoids a second SPI call.)

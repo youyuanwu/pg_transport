@@ -1216,10 +1216,12 @@ dependencies = [
  "base64",
  "bytes",
  "futures",
+ "hmac",
  "libc",
  "pgrx",
  "pgrx-tests",
  "pgwire",
+ "sha2",
  "tokio",
  "tokio-util",
 ]

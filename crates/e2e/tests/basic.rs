@@ -257,62 +257,75 @@ async fn auth_dispatch_log_line_present() -> Result<()> {
 }
 
 #[tokio::test]
-async fn auth_scram_stored_role_routes_to_scram_dispatch() -> Result<()> {
-    // Phase 7.2: the verifier loader reads pg_authid.rolpassword
-    // via SPI and routes to AuthMethod::ScramSha256 when the role
-    // has a SCRAM verifier. Phase 7.3 implements the actual SCRAM
-    // crypto; until then, the dispatch lands on the
-    // "method not implemented" branch (SQLSTATE 0A000). Asserting
-    // that branch proves the verifier loader fired correctly.
+async fn auth_scram_stored_role_accepts_correct_password() -> Result<()> {
+    // Phase 7.3: verifier loader + SCRAM-SHA-256 server-side
+    // verifier (StoredKey path) end-to-end. tokio-postgres
+    // negotiates SASL with the server and runs the proof; we
+    // verify it succeeds *and* that a follow-up query works
+    // (proves the post-auth ReadyForQuery + SimpleQuery handler
+    // chain is intact after the multi-message auth exchange).
     let c = Cluster::shared().await;
     let admin = c.admin_connect("postgres").await?;
 
-    // Idempotent: drop the role if a prior run left it around.
-    let role = "e2e_scram_pending";
+    let role = "e2e_scram_ok";
     let _ = admin
         .simple_query(&format!("DROP ROLE IF EXISTS {role}"))
         .await?;
-
-    // PG 14+ default `password_encryption` is scram-sha-256, so
-    // CREATE ROLE … PASSWORD 'foo' stores a SCRAM verifier.
+    // PG 14+ default `password_encryption` = scram-sha-256, so
+    // CREATE ROLE … PASSWORD 'pw' stores a SCRAM verifier. The
+    // role needs pg_read_all_data to read pg_class for the
+    // verification query below.
     admin
         .simple_query(&format!(
-            "CREATE ROLE {role} LOGIN PASSWORD 'pw' \
+            "CREATE ROLE {role} LOGIN PASSWORD 'correctpw' \
              IN ROLE pg_read_all_data"
         ))
         .await?;
 
-    // Sanity: confirm the stored verifier is SCRAM-format (so the
-    // test would fail correctly if some future PG version flipped
-    // the default to MD5 or cleartext).
-    let row = admin
-        .query_one(
-            "SELECT substring(rolpassword from 1 for 13) FROM pg_authid WHERE rolname = $1",
-            &[&role],
-        )
+    // The SCRAM exchange happens transparently inside connect_as.
+    let client = c.connect_as(role, "postgres", Some("correctpw")).await?;
+    let msgs = client
+        .simple_query("SELECT relname FROM pg_class WHERE relname = 'pg_authid'")
         .await?;
-    let prefix: &str = row.get(0);
     assert_eq!(
-        prefix, "SCRAM-SHA-256",
-        "pg_authid stored verifier is not SCRAM-format ({prefix:?}); \
-         this test assumes PG 14+ default password_encryption"
+        e2e::first_text_cell(&msgs).as_deref(),
+        Some("pg_authid"),
+        "SCRAM-authed connection must be able to query"
     );
 
-    // Attempt to connect through pg_transport. tokio-postgres
-    // will negotiate SASL; the server reports
-    // "method scram-sha-256 selected by pg_hba.conf is not
-    // implemented in this build" (FATAL, 0A000) at the auth step.
+    let _ = admin
+        .simple_query(&format!("DROP ROLE IF EXISTS {role}"))
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn auth_scram_wrong_password_rejected_with_28p01() -> Result<()> {
+    // Wrong password → SCRAM proof verification fails →
+    // FATAL 28P01. The wire-level rejection is intentionally
+    // identical to malformed-message rejection (no info leak).
+    let c = Cluster::shared().await;
+    let admin = c.admin_connect("postgres").await?;
+    let role = "e2e_scram_wrong";
+    let _ = admin
+        .simple_query(&format!("DROP ROLE IF EXISTS {role}"))
+        .await?;
+    admin
+        .simple_query(&format!(
+            "CREATE ROLE {role} LOGIN PASSWORD 'realpw' IN ROLE pg_read_all_data"
+        ))
+        .await?;
+
     let err = c
-        .connect_as(role, "postgres", Some("pw"))
+        .connect_as(role, "postgres", Some("wrongpw"))
         .await
-        .expect_err("scram-stored role should hit unimplemented-method reject in 7.2");
+        .expect_err("wrong SCRAM password must fail");
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("0A000") || msg.contains("not implemented") || msg.contains("scram"),
-        "expected 0A000 / 'not implemented' / 'scram' in error, got: {msg}"
+        msg.contains("28P01") || msg.contains("SCRAM") || msg.contains("authentication failed"),
+        "expected SCRAM auth-failed error, got: {msg}"
     );
 
-    // Cleanup so re-runs are idempotent.
     let _ = admin
         .simple_query(&format!("DROP ROLE IF EXISTS {role}"))
         .await?;

@@ -28,6 +28,7 @@
 //!   (needs TLS), peer.
 
 pub mod hba;
+pub mod scram;
 pub mod verifier;
 
 /// Methods PG's `pg_hba.conf` can specify. Mirrors PG's `UserAuth`
@@ -128,16 +129,13 @@ impl AuthOutcome {
 }
 
 /// Dispatch table: given the auth method PG's HBA chose, return the
-/// outcome. v0.1 only implements [`AuthMethod::Trust`] and
-/// [`AuthMethod::Reject`]; everything else returns
-/// [`AuthOutcome::unimplemented`].
-///
-/// This function does **not** read from the wire (no SCRAM exchange,
-/// no password message). The methods that need wire I/O (password,
-/// md5, scram-sha-256) get implemented in later phase commits as
-/// separate state-machine handlers in the startup handler — at which
-/// point they'll replace the corresponding `AuthOutcome::unimplemented`
-/// branch here.
+/// outcome. Currently unused — phase 7.3 dispatches on
+/// [`verifier::RolPassword`] directly in the startup handler
+/// because the SCRAM branch needs the parsed verifier in hand and
+/// the variant-to-outcome mapping is more naturally expressed at
+/// the call site. Kept here for the rare future path that wants
+/// method-only dispatch (e.g. a real `hba_getauthmethod` swap).
+#[allow(dead_code)]
 pub fn run(method: AuthMethod) -> AuthOutcome {
     match method {
         AuthMethod::Trust => AuthOutcome::Accept,

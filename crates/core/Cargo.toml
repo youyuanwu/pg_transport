@@ -56,11 +56,14 @@ bytes       = { workspace = true }
 libc = "0.2"
 
 # Phase 7 (wire-layer auth) deps. base64 decodes pg_authid SCRAM
-# verifiers (`SCRAM-SHA-256$<iters>:<salt_b64>$<stored_b64>:<server_b64>`);
-# already in the tree via pgwire but listed here as a direct dep to
-# avoid relying on a transitive. hmac / sha2 / stringprep land in
-# phase 7.3 when the SCRAM crypto goes in.
+# verifiers (`SCRAM-SHA-256$<iters>:<salt_b64>$<stored_b64>:<server_b64>`)
+# and encodes the wire-format SCRAM messages; already in the tree
+# via pgwire but listed here as a direct dep to avoid relying on a
+# transitive. hmac / sha2 do the SCRAM proof verification (phase
+# 7.3) — both also pgwire transitives, promoted to direct.
 base64 = "0.22"
+hmac   = "0.13"
+sha2   = "0.11"
 
 # v0 phase 0 stub — the wire and TLS deps land per-phase:
 #   pgwire       = phase 4 (startup + simple query) — done
