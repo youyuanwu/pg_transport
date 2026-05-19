@@ -118,3 +118,16 @@ jobs:
       # See Justfile.
       - name: just check
         run: just check
+
+      # Smoke-shape bench runs. NOT part of `just check` because they
+      # build the cdylib in --release (LTO=fat, slow) and devs want
+      # local `just check` fast. Goal here is "does the bench code
+      # path break?", not "are the numbers good?" — magnitudes are
+      # noisy on shared CI hardware and would either flap or be too
+      # loose to catch real regressions (see Q&A on perf-in-CI).
+      # Minimal parameters keep runtime in the ~10–20 s range each.
+      - name: just bench (smoke — 200 iters × 2 conns)
+        run: just bench pg${{ matrix.pg-major }} 200 2
+
+      - name: just pgbench (smoke — 3 s × 2 clients, select mode)
+        run: just pgbench pg${{ matrix.pg-major }} select 3 2
