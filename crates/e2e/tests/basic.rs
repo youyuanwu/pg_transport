@@ -196,6 +196,67 @@ async fn admin_connect_speaks_full_protocol() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 7.1 auth-dispatch tests
+// ---------------------------------------------------------------------------
+//
+// `Cluster::new` boots with `pg_transport.auth_source = 'pg_hba'`;
+// `wire::auth::hba::lookup` is stubbed to AuthMethod::Trust in 7.1,
+// so connections claiming `database = "postgres"` are accepted and
+// every other database is rejected before auth via the new
+// startup-handler database check.
+
+#[tokio::test]
+async fn auth_trust_accepts_postgres_database() -> Result<()> {
+    let c = Cluster::shared().await;
+    let client = c.connect("postgres").await?;
+    let msgs = client.simple_query("SELECT 1").await?;
+    assert!(
+        msgs.iter()
+            .any(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_))),
+        "expected at least one Row message after trust auth"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn auth_non_postgres_database_rejected() -> Result<()> {
+    // v0 slot SPI is pinned to "postgres"; connections claiming a
+    // different database get a clear FATAL (SQLSTATE 3D000,
+    // invalid_catalog_name) before any query runs. This guards
+    // against silently routing all DBs to the postgres database.
+    let c = Cluster::shared().await;
+    let err = c
+        .connect("template1")
+        .await
+        .expect_err("connect to non-postgres db should fail");
+
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("3D000") || msg.contains("template1"),
+        "expected wrong-database error to mention 3D000 or the database name, got: {msg}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn auth_dispatch_log_line_present() -> Result<()> {
+    // The phase-7 startup handler emits a structured log line
+    // `pgwire-v3 startup: peer=… tls=… proto=… user=… db=…`
+    // (the user= / db= suffixes are the 7.1 additions). Force a
+    // connection to guarantee at least one such line; assert the
+    // `user=` marker exists.
+    let c = Cluster::shared().await;
+    let _client = c.connect("postgres").await?;
+    let log = std::fs::read_to_string(c.log_path())?;
+    assert!(
+        log.contains("user=\"postgres\""),
+        "expected the phase-7 auth-dispatch log line with user=…; tail:\n{}",
+        log.lines().rev().take(20).collect::<Vec<_>>().join("\n")
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Server-observability tests — ported from the legacy `just smoke` recipe.
 // ---------------------------------------------------------------------------
 //

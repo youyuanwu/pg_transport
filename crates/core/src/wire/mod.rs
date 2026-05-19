@@ -9,6 +9,7 @@
 //! v0 has one wire: [`pgwire_v3::PgwireV3`] (built on the sunng87
 //! [`pgwire`](https://crates.io/crates/pgwire) crate).
 
+pub mod auth;
 pub mod pgwire_v3;
 
 use std::os::fd::OwnedFd;

@@ -77,8 +77,11 @@ pub extern "C-unwind" fn _PG_init() {
 
     // Register GUCs before anything reads them. Phase 2 surface:
     // pg_transport.backend_pool_size only (Q23: GUC list starts at
-    // phase 2).
+    // phase 2). Phase 7 adds pg_transport.auth_source — required,
+    // no default, validated immediately so an unset value FATALs at
+    // cluster boot rather than at the first slot's first auth.
     guc::register();
+    guc::validate_required();
 
     // Frontend bgworker (Q22 → option (a)): registered statically so
     // it comes up at postmaster start.
@@ -178,6 +181,11 @@ pub mod pg_test {
         // Required for the SPL check in `_PG_init()` to pass and for
         // `BackgroundWorkerBuilder::load()` (static registration) to
         // be legal — see docs/design/backend-handoff.md §1.
-        vec!["shared_preload_libraries = 'pg_transport'"]
+        // `pg_transport.auth_source` is required by `_PG_init()` since
+        // phase 7 (FATAL if unset); pg_hba is the v0 documented default.
+        vec![
+            "shared_preload_libraries = 'pg_transport'",
+            "pg_transport.auth_source = 'pg_hba'",
+        ]
     }
 }

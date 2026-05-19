@@ -1,29 +1,37 @@
 //! `pgwire-v3` Wire impl built on the [`pgwire`](https://crates.io/crates/pgwire)
-//! crate. Brings up FE/BE v3: startup handshake (trust auth in
-//! phase 4), simple query → SPI bridge, extended query → "not
-//! implemented" error frame (default `NoopHandler` behaviour, see
+//! crate. Brings up FE/BE v3: startup handshake, simple query →
+//! SPI bridge, extended query → "not implemented" error frame
+//! (default `NoopHandler` behaviour, see
 //! [backend-wire.md §2](../../../../docs/design/backend-wire.md)).
 //!
-//! Phase 4a (this commit): trust auth + idle simple-query handler
-//! (responds with `Tag::new("OK")`). Phase 4b lands the SPI bridge
-//! so `SELECT 1` returns `1`.
+//! Phase 7.1 (auth framework): startup handler does proper auth
+//! dispatch via [`crate::wire::auth`] — looks up the HBA method
+//! (currently stubbed to `Trust`) and either accepts or sends a
+//! FATAL `ErrorResponse` for methods we don't yet implement.
+//! Database-name check: connections claiming `database != "postgres"`
+//! are rejected with SQLSTATE `3D000` since v0 slots hard-code SPI
+//! to the `postgres` database.
 
 use std::fmt::Debug;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::Sink;
-use pgwire::api::auth::StartupHandler;
-use pgwire::api::auth::noop::NoopStartupHandler;
+use futures::{Sink, SinkExt};
+use pgwire::api::auth::{DefaultServerParameterProvider, StartupHandler, finish_authentication};
 use pgwire::api::query::SimpleQueryHandler;
 use pgwire::api::results::Response;
 use pgwire::api::store::PortalStore;
-use pgwire::api::{ClientInfo, ClientPortalStore, PgWireServerHandlers};
-use pgwire::error::{PgWireError, PgWireResult};
+use pgwire::api::{
+    ClientInfo, ClientPortalStore, METADATA_DATABASE, METADATA_USER, PgWireServerHandlers,
+    PidSecretKeyGenerator, RandomPidSecretKeyGenerator,
+};
+use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use pgwire::messages::response::ErrorResponse;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pgwire::tokio::process_socket;
 
+use super::auth::{self, AuthOutcome, hba};
 use super::{Wire, WireCtx};
 
 /// The v0 wire implementation. Stateless marker — per-connection
@@ -81,7 +89,7 @@ impl Wire for PgwireV3 {
 /// criterion for extended query ("clear 'not supported' error frame").
 #[derive(Default)]
 struct PgTransportHandlers {
-    startup: Arc<TrustStartup>,
+    startup: Arc<PgTransportStartup>,
     simple_query: Arc<SimpleQuery>,
 }
 
@@ -102,40 +110,138 @@ impl PgWireServerHandlers for PgTransportHandlers {
 }
 
 // ---------------------------------------------------------------------------
-// Trust startup
+// Startup handler — phase 7.1 auth dispatch
 // ---------------------------------------------------------------------------
 
-/// Trust-auth startup handler — accepts every client.
+/// Startup handler that does proper auth dispatch via
+/// [`crate::wire::auth`]:
 ///
-/// Phase 4 is `trust` only (no password, no SCRAM, no `hba_getauthmethod`
-/// lookup). Phase 7 replaces this with the real auth machinery.
+/// 1. Negotiates protocol version + saves StartupMessage parameters
+///    into client metadata.
+/// 2. Validates the claimed `database` parameter (must be
+///    `"postgres"` in v0; per-database routing is a later phase).
+/// 3. Looks up the auth method via [`hba::lookup`] (stubbed to
+///    trust in 7.1; real `hba_getauthmethod` FFI in 7.2).
+/// 4. Runs the method via [`auth::run`]:
+///    - `Trust` → finish_authentication0 + ReadyForQuery.
+///    - `Reject` / unimplemented method → FATAL ErrorResponse, close.
+///
+/// We implement `StartupHandler` directly rather than going through
+/// `NoopStartupHandler` because the latter sends `AuthenticationOk`
+/// **before** calling `post_startup` — making it impossible to
+/// reject a connection cleanly after method lookup. Implementing
+/// `on_startup` ourselves lets us decide accept-vs-reject *before*
+/// any auth-success frame goes on the wire.
 #[derive(Default)]
-struct TrustStartup;
+struct PgTransportStartup;
 
 #[async_trait]
-impl NoopStartupHandler for TrustStartup {
-    async fn post_startup<C>(
+impl StartupHandler for PgTransportStartup {
+    async fn on_startup<C>(
         &self,
         client: &mut C,
-        _message: PgWireFrontendMessage,
+        message: PgWireFrontendMessage,
     ) -> PgWireResult<()>
     where
-        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        // We only handle the initial Startup message; password /
+        // SASL response messages flow back here once we implement
+        // those methods (phase 7.3+).
+        let PgWireFrontendMessage::Startup(ref startup) = message else {
+            return Ok(());
+        };
+
+        pgwire::api::auth::protocol_negotiation(client, startup).await?;
+        pgwire::api::auth::save_startup_parameters_to_metadata(client, startup);
+
+        // Read what the client claims; if either is missing the
+        // pgwire-side metadata helpers would already have defaulted
+        // to empty — we still treat missing as an error.
+        let user = client
+            .metadata()
+            .get(METADATA_USER)
+            .cloned()
+            .unwrap_or_default();
+        let database = client
+            .metadata()
+            .get(METADATA_DATABASE)
+            .cloned()
+            .unwrap_or_else(|| user.clone()); // PG semantics: db defaults to user
+        let host = client.socket_addr().ip().to_string();
+        let ssl = client.is_secure();
+
         pgrx::log!(
-            "pgwire-v3 startup: peer={} tls={} proto={:?}",
+            "pgwire-v3 startup: peer={} tls={} proto={:?} user={user:?} db={database:?}",
             client.socket_addr(),
-            client.is_secure(),
+            ssl,
             client.protocol_version(),
         );
-        Ok(())
+
+        // Phase 7.1 hard constraint: slot SPI is pinned to
+        // "postgres" at slot startup; per-handoff database routing
+        // is a later phase. Reject any other claimed database
+        // cleanly rather than silently running queries against the
+        // wrong DB.
+        if database != "postgres" {
+            return reject(client, &AuthOutcome::wrong_database(&database)).await;
+        }
+
+        let method = hba::lookup(&hba::HbaLookup {
+            user: &user,
+            database: &database,
+            host: &host,
+            ssl,
+        });
+        let outcome = auth::run(method);
+
+        match outcome {
+            AuthOutcome::Accept => {
+                // Generate PID + secret key per pgwire's
+                // NoopStartupHandler. We don't register a connection
+                // manager (cancel-routing is deferred — roadmap §1
+                // "deferred" table).
+                let pid_gen = RandomPidSecretKeyGenerator::default();
+                let (pid, secret_key) = pid_gen.generate(client);
+                client.set_pid_and_secret_key(pid, secret_key);
+
+                // `finish_authentication` (public) does the
+                // AuthenticationOk + ParameterStatus + BackendKeyData
+                // + ReadyForQuery + state-transition dance. Equivalent
+                // to NoopStartupHandler's tail.
+                finish_authentication(client, &DefaultServerParameterProvider::default()).await?;
+                Ok(())
+            }
+            outcome @ AuthOutcome::Reject { .. } => reject(client, &outcome).await,
+        }
     }
 }
 
+/// Send a FATAL ErrorResponse for an [`AuthOutcome::Reject`] and
+/// return `Ok(())` so pgwire treats the connection as cleanly
+/// closed rather than as a transport-level error.
+async fn reject<C>(client: &mut C, outcome: &AuthOutcome) -> PgWireResult<()>
+where
+    C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+    C::Error: Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
+    let AuthOutcome::Reject { sqlstate, message } = outcome else {
+        unreachable!("reject called with non-Reject outcome");
+    };
+    pgrx::log!("pgwire-v3 auth reject: sqlstate={sqlstate} message={message:?}");
+    let info = ErrorInfo::new("FATAL".to_string(), sqlstate.to_string(), message.clone());
+    let err_response: ErrorResponse = info.into();
+    client
+        .send(PgWireBackendMessage::ErrorResponse(err_response))
+        .await?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
-// Simple-query handler — phase 4a echo, phase 4b SPI bridge
+// Simple-query handler — phase 4b SPI bridge
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]

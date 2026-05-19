@@ -208,7 +208,9 @@ impl Cluster {
              # Comfortably above 1 FE + POOL_SIZE slots + PG internal\n\
              # bgworkers (logical-rep launcher, autovac, etc.).\n\
              max_worker_processes = 32\n\
-             pg_transport.backend_pool_size = {POOL_SIZE}\n",
+             pg_transport.backend_pool_size = {POOL_SIZE}\n\
+             # auth_source is required by _PG_init() since phase 7.\n\
+             pg_transport.auth_source = 'pg_hba'\n",
             sockets = sockets.display(),
         );
         use std::io::Write;

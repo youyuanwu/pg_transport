@@ -92,6 +92,8 @@ bench pg=default_pg iters="1000" connections="1" pool="" csv="":
     logging_collector = off
     log_min_messages = warning
     pg_transport.backend_pool_size = $pool_size
+    # auth_source is required by _PG_init() since phase 7.
+    pg_transport.auth_source = 'pg_hba'
     max_worker_processes = $mwp
     EOF
 

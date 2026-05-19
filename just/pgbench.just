@@ -92,6 +92,8 @@ pgbench pg=default_pg mode="select" duration="10" clients="4" pool="":
     logging_collector = off
     log_min_messages = warning
     pg_transport.backend_pool_size = $pool_size
+    # auth_source is required by _PG_init() since phase 7.
+    pg_transport.auth_source = 'pg_hba'
     max_worker_processes = $mwp
     EOF
 
