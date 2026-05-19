@@ -104,7 +104,7 @@ pub extern "C-unwind" fn _PG_init() {
     // Our footprint is 1 FE + `backend_pool_size` slots + PG's
     // own bgworkers (logical replication launcher, etc.). For
     // pool_size > ~6 the operator must bump max_worker_processes
-    // in postgresql.conf; the just/{smoke,bench}.just recipes do
+    // in postgresql.conf; the just/{e2e,bench}.just recipes do
     // this automatically. A future phase may check the return
     // value via raw pg_sys and emit a clear FATAL.
     let pool_size = guc::backend_pool_size();

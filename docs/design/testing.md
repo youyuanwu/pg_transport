@@ -94,13 +94,29 @@ and adds the next when its subsystem lands.
 
 ### 3.3 End-to-end (out-of-process, sibling to bench)
 
-- Same harness as `crates/bench` (separate cluster, `psql` /
+- **Lives in `crates/e2e/`** (lib + `tests/`); driven by `just e2e`.
+  The `Cluster` helper handles `initdb` + `pg_ctl start` with
+  `shared_preload_libraries = 'pg_transport'`, waits for the wire
+  listener to come up, and is shared across all `#[tokio::test]`
+  functions in a binary via a process-wide `OnceCell`. Each test gets
+  a fresh `tokio_postgres::Client` via `Cluster::shared().await.connect(db).await`.
+- Same harness shape as `crates/bench` (separate cluster, `psql` /
   `tokio-postgres` clients) but asserting correctness rather than
   timing. Useful for cross-version PG matrix testing and for
   scenarios that need a real signal (`kill -SEGV` on a slot
   bgworker, observe respawn).
-- Phase-5 ships first because we need the same machinery for bench
-  numbers anyway; correctness e2e then drops in as a sibling.
+- **Wire-scope caveat:** while pg_transport only implements the
+  simple-query (`'Q'`) path, e2e tests use `Client::simple_query` plus
+  the `e2e::first_text_cell` / `e2e::text_column` helpers. Extended
+  query (`query` / `query_one` / `execute`) lands in roadmap phase 9,
+  at which point this file's tests can be reshaped to use the typed
+  accessors and a parallel simple-query suite added.
+- **Server-observability assertions** (server-log substrings + psql
+  `(N rows)` Tag rendering + the `panic_to_pgwire` downcast guard)
+  ride alongside the tokio-postgres tests in the same harness via
+  `Cluster::log_path()` and `Cluster::psql()`. These were previously
+  a separate `just smoke` bash recipe; consolidating them under e2e
+  removes the duplicate cluster bootstrap and unifies CI.
 
 ## 4. Error-injection mechanism
 

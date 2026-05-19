@@ -563,3 +563,163 @@ fn generic_error(prefix: &str, message: &str) -> PgWireError {
         format!("{prefix}: {message}"),
     )))
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+//
+// `#[pg_test]` runs each test inside a regular PG backend with an
+// outer `BEGIN; <body>; ROLLBACK` wrapper. That lets us exercise:
+//
+//   * [`parse_and_classify`] — calls `pg_sys::raw_parser` in-process,
+//     producing our `(slice, classification)` tuples. Catches any
+//     future pgrx upgrade that shifts `TransactionStmtKind` enum
+//     values or `RawStmt` layout, plus our slicing logic.
+//   * [`classify_raw_stmt`] / [`extract_statement_spans`] — exercised
+//     transitively through `parse_and_classify`.
+//
+// What we deliberately do NOT cover here:
+//
+//   * [`run_spi_statement`] / [`execute_simple_query`] — both call
+//     `StartTransactionCommand`, which trips
+//     `"unexpected state INPROGRESS"` against pg_test's pre-opened
+//     outer transaction. Their coverage lives in `just e2e` /
+//     `just pgbench` (real out-of-process flow against the slot).
+//   * [`handle_xact_control`] — same reason.
+//   * Wire layer + slot handoff — multi-process, out of scope for
+//     `#[pg_test]` entirely. See [`docs/design/testing.md`](../../../../docs/design/testing.md).
+#[cfg(any(test, feature = "pg_test"))]
+#[pgrx::pg_schema]
+mod tests {
+    use super::{XactCmd, parse_and_classify};
+    use pgrx::prelude::*;
+    use pgwire::error::PgWireError;
+
+    /// Convenience: assert parse succeeded and return the spans.
+    fn parse_ok(query: &str) -> Vec<(&str, Option<XactCmd>)> {
+        parse_and_classify(query).expect("parse should succeed")
+    }
+
+    #[pg_test]
+    fn empty_inputs_return_no_statements() {
+        // PG drops whitespace-only and comment-only inputs at parse
+        // time; we must do the same so pgwire emits a single
+        // EmptyQueryResponse rather than running anything.
+        assert!(parse_ok("").is_empty());
+        assert!(parse_ok("   \t  \n").is_empty());
+        assert!(parse_ok("-- just a comment\n").is_empty());
+        assert!(parse_ok("/* block comment */").is_empty());
+    }
+
+    #[pg_test]
+    fn single_select_is_unclassified() {
+        let stmts = parse_ok("SELECT 1");
+        assert_eq!(stmts.len(), 1);
+        assert!(
+            stmts[0].1.is_none(),
+            "SELECT should flow through to SPI uncategorised, got {:?}",
+            stmts[0].1
+        );
+    }
+
+    #[pg_test]
+    fn begin_is_classified() {
+        let stmts = parse_ok("BEGIN");
+        assert_eq!(stmts.len(), 1);
+        assert!(matches!(stmts[0].1, Some(XactCmd::Begin)));
+    }
+
+    #[pg_test]
+    fn start_transaction_classified_as_begin() {
+        // `START TRANSACTION` shares the gram.y TransactionStmt node
+        // with `BEGIN` but has its own TransactionStmtKind variant.
+        // We collapse both to XactCmd::Begin so the xact-block
+        // routing is uniform.
+        let stmts = parse_ok("START TRANSACTION");
+        assert_eq!(stmts.len(), 1);
+        assert!(matches!(stmts[0].1, Some(XactCmd::Begin)));
+    }
+
+    #[pg_test]
+    fn commit_and_rollback_are_classified() {
+        assert!(matches!(parse_ok("COMMIT")[0].1, Some(XactCmd::Commit)));
+        assert!(matches!(parse_ok("ROLLBACK")[0].1, Some(XactCmd::Rollback)));
+    }
+
+    #[pg_test]
+    fn begin_with_isolation_mode_list_still_begin() {
+        // Mode-list variants share TransactionStmtKind::TRANS_STMT_BEGIN;
+        // the mode list is carried as `options` on the same node. This
+        // is the case that motivated using the real parser rather
+        // than bare-keyword matching.
+        let stmts = parse_ok("BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE");
+        assert_eq!(stmts.len(), 1);
+        assert!(matches!(stmts[0].1, Some(XactCmd::Begin)));
+    }
+
+    #[pg_test]
+    fn savepoint_not_intercepted() {
+        // SAVEPOINT is a TransactionStmt in PG's grammar but v0
+        // deliberately does NOT intercept it — let SPI surface the
+        // SPI_ERROR_TRANSACTION rejection with its native message.
+        let stmts = parse_ok("SAVEPOINT s1");
+        assert_eq!(stmts.len(), 1);
+        assert!(stmts[0].1.is_none(), "SAVEPOINT must flow through to SPI");
+    }
+
+    #[pg_test]
+    fn multi_statement_split() {
+        let stmts = parse_ok("SELECT 1; SELECT 2");
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[0].0.trim(), "SELECT 1");
+        assert_eq!(stmts[1].0.trim().trim_end_matches(';'), "SELECT 2");
+        assert!(stmts[0].1.is_none() && stmts[1].1.is_none());
+    }
+
+    #[pg_test]
+    fn multi_statement_mixed_classification() {
+        let stmts = parse_ok("BEGIN; SELECT 1; COMMIT");
+        assert_eq!(stmts.len(), 3);
+        assert!(matches!(stmts[0].1, Some(XactCmd::Begin)));
+        assert!(stmts[1].1.is_none());
+        assert!(matches!(stmts[2].1, Some(XactCmd::Commit)));
+    }
+
+    #[pg_test]
+    fn semicolon_inside_string_literal_preserved() {
+        // The semicolon is inside a string literal — `raw_parser`
+        // must keep `SELECT ';'` as one statement, not split on the
+        // literal's semicolon. This is why we use the real parser
+        // instead of byte-level splitting.
+        let stmts = parse_ok("SELECT ';'; SELECT 2");
+        assert_eq!(stmts.len(), 2, "literal semicolon must not split");
+        assert!(stmts[0].0.contains("';'"));
+    }
+
+    #[pg_test]
+    fn dollar_quoted_string_handled() {
+        // Dollar-quoting was the canonical use-case for adopting a
+        // real parser (any byte splitter would mis-handle this).
+        let stmts = parse_ok("SELECT $tag$ a ; b $tag$; SELECT 2");
+        assert_eq!(stmts.len(), 2);
+        assert!(stmts[0].0.contains("$tag$"));
+    }
+
+    #[pg_test]
+    fn syntax_error_returns_pgwire_error_with_native_message() {
+        // `raw_parser` raises a PG ERROR for bad syntax; we catch it
+        // via PgTryBuilder and surface a PgWireError instead of
+        // longjmp'ing past the wire layer. We also get PG's native
+        // "syntax error at or near …" message for free.
+        let err = parse_and_classify("SELECTT 1").expect_err("should fail");
+        match err {
+            PgWireError::UserError(info) => {
+                assert!(
+                    info.message.contains("syntax error"),
+                    "expected PG-native syntax error, got: {info:?}"
+                );
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+}

@@ -10,9 +10,9 @@ set dotenv-load := true
 # Sub-files. `import` flat-merges into the same recipe namespace, so a
 # recipe `foo` in `just/x.just` is invoked as `just foo`.
 import 'just/doctor.just'
-import 'just/smoke.just'
 import 'just/bench.just'
 import 'just/pgbench.just'
+import 'just/e2e.just'
 
 # Pin every cargo-pgrx invocation to a user-global Postgres install at
 # `~/.pgrx` so multiple pgrx repos on the same machine share the same
@@ -148,10 +148,11 @@ fmt-check:
 lint:
     cargo clippy --workspace --all-targets -- -D warnings
 
-# CI gate: format check + lint + unit tests + pg18 + pg_regress.
+# CI gate: format check + lint + unit tests + pg18 + pg_regress + e2e.
 check: fmt-check lint unit
     just test pg18
     just regress pg18
+    just e2e pg18
 
 # ---------------------------------------------------------------------------
 # Packaging

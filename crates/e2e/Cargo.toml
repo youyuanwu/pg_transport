@@ -1,0 +1,36 @@
+[package]
+# Out-of-process end-to-end test harness. Spawns a real PG cluster
+# with `pg_transport` in `shared_preload_libraries`, then drives
+# scenarios through tokio-postgres against the pg_transport wire
+# listener. See `docs/design/testing.md` §3.3 for where this fits in
+# the test pyramid.
+name         = "e2e"
+description  = "End-to-end test harness — spawns a real PG with pg_transport loaded and runs scenarios through tokio-postgres."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+# Library, not a binary. The harness is consumed by integration tests
+# under `tests/` (one cluster shared across all `#[tokio::test]`
+# functions in the same `cargo test` invocation via a process-wide
+# `OnceCell`).
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Async runtime. `process` is unused — we shell out to initdb /
+# pg_ctl via std::process::Command (one-shot, synchronous; not worth
+# the tokio::process wrapper).
+tokio          = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+tokio-postgres = { workspace = true }
+anyhow         = { workspace = true }
+
+[dev-dependencies]
+# Integration tests under tests/ need the runtime macros + time
+# helpers; pulling tokio in again is a no-op (feature unification).
+tokio          = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tokio-postgres = { workspace = true }
+anyhow         = { workspace = true }
