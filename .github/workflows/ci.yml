@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# Cancel in-progress PR runs when a new commit lands on the same PR;
+# leave push runs alone so we never lose post-merge / branch-tip signal.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: just check (PG ${{ matrix.pg-major }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # v0 ships PG 18 only (see docs/design/roadmap.md §1).
+        # Additional majors land per-phase; add to the matrix when
+        # they're promoted to the supported list.
+        pg-major: ["18"]
+    env:
+      # Pin cargo-pgrx to the workspace's pgrx dependency version
+      # (workspace Cargo.toml uses `pgrx = "=0.18.0"`).
+      PGRX_VERSION: "0.18.0"
+      # Provision Postgres inside the workspace so the cache action
+      # below can capture it as a single directory.
+      PGRX_HOME: ${{ github.workspace }}/.pgrx
+      # Surface compiler diagnostics in the most useful form for CI.
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: short
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # Build deps for compiling Postgres from source under `cargo pgrx init`.
+      # Mirrors the apt list `just doctor` recommends.
+      - name: Install Postgres build dependencies (apt)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config bison flex perl \
+            libclang-dev clang \
+            libicu-dev libssl-dev zlib1g-dev libreadline-dev \
+            curl tar
+
+      - name: Install just
+        uses: extractions/setup-just@v4
+
+      # Single source of truth for the Rust version: rust-toolchain.toml.
+      # Parse the `channel = "X.Y.Z"` value so the dtolnay action below
+      # installs the matching toolchain.
+      - name: Read Rust channel from rust-toolchain.toml
+        id: rust-toolchain
+        run: |
+          channel=$(grep -oP 'channel\s*=\s*"\K[^"]+' rust-toolchain.toml)
+          if [ -z "$channel" ]; then
+            echo "::error::could not parse channel from rust-toolchain.toml"
+            exit 1
+          fi
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ steps.rust-toolchain.outputs.channel }}
+          components: rustfmt, clippy
+
+      # Cargo registry + git index + per-profile target dirs. Keyed
+      # on Cargo.lock so the cache invalidates when dependencies bump.
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          # Share the cache between PR runs and main; small chance of
+          # poisoning is acceptable for a CI cache.
+          shared-key: pg${{ matrix.pg-major }}
+
+      # cargo-pgrx is a one-off install. Cache the resulting binary so
+      # we don't recompile it on every run.
+      - name: Cache cargo-pgrx binary
+        id: pgrx-bin-cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/bin/cargo-pgrx
+          key: cargo-pgrx-${{ runner.os }}-${{ env.PGRX_VERSION }}
+
+      - name: Install cargo-pgrx (cache miss)
+        if: steps.pgrx-bin-cache.outputs.cache-hit != 'true'
+        run: cargo install --locked --version "=${PGRX_VERSION}" cargo-pgrx
+
+      # The big one: `cargo pgrx init --pgN download` fetches the PG
+      # tarball and builds it with `--enable-cassert` (5–10 min,
+      # ~1.5 GB). Cache it across runs keyed on (OS, pgrx version,
+      # PG major) — a bump in any of those triggers a rebuild.
+      - name: Cache provisioned Postgres ($PGRX_HOME)
+        id: pgrx-pg-cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.PGRX_HOME }}
+          key: pgrx-pg-${{ runner.os }}-${{ env.PGRX_VERSION }}-pg${{ matrix.pg-major }}
+
+      - name: Provision Postgres (cache miss)
+        if: steps.pgrx-pg-cache.outputs.cache-hit != 'true'
+        run: cargo pgrx init --pg${{ matrix.pg-major }} download
+
+      # `just check` = fmt-check + clippy (warnings → errors) + cargo
+      # test (workspace --lib --bins) + `cargo pgrx test pgN` (all
+      # `#[pg_test]`s) + `just regress pgN` (pg_regress golden-file
+      # end-to-end tests) + `just e2e pgN` (out-of-process tokio-
+      # postgres harness covering the wire layer + slot handoff).
+      # See Justfile.
+      - name: just check
+        run: just check
