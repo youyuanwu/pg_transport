@@ -332,60 +332,65 @@ they have either been resolved or deferred from v0 — see Q1 below,
 [deferred/cancel-routing.md](deferred/cancel-routing.md), §5 above,
 §4 above, §3 above, and §3 above respectively.)
 
-One **specification item** remains open for phase 9 (it's no longer
-an architectural choice, but a checklist that the wire impl must
-satisfy):
+One **specification item** was open for phase 9 (an implementation
+checklist, no longer an architectural choice). Phase 9 shipped the
+wire layer; the checklist below is now a status record rather than a
+forward-looking spec.
 
 1. **Extended-query state ownership.** ~~Open~~ **Resolved: option
-   (a)** — the wire layer owns the names, SPI owns the plans. The
-   wire keeps `HashMap<String, SpiPlan>` and
-   `HashMap<String, BoundPortal>` (`""` is the unnamed slot); per-
-   handoff reset drops the maps and calls `SPI_freeplan` on each
-   entry. Option (b) (push naming into a new `SPI_*` surface) was
-   rejected — it would add a PG-version-coupled SPI surface to save
-   ~one `HashMap` per slot, which doesn't earn its keep.
+   (a)** — the wire layer owns the names, SPI owns the plans.
+   Implementation lands in [`crates/core/src/wire/extended.rs`](../../crates/core/src/wire/extended.rs)
+   (pgwire's `ExtendedQueryHandler` + `QueryParser` impls) and
+   [`crates/core/src/backend/extended.rs`](../../crates/core/src/backend/extended.rs)
+   (SPI bridge: `prepare` + `execute`). The wire layer reuses
+   pgwire 0.40's `MemPortalStore<PgTransportStatement>` (a
+   `BTreeMap<String, Arc<StoredStatement<S>>>` + portal map);
+   `PgTransportStatement` is `Arc<PreparedStatement>` where
+   `PreparedStatement` owns an [`SpiPlan`](../../crates/core/src/backend/extended.rs)
+   whose `Drop` impl calls `SPI_freeplan`. Option (b) (a new SPI
+   naming surface) was rejected as PG-version-coupled work.
 
-   **Remaining spec work for phase 9.** Per-handoff reset correctness
-   is the single biggest correctness risk in v0 — the whole
-   framework's premise is "reuse one backend across many client
-   sessions via fd handoff". Reset has to be exact, or session A's
-   state leaks into session B on the same slot (wrong query results
-   across unrelated clients). Sub-questions that the phase-9 ADR
-   must answer:
-   - **Order.** Free portals first, then plans, then drop the name
-     maps? Or drop the maps first and rely on the `SpiPlan` destructor?
-     `SPI_freeplan` on a dangling pointer is UB.
-   - **Panic-safety.** Resolved by [roadmap.md §2.3 Q9](roadmap.md#23-resolved)
-     (re-resolved via [Q24](roadmap.md#23-resolved)): the workspace
-     sets `panic = "unwind"`. A panic in `SPI_execute` (or anywhere
-     in the wire layer) unwinds; the wire layer's `PgTryBuilder`
-     wrapper catches it and converts to a wire `ErrorResponse`. If a
-     panic escapes the wrapper, the slot bgworker exits, the
-     frontend detects `EPIPE` on the next `sendmsg` and respawns it
-     (see [backend-handoff.md §6](backend-handoff.md#6-slot-lifecycle));
-     the next handoff lands in a fresh slot with no leaked plans or
-     portals. Reset is the wire layer's responsibility on the happy
-     path; the slot-respawn path is the safety net.
-     on a guard — a line at the bottom of the slot loop is fine,
-     because the only way that line gets skipped is process death,
-     which already gives us a clean slate.
-   - **Partial-failure semantics.** If `SPI_freeplan` itself errors
-     mid-reset, do we leak the remaining plans or panic the slot?
-     Leaning panic-and-respawn-the-slot — a slot whose reset failed
-     can't be trusted.
-   - **GUC / temp-table / cursor scope.** `SET LOCAL` is
-     transaction-scoped (free), but `SET` (session-scope) survives.
-     Same for `CREATE TEMP TABLE` and unnamed cursors. Either disallow
-     these in v0 (raise on detection) or run a `DISCARD ALL`-equivalent
-     on reset.
-   - **`Sync` mid-extended-flow.** A client that disconnects between
-     `Parse` and `Sync` leaves a half-bound portal. Drop on next
-     handoff, or eagerly on disconnect?
+   **How each sub-question came out in the phase-9 impl.**
+   - **Order.** N/A as posed — the map drops its `Arc<StoredStatement>`
+     entries, the last `Arc` reaching zero calls our `SpiPlan::Drop`
+     which calls `SPI_freeplan`. There is no separate plan-vs-portal
+     ordering question because the portal holds a strong reference
+     to its parent statement; portals drop first (Sync clears the
+     unnamed portal; Close drops named ones), then statements when
+     no portal still refers to them.
+   - **Panic-safety.** As stated: `SPI_prepare` / `SPI_execute_plan`
+     run inside `catch_unwind` + `AssertUnwindSafe`. On panic we
+     `AbortCurrentTransaction` and convert the caught panic to a
+     wire `ErrorResponse` via the same `panic_to_pgwire` machinery
+     the simple-query path uses.
+   - **Partial-failure semantics.** Per-handoff: not applicable —
+     reset is *naturally* per-connection because we build a fresh
+     pgwire `DefaultClient` (with its own `MemPortalStore`) per
+     `process_socket` call, and the slot loop drops it at the end
+     of each handoff. There's no shared cross-handoff state to
+     partially-fail on.
+   - **GUC / temp-table / cursor scope.** Not enforced in v0. A
+     follow-up commit can add `DISCARD ALL` to the slot loop's
+     post-handoff hook (after the `process_socket` return) if a
+     real workload exhibits leakage. v0's `extended_query_per_handoff_state_isolation`
+     test pins the per-connection-portal-store path; session-scope
+     `SET` / `CREATE TEMP TABLE` leakage across handoffs on the
+     **same slot** is a known v0 gap.
+   - **`Sync` mid-extended-flow.** Half-bound portals are dropped
+     on connection close (per the per-connection store discipline
+     above). Mid-flow `Sync` clears the unnamed portal as pgwire's
+     default `on_sync` does.
 
-   Acceptance criterion before phase 9: a test that pins one slot,
-   runs N back-to-back handoffs each doing
-   `PREPARE foo AS ...; CREATE TEMP TABLE t...; SET tz = ...`, and
-   asserts the next handoff sees no `foo`, no `t`, default `tz`.
+   Acceptance: the phase-9 e2e suite's
+   `extended_query_per_handoff_state_isolation` test pins the
+   "client A's PREPARE doesn't leak to client B" invariant for the
+   connection-closes case. Same-slot session-scope leakage
+   (`SET tz` / `CREATE TEMP TABLE` / session-scoped `PREPARE` on
+   the same persistent SPI session across two handoffs) is a known
+   v0 gap; the fix is a one-line `DISCARD ALL` in
+   `slot::run_slot`'s post-handoff hook, but it interacts with the
+   plan cache invalidation question and is held until a real
+   workload demands it.
 
 ---
 

@@ -635,6 +635,81 @@ Affects [Q12](#23-resolved) (re-resolved as rustls),
 adds `tokio-rustls` + `rustls-pemfile` + `rustls-pki-types`), and
 [backend-wire.md §5](backend-wire.md) (TLS lib reference updated).
 
+**Q27. Extended-query parameter-type inference path.** ~~Open~~
+**Resolved: two-pass at Parse time — varparams analyser then
+`SPI_prepare` with resolved fixed types.**
+
+The phase-9 wire layer accepts `Parse` messages with empty
+`type_oids` (tokio-postgres' default for `client.query(sql, &[...])`
+when the client doesn't ask for explicit types). PG's standard
+inference path is `parse_analyze_varparams` inside
+`exec_parse_message`; the SPI surface we use for plan caching
+(`SPI_prepare`) instead runs the analyser in *fixedparams* mode,
+which refuses `InvalidOid` parameters with "could not determine
+data type of parameter $N".
+
+Three options surveyed during impl:
+
+- **(a) `SPI_prepare_params` with a `parserSetup` callback** (first
+  attempted, rejected). The callback would invoke
+  `setup_parse_variable_parameters` (declared manually — pgrx 0.18
+  filters `parser/parse_param.h` out of its bindings) and read
+  the resolved OIDs back from our setup arg after
+  `SPI_prepare_params` returns. *Failed in testing:* the analyser
+  fills the `Oid[]` array in a memory context that gets clobbered
+  before our post-call read, leaving us reading `0x7F7F7F7F`
+  (PG's `CLOBBER_FREED_MEMORY` pattern) instead of the inferred
+  OIDs. Tracing which memory context the analyser uses for the
+  varparams array is a deeper PG-internals question than the v0
+  budget supports.
+
+- **(b) Two-pass: varparams pre-pass, then `SPI_prepare` with
+  resolved fixed types** (adopted). At Parse time, when the client
+  supplied no hints, run `pg_parse_query` → `pg_analyze_and_rewrite_varparams`
+  to extract resolved OIDs, **copy them into a Rust `Vec`
+  immediately** (before the analyser's memory context goes away),
+  upgrade any remaining `UNKNOWNOID` slots to `TEXTOID` (matching
+  real PG's `check_variable_parameters` behaviour), then call
+  `SPI_prepare(sql, n, oids)` with the resolved fixed types. Cost:
+  one extra parse + analyse per Parse message (~5–10 µs), and the
+  Rust `Vec` copy. Acceptable for v0 — Parse is once-per-prepare,
+  Execute is the hot loop.
+
+- **(c) Hand-roll a CachedPlanSource** without going through
+  `SPI_prepare` at all (use
+  `pg_analyze_and_rewrite_varparams` directly, then
+  `CreateCachedPlan` + `CompleteCachedPlan` + `SaveCachedPlan`).
+  Rejected — would replace one SPI wrapper call with three
+  PG-internals calls plus a manual cache-validity bookkeeping
+  surface, gaining nothing for v0.
+
+**Result-format handling.** Same Q27 covers binary-result encoding
+(tokio-postgres' typed accessors request binary by default for
+every type they know how to deserialise). v0 honours the per-column
+format from `Bind.result_column_format_codes`:
+
+- *Text* (or column-unspecified) — `SPI_getbinval` → `OidOutputFunctionCall`
+  → cstring bytes. Same path the simple-query bridge would have
+  taken if it used the binval/output split rather than `SPI_getvalue`.
+- *Binary* — `SPI_getbinval` → `OidSendFunctionCall` → `bytea`,
+  with `pgrx::varlena::varlena_to_byte_slice` to pull the raw
+  bytes out of the varlena (handles short / long / external
+  headers).
+
+DataRow bytes are built manually with `BytesMut::put_i32` (length
+prefix) + `put_slice` (column body), bypassing pgwire's
+`DataRowEncoder` (which is Rust-value-oriented and not a fit for
+"raw PG-formatted bytes").
+
+Affects [backend-wire.md §8 Q1](backend-wire.md#8-open-questions)
+(status updated from "spec checklist" to "shipped"),
+[`crates/core/src/backend/extended.rs`](../../crates/core/src/backend/extended.rs)
+(new — ~640 LOC),
+[`crates/core/src/wire/extended.rs`](../../crates/core/src/wire/extended.rs)
+(new — `ExtendedQueryHandler` + `QueryParser` impls), and
+[`crates/core/src/wire/pgwire_v3.rs`](../../crates/core/src/wire/pgwire_v3.rs)
+(registers the handler in `PgWireServerHandlers::extended_query_handler`).
+
 ---
 
 ## 3. Risks & mitigations

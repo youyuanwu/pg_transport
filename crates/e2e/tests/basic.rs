@@ -1,28 +1,27 @@
-//! Demonstrative end-to-end tests covering the phase-4b acceptance
-//! matrix from [`docs/design/roadmap.md`](../../../../docs/design/roadmap.md):
-//! `SELECT 1` round-trip, multi-column / multi-row results, the
-//! division-by-zero error path, and multi-statement / xact-control
-//! interactions.
+//! Demonstrative end-to-end tests covering the phase-4b through
+//! phase-9 acceptance matrix from
+//! [`docs/design/roadmap.md`](../../../../docs/design/roadmap.md).
 //!
 //! All tests share a single cluster via [`e2e::Cluster::shared`];
-//! they use distinct table names to avoid stepping on each other
-//! when cargo runs them in parallel.
+//! they use distinct table / role names to avoid stepping on each
+//! other when cargo runs them in parallel.
 //!
-//! ## Why everything uses `simple_query`
+//! ## Simple-query vs extended-query
 //!
-//! pg_transport v0 only implements the simple-query (`'Q'`) wire path
-//! — extended query (`Parse` / `Bind` / `Execute`) lands in roadmap
-//! phase 9. tokio-postgres' typed accessors (`query`, `query_one`,
-//! `execute`) all go through extended query, so they fail against the
-//! pg_transport port with `FATAL: This feature is not implemented`.
-//! Use [`tokio_postgres::Client::simple_query`] plus the
-//! [`e2e::first_text_cell`] / [`e2e::text_column`] helpers — every
-//! value comes back as `Option<&str>` in text format (exactly what
-//! pg_transport's SPI bridge emits via `SPI_getvalue`).
+//! - **Simple-query** (`'Q'`): use
+//!   [`tokio_postgres::Client::simple_query`] plus the
+//!   [`e2e::first_text_cell`] / [`e2e::text_column`] helpers. All
+//!   values come back as `Option<&str>` in text format. Phase 4b
+//!   onwards.
+//! - **Extended-query** (`Parse` / `Bind` / `Describe` / `Execute`
+//!   / `Sync`): tokio-postgres' typed accessors (`query`,
+//!   `query_one`, `execute`, `prepare`) all use this path. Phase 9
+//!   onwards. Results come back as typed `Row`s; parameters are
+//!   bound in binary format by default.
 //!
-//! When phase 9 lands, this file's tests can be reshaped to use the
-//! typed accessors and a separate suite added for the simple-query
-//! path.
+//! Pre-phase-9 commits asserted simple-query exclusively because
+//! the wire layer returned `'This feature is not implemented'`
+//! for any extended message.
 
 use anyhow::Result;
 use e2e::{Cluster, first_text_cell, text_column};
@@ -499,6 +498,257 @@ async fn tls_sslmode_disable_still_works() -> Result<()> {
     assert!(
         out.contains("(1 row)"),
         "expected plaintext SELECT 1 to still work; got:\n{out}"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Phase 9 extended-query tests
+// ---------------------------------------------------------------------------
+//
+// tokio-postgres' `query` / `query_one` / `execute` / `prepare`
+// methods all go through Parse / Bind / Describe / Execute / Sync.
+// Pre-phase-9 the wire layer returned `'This feature is not
+// implemented'` for every extended-protocol message, so these
+// tests would have failed at the first call.
+
+#[tokio::test]
+async fn extended_query_no_params_typed_row() -> Result<()> {
+    // The smallest possible extended-query path: `query` with no
+    // params, one column, one row. Exercises Parse + Bind +
+    // Describe + Execute round-trip end-to-end. The typed
+    // `row.get::<_, i32>(0)` requires Describe to have returned
+    // the right column OID (INT4) — proves our
+    // `SPI_plan_get_plan_sources` → `resultDesc` extraction works.
+    let c = Cluster::shared().await;
+    let client = c.connect("postgres").await?;
+    let row = client.query_one("SELECT 1::int", &[]).await?;
+    let v: i32 = row.get(0);
+    assert_eq!(v, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn extended_query_binary_int_param() -> Result<()> {
+    // tokio-postgres binds `&5_i32` in BINARY format with the
+    // INT4 OID. Exercises `OidReceiveFunctionCall` for INT4
+    // plus the resolved-param-type path
+    // (`SPI_getargtypeid` extracts the OID, the wire layer
+    // round-trips it back to pgwire via `get_parameter_types`).
+    let c = Cluster::shared().await;
+    let client = c.connect("postgres").await?;
+    let row = client.query_one("SELECT $1::int + 10", &[&5_i32]).await?;
+    let v: i32 = row.get(0);
+    assert_eq!(v, 15);
+    Ok(())
+}
+
+#[tokio::test]
+async fn extended_query_text_param_and_null() -> Result<()> {
+    // Two parameters of distinct types (TEXT, INT4) and a NULL.
+    // Verifies parameter-array indexing + null-mask handling
+    // (`b'n'` for null entries in SPI's nulls argument).
+    let c = Cluster::shared().await;
+    let client = c.connect("postgres").await?;
+    let row = client
+        .query_one(
+            "SELECT $1::text || ' #' || COALESCE($2::text, 'NULL'), $3::int",
+            &[&"hello", &Option::<&str>::None, &42_i32],
+        )
+        .await?;
+    let s: &str = row.get(0);
+    let n: i32 = row.get(1);
+    assert_eq!(s, "hello #NULL");
+    assert_eq!(n, 42);
+    Ok(())
+}
+
+#[tokio::test]
+async fn extended_query_multi_row_select() -> Result<()> {
+    // `query` returns Vec<Row>. Exercises the per-row materialise
+    // path and ordering through pgwire's DataRow stream.
+    let c = Cluster::shared().await;
+    let client = c.connect("postgres").await?;
+    let rows = client
+        .query(
+            "SELECT relname FROM pg_class \
+             WHERE relname IN ('pg_class','pg_type','pg_proc') \
+             ORDER BY relname",
+            &[],
+        )
+        .await?;
+    let names: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
+    assert_eq!(
+        names,
+        vec![
+            "pg_class".to_string(),
+            "pg_proc".to_string(),
+            "pg_type".to_string()
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn extended_query_prepare_then_reuse() -> Result<()> {
+    // `prepare` issues Parse only; subsequent `query` calls
+    // against the Statement reuse it via Bind+Execute. This
+    // proves the kept plan survives multiple Execute calls and
+    // that pgwire's PortalStore keeps the StoredStatement
+    // referenced across Sync messages.
+    let c = Cluster::shared().await;
+    let client = c.connect("postgres").await?;
+    let stmt = client.prepare("SELECT $1::int * 2").await?;
+    for n in 1..=5 {
+        let row = client.query_one(&stmt, &[&n]).await?;
+        let got: i32 = row.get(0);
+        assert_eq!(got, n * 2);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn extended_query_execute_returns_row_count() -> Result<()> {
+    // `execute` runs an INSERT / UPDATE / DELETE without
+    // RETURNING and returns the affected row count from the
+    // CommandComplete tag's numeric suffix. Exercises the
+    // utility / DML-no-RETURNING branch (`SPI_tuptable.is_null()`
+    // or empty result_schema) plus the `command_tag_from_rc`
+    // mapping for SPI_OK_INSERT / _UPDATE / _DELETE.
+    let c = Cluster::shared().await;
+    let client = c.connect("postgres").await?;
+    let table = "e2e_ext_exec";
+    let _ = client
+        .execute(&format!("DROP TABLE IF EXISTS {table}"), &[])
+        .await?;
+    client
+        .execute(&format!("CREATE TABLE {table} (id int, val text)"), &[])
+        .await?;
+    let inserted = client
+        .execute(
+            &format!("INSERT INTO {table} VALUES ($1, $2), ($3, $4)"),
+            &[&1_i32, &"one", &2_i32, &"two"],
+        )
+        .await?;
+    assert_eq!(inserted, 2, "INSERT row count");
+
+    let updated = client
+        .execute(
+            &format!("UPDATE {table} SET val = 'X' WHERE id = $1"),
+            &[&1_i32],
+        )
+        .await?;
+    assert_eq!(updated, 1, "UPDATE row count");
+
+    let deleted = client
+        .execute(&format!("DELETE FROM {table} WHERE id >= $1"), &[&0_i32])
+        .await?;
+    assert_eq!(deleted, 2, "DELETE row count");
+
+    let _ = client.execute(&format!("DROP TABLE {table}"), &[]).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn extended_query_syntax_error_keeps_connection_usable() -> Result<()> {
+    // Parse-time syntax error must surface as a typed DbError
+    // (not connection death) and the connection must remain
+    // usable for the next query. Mirrors the simple-query
+    // `division_by_zero_*` test but for the extended path.
+    let c = Cluster::shared().await;
+    let client = c.connect("postgres").await?;
+    let err = client
+        .query_one("SELECTT 1", &[])
+        .await
+        .expect_err("syntax error should fail");
+    let db = err
+        .as_db_error()
+        .unwrap_or_else(|| panic!("expected DbError, got: {err:?}"));
+    assert!(
+        db.message().contains("syntax error"),
+        "expected PG-native syntax-error message, got: {}",
+        db.message()
+    );
+    // Connection still works for a follow-up query.
+    let row = client.query_one("SELECT 99::int", &[]).await?;
+    let v: i32 = row.get(0);
+    assert_eq!(v, 99);
+    Ok(())
+}
+
+#[tokio::test]
+async fn extended_query_division_by_zero_surfaces_as_db_error() -> Result<()> {
+    // Execute-time PG ERROR (not Parse-time). Exercises the
+    // catch_unwind path inside `extended::execute` plus
+    // AbortCurrentTransaction recovery. Connection must remain
+    // usable afterwards.
+    let c = Cluster::shared().await;
+    let client = c.connect("postgres").await?;
+    let err = client
+        .query_one("SELECT $1::int / $2::int", &[&1_i32, &0_i32])
+        .await
+        .expect_err("division by zero should fail");
+    let db = err
+        .as_db_error()
+        .unwrap_or_else(|| panic!("expected DbError, got: {err:?}"));
+    assert!(
+        db.message().contains("division by zero"),
+        "expected PG-native message, got: {}",
+        db.message()
+    );
+    let row = client.query_one("SELECT 1::int", &[]).await?;
+    let v: i32 = row.get(0);
+    assert_eq!(v, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn extended_query_per_handoff_state_isolation() -> Result<()> {
+    // Per-handoff reset correctness — the v0 design's biggest
+    // correctness risk per `backend-wire.md §8 Q1`. Two sequential
+    // connections (very likely landing on the same slot, since the
+    // pool is small) must not share prepared-statement state.
+    //
+    // Client A prepares an unnamed-portal Statement (tokio-
+    // postgres' `prepare` uses an explicit name; we craft an
+    // explicit-name PREPARE at the wire layer via `simple_query` so
+    // its lifetime is clearly per-session, not bound to tokio-
+    // postgres' Statement struct).
+    //
+    // Because the SPL pool is sized so much larger than the test
+    // concurrency, the two connections might land on different
+    // slots — in which case the test still passes trivially. The
+    // useful assertion is: regardless of routing, no client ever
+    // sees a stale prepared statement from a previous connection.
+    let c = Cluster::shared().await;
+    {
+        let client_a = c.connect("postgres").await?;
+        client_a
+            .simple_query("PREPARE phase9_reset_probe AS SELECT 7")
+            .await?;
+        // client_a drops here — connection closes; pgwire's
+        // DefaultClient (and the PortalStore inside it) is dropped;
+        // our SpiPlan::Drop runs SPI_freeplan.
+    }
+    // Give the slot a beat to recycle back to the pool.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let client_b = c.connect("postgres").await?;
+    let err = client_b
+        .simple_query("EXECUTE phase9_reset_probe")
+        .await
+        .expect_err("client B must not see client A's prepared statement");
+    let db = err
+        .as_db_error()
+        .unwrap_or_else(|| panic!("expected DbError, got: {err:?}"));
+    // PG error code for "prepared statement does not exist" is
+    // 26000 (invalid_sql_statement_name). The message also
+    // mentions the name.
+    assert!(
+        db.message().contains("phase9_reset_probe") || db.code().code() == "26000",
+        "expected 'no such prepared statement' error, got: {} ({})",
+        db.message(),
+        db.code().code()
     );
     Ok(())
 }

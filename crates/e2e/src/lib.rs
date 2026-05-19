@@ -11,7 +11,7 @@
 //! # async fn run() -> anyhow::Result<()> {
 //! let cluster = e2e::Cluster::shared().await;
 //! let client = cluster.connect("postgres").await?;
-//! // Phase-4b: SIMPLE query only — see "Wire protocol scope" below.
+//! // Both simple and extended paths work as of phase 9.
 //! let v = e2e::first_text_cell(&client.simple_query("SELECT 1").await?);
 //! assert_eq!(v.as_deref(), Some("1"));
 //! # Ok(()) }
@@ -23,22 +23,22 @@
 //! pay the boot cost N times; keep e2e tests consolidated in one
 //! `tests/` file when feasible.
 //!
-//! ## Wire protocol scope (v0 / phase 4b)
+//! ## Wire protocol scope (v0 / phase 9)
 //!
-//! pg_transport currently implements **only the simple-query path**
-//! (`'Q'` message). Extended query (`Parse` / `Bind` / `Describe` /
-//! `Execute`) lands in roadmap phase 9. That means tokio-postgres'
-//! `query` / `query_one` / `execute` methods will all fail against the
-//! pg_transport port with `FATAL: This feature is not implemented` —
-//! they go through the extended-query path even for parameter-less
-//! statements.
+//! As of phase 9 pg_transport implements **both** the simple-query
+//! (`'Q'`) and the extended-query (`Parse` / `Bind` / `Describe` /
+//! `Execute` / `Sync` / `Close` / `Flush`) wire paths. tokio-postgres'
+//! typed accessors (`query`, `query_one`, `execute`, `prepare`) all
+//! work end-to-end through [`Cluster::connect`].
 //!
-//! **Use [`tokio_postgres::Client::simple_query`]** for any SQL you
-//! send through [`Cluster::connect`]. Use [`first_text_cell`] /
-//! [`text_column`] to pull values out of the resulting
-//! `Vec<SimpleQueryMessage>`. [`Cluster::admin_connect`] talks to
-//! vanilla PG and supports the full protocol — use it for setup
-//! shaped queries that need parameter binding.
+//! Use [`tokio_postgres::Client::simple_query`] for text-format
+//! results across the simple path, plus [`first_text_cell`] /
+//! [`text_column`] to extract them. Use `query` / `execute` /
+//! `prepare` for typed parameter binding and binary-format
+//! results. [`Cluster::admin_connect`] still goes to vanilla PG
+//! (port [`PG_PORT`]) for setup queries that need to bypass
+//! pg_transport entirely (e.g. `CREATE ROLE`, `pg_authid`
+//! inspection).
 //!
 //! ## Assumptions
 //!

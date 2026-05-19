@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{Sink, SinkExt};
 use pgwire::api::auth::{DefaultServerParameterProvider, StartupHandler, finish_authentication};
-use pgwire::api::query::SimpleQueryHandler;
+use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::Response;
 use pgwire::api::store::PortalStore;
 use pgwire::api::{
@@ -41,6 +41,7 @@ use pgwire::tokio::process_socket;
 use super::auth::scram::{SCRAM_SHA_256, ScramError, ScramServer};
 use super::auth::verifier::RolPassword;
 use super::auth::{AuthMethod, AuthOutcome, hba};
+use super::extended::PgTransportExtendedQuery;
 use super::{Wire, WireCtx};
 
 /// The v0 wire implementation. Stateless marker — per-connection
@@ -91,6 +92,7 @@ impl Wire for PgwireV3 {
 struct PgTransportHandlers {
     startup: Arc<PgTransportStartup>,
     simple_query: Arc<SimpleQuery>,
+    extended_query: Arc<PgTransportExtendedQuery>,
 }
 
 impl PgWireServerHandlers for PgTransportHandlers {
@@ -100,6 +102,15 @@ impl PgWireServerHandlers for PgTransportHandlers {
 
     fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> {
         self.simple_query.clone()
+    }
+
+    // Phase 9: real ExtendedQueryHandler. Replaces the default
+    // `NoopHandler` that returned `'This feature is not
+    // implemented'` for every Parse/Bind/Execute, which is what
+    // forced the e2e harness to use `simple_query` exclusively
+    // through phases 4 – 8.
+    fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
+        self.extended_query.clone()
     }
 }
 

@@ -10,6 +10,7 @@
 //! [`pgwire`](https://crates.io/crates/pgwire) crate).
 
 pub mod auth;
+pub mod extended;
 pub mod pgwire_v3;
 pub mod tls;
 
