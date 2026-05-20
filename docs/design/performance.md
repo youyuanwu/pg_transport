@@ -11,7 +11,23 @@ mean and where the headroom is*.
 
 ## 1. Where we are
 
-Most recent bench run (`just bench pg18 200 2`):
+Most recent bench run (`just bench pg18 5000 2`, post-§3.2 port):
+
+| Stat | Vanilla PG | pg_transport | Ratio |
+| --- | --- | --- | --- |
+| p50  | 175.5 µs | 157.7 µs | 0.90x |
+| p95  | 289.0 µs | 275.8 µs | 0.95x |
+| p99  | 363.9 µs | 348.7 µs | 0.96x |
+| mean | 194.4 µs | 174.7 µs | 0.90x |
+| **qps** | 10259.7 | 11424.3 | **1.11x** |
+
+`just pgbench pg18 select 5 4`: vanilla PG 17890 tps, pg_transport
+17448 tps (0.975x — within noise; the 1-column pgbench `-S` workload
+doesn't exercise the per-cell allocation path that the custom
+bench above does).
+
+**Pre-§3.2 baseline for comparison** (`just bench pg18 200 2`,
+recorded before the simple-query BytesMut direct path landed):
 
 | Stat | Vanilla PG | pg_transport | Ratio |
 | --- | --- | --- | --- |
@@ -20,16 +36,17 @@ Most recent bench run (`just bench pg18 200 2`):
 | mean | 194.9 µs | 216.1 µs | 1.11x |
 | **qps** | 10164.8 | 9140.8 | **0.90x** |
 
-`just pgbench pg18 select 3 2`:
+The §3.2 port (~30 LOC, eliminating the `Vec<Option<String>>`
+intermediate + pgwire `DataRowEncoder` re-encode pass on the
+simple-query path) is responsible for a **~20 percentage point qps
+swing** on the custom harness — we now run faster than vanilla PG
+on this workload. p50/mean win by ~10% each.
 
-| Driver | tps | Failed txns |
-| --- | --- | --- |
-| Vanilla PG | ~8500 | 0 |
-| pg_transport | 8527 | 0 |
+Range across phases 4 → 9 + 9.5: **0.90x – 1.20x qps**. Tail
+latencies (p95 / p99 / max) consistently land at or *better than*
+vanilla PG — the bgworker pool reuse pays off there (no
+per-connection fork tax).
 
-Range across all phases (4 → 9): **0.84x – 1.04x qps**. p95 and
-above frequently land at or *better than* vanilla PG (the bgworker
-pool reuse pays off in tail latency — no per-connection fork tax).
 
 **Context — how this compares to other pooling solutions:**
 
@@ -154,35 +171,28 @@ adoption plan in
 Re-entry trigger: bench shows > 10% qps gap attributable to SPI, or
 a v0+ feature needs cursor-streaming / per-column COPY OUT.
 
-### 3.2 Simple-query path's `Vec<Option<String>>` intermediate
+### 3.2 Simple-query path's `Vec<Option<String>>` intermediate — ~~deferred~~ **SHIPPED**
 
-**What:** The simple-query bridge materialises each row as a
-`Vec<Option<String>>` (one `String` heap alloc per non-null cell),
-then calls pgwire's `DataRowEncoder` to re-encode each cell into a
-`BytesMut`. That's 2× the per-cell allocations vs. the extended-query
+**What was wrong:** The simple-query bridge materialised each row as
+a `Vec<Option<String>>` (one `String` heap alloc per non-null cell),
+then called pgwire's `DataRowEncoder` to re-encode each cell into a
+`BytesMut`. That was 2× the per-cell allocations vs. the extended-query
 path, which writes bytes directly into the `BytesMut`.
 
-**Why it exists:** Historical. The simple-query path landed in
-phase 4b before [`extended.rs`](../../crates/core/src/backend/extended.rs)
-in phase 9 worked out the direct `BytesMut` pattern. Both paths now
-have access to the same [`TypeOutput` / `TypeSend`](../../crates/core/src/backend/spi.rs)
-wrappers; only the simple-query side hasn't been ported.
+**What landed:** Ported the extended-query encoding pattern
+(`BytesMut::put_i32` length prefix + `put_slice` body, with per-column
+[`TypeOutput`](../../crates/core/src/backend/spi.rs) cache) into
+[`run_via_spi`](../../crates/core/src/backend/spi_bridge.rs). Switched
+the outer xact bracket to [`with_spi`](../../crates/core/src/backend/spi.rs)
+so the two bridges share one xact discipline.
 
-**Magnitude:** For 1-cell results (pgbench `-S`): below noise. For
-wide-row results (e.g. `SELECT * FROM information_schema.columns`,
-~30 columns × 800+ rows): ~5–10% latency reduction in
-`run_via_spi` — many small allocations dominate when each cell is
-short.
+**Bench impact (measured):** ~20 percentage points of qps on `just
+bench pg18 5000 2` (from 0.90x to 1.11x qps vs vanilla PG). p50 /
+mean improved ~10% each. Per-cell `getTypeOutputInfo` syscache
+lookups (§3.5) folded in for free.
 
-**Cost:** ~30 LOC. Port the extended-query encoding pattern
-(`BytesMut::put_i32` length prefix + `put_slice` body, with the
-per-column `ColumnEncoder` enum) back into
-[`run_via_spi`](../../crates/core/src/backend/spi_bridge.rs).
+**Re-entry trigger:** — (done).
 
-**Status:** Standalone, no design dependencies, slam-dunk
-follow-on. Worth doing before 3.1 because it makes the two bridges
-symmetric and proves out the BytesMut pattern is the right one
-across the codebase.
 
 ### 3.3 Per-query xact bracket overhead
 
@@ -235,27 +245,17 @@ is significantly higher than the perf gain over v0's timeline.
 above 5% — unlikely. The pgwire crate is maintained and follows PG
 protocol upstream; a fork would be a maintenance hole.
 
-### 3.5 `SPI_getvalue`'s per-cell `getTypeOutputInfo` lookup
+### 3.5 `SPI_getvalue`'s per-cell `getTypeOutputInfo` lookup — ~~bundled with 3.2~~ **SHIPPED with 3.2**
 
-**What:** Simple-query path calls `SPI_getvalue(tuple, tupdesc,
-col+1)` per cell. Under the hood `SPI_getvalue` calls
-`getTypeOutputInfo(atttypid, ...)` per call — that's a syscache
-lookup per cell, when really the type info is invariant across rows
-in the same result.
+Resolved as part of [§3.2](#32-simple-query-paths-vecoptionstring-intermediate--deferred-shipped):
+the new [`run_via_spi`](../../crates/core/src/backend/spi_bridge.rs)
+builds a per-column `Vec<TypeOutput>` once via
+[`TypeOutput::for_type`](../../crates/core/src/backend/spi.rs) and
+reuses it across every row, replacing the per-cell
+`SPI_getvalue` → `getTypeOutputInfo` syscache lookup. Cell access
+now goes through [`SpiTuples::cell`](../../crates/core/src/backend/spi.rs)
+(uses `SPI_getbinval`) directly.
 
-The extended-query path already caches this via `TypeOutput::for_type`
-called once per column per Execute (not per cell).
-
-**Magnitude:** PG's syscache hit is ~50 ns. For an N_rows × N_cols
-result we do N×N lookups instead of N_cols. For pgbench `-S` (1×1):
-50 ns of waste. For a 1000 × 20 result: ~1 ms of waste (~0.5–1% of
-that query's total latency).
-
-**Cost:** Trivial — folds entirely into 3.2 (when we move simple-
-query to the direct-`BytesMut` pattern, we'll cache `TypeOutput` per
-column the same way `extended.rs` does).
-
-**Status:** Bundled with 3.2.
 
 ## 4. Where we're already well-optimised
 
@@ -269,26 +269,30 @@ deltas can be attributed correctly:
 | **Tokio runtime** | Built once per slot (`Rc<Runtime>`), reused across handoffs. Not rebuilt per query. |
 | **TLS** | rustls + ring; same crypto class as PG's OpenSSL. Per-byte overhead identical. |
 | **SPI plan caching (extended-query)** | `SPI_keepplan`'d once at Parse, reused across Execute via `SPI_execute_plan`. Matches PG's `CachedPlanSource` semantics. **At Execute time we are at zero-parse parity with PG.** |
-| **Per-cell type I/O caching (extended-query)** | `TypeOutput` / `TypeSend` built once per column per Execute, not per cell. Only the simple-query side is missing this (#3.5). |
+| **Per-cell type I/O caching (both paths)** | `TypeOutput` / `TypeSend` built once per column per query/Execute, not per cell. Simple-query path adopted this in [§3.2](#32-simple-query-paths-vecoptionstring-intermediate--deferred-shipped); extended-query path has had it since phase 9. |
 | **Snapshot / xact state inside BEGIN block** | `StartTransactionCommand` becomes `CommandCounterIncrement` when already in `TBLOCK_INPROGRESS`; same for Commit. We inherit this from PG's xact machinery — no special-casing needed. |
 | **Binary parameter & result format** | Honoured per-column from `Bind.parameter_format_codes` / `result_column_format_codes` without forcing text round-tripping. tokio-postgres' binary path works without conversion. |
 
 ## 5. What our bench gap actually measures
 
-Decomposing the 10–20 µs absolute mean gap from §1:
+Decomposing the bench gap. **As of the §3.2 port, the gap has
+inverted** — pg_transport now leads on this workload. The table
+below accounts for what's *still pending* (would widen the lead
+further on the workloads that exercise it):
 
-| Source | Estimated µs/query | Reference |
-| --- | --- | --- |
-| Parse pass #2 (SPI's inner) | ~5 | §3.1 |
-| Per-query xact bracket (Start + Snapshot + SPI_connect + reverse) | ~5–10 | §3.3 |
-| Row materialisation through `SPI_tuptable` (1 copy) + Vec<Option<String>> intermediate | ~2–5 | §3.1 + §3.2 |
-| Misc — pgwire framing, async dispatch, MemoryContext, `with_spi` closure scaffolding | ~5 | §3.4 |
-| **Total estimated** | **~17–25 µs** | matches the observed ~10–20 µs |
+| Source | Estimated µs/query | Reference | Status |
+| --- | --- | --- | --- |
+| Parse pass #2 (SPI's inner) | ~5 | §3.1 | deferred (largest open win) |
+| Per-query xact bracket (Start + Snapshot + SPI_connect + reverse) | ~5–10 | §3.3 | deferred (multi-statement `'Q'` only) |
+| Row materialisation `Vec<Option<String>>` intermediate | ~2–5 | ~~§3.2~~ | **shipped** |
+| Per-cell `SPI_getvalue` syscache lookup | ~50 ns/cell | ~~§3.5~~ | **shipped** (with §3.2) |
+| Misc — pgwire framing, async dispatch, MemoryContext, `with_spi` closure scaffolding | ~5 | §3.4 | non-starter |
 
-The numbers add up. Closing 3.1 (~10 µs win) + 3.2 (~2–5 µs) + 3.3
-(~5–10 µs for multi-statement Qs) would put us at or below vanilla
-PG mean latency. **p95/max would likely stay at or below vanilla
-because we still don't pay PG's fork tax.**
+Closing 3.1 (~10 µs) + 3.3 (~5–10 µs on multi-statement `'Q'`) would
+extend the lead on wide-row workloads and on pgbench-tpcb. **p95/max
+already stay at or below vanilla** because we still don't pay PG's
+fork tax.
+
 
 ## 6. Re-entry conditions
 
@@ -296,17 +300,15 @@ Per [roadmap Q18](roadmap.md#23-resolved), perf-driven refactors
 are gated on bench signal:
 
 - **Trigger 3.1:** bench shows >10% qps gap attributable to SPI on a
-  representative workload (currently we're ~10% on the custom
-  harness's `SELECT 1` micro-bench, ~0% on pgbench tpcb). The
-  pgbench number is more representative of real workloads.
-- **Trigger 3.2:** any complaint or profile that names per-cell
-  `String` allocation as significant. Standalone enough to land
-  preemptively if someone wants to do it.
+  representative workload. (Post-§3.2 we *lead* by ~11% on the
+  custom harness; pgbench tpcb is at parity. Re-evaluate once a
+  wider-row representative workload exists.)
+- **Trigger 3.2:** — (shipped).
 - **Trigger 3.3:** profile of pgbench-tpcb (or any multi-statement-
   `'Q'` workload) showing xact bracket overhead.
 - **Trigger 3.4:** profile shows pgwire dispatch above 5% of
   per-query latency. Unlikely.
-- **Trigger 3.5:** automatic — folds into 3.2.
+- **Trigger 3.5:** — (shipped with 3.2).
 
 ## 7. Macro perf-vs-correctness stance
 

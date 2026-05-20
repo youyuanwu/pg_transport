@@ -20,20 +20,24 @@
 //! through PG's xact-block API. Resolves Q25 in
 //! [roadmap.md](../../../../docs/design/roadmap.md).
 
-use std::any::Any;
 use std::ffi::{CStr, CString};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
+use bytes::{BufMut, BytesMut};
 use futures::StreamExt;
 use futures::stream;
 use pgrx::pg_sys::panic::CaughtError;
 use pgrx::pg_sys::{self};
 use pgwire::api::Type;
-use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
-use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use pgwire::api::results::{FieldFormat, FieldInfo, QueryResponse, Response, Tag};
+use pgwire::error::PgWireResult;
+use pgwire::messages::data::DataRow;
 
-use super::spi::{caught_error_to_pgwire, generic_error, panic_to_pgwire};
+use super::spi::{
+    SpiCtx, SpiTuples, TypeOutput, caught_error_to_pgwire, generic_error, panic_to_pgwire,
+    spi_rc_error, with_spi,
+};
 
 /// Run a simple-query string through SPI and shape the result into
 /// pgwire `Response`s.
@@ -83,88 +87,29 @@ fn execute_one_statement(
     run_spi_statement(query)
 }
 
-/// Execute one non-xact-control statement via SPI under our own
-/// transaction wrapper.
+/// Execute one non-xact-control statement via SPI under the shared
+/// [`with_spi`] xact wrapper. The wrapper encodes the same
+/// Start/Push/SPI_connect/SPI_finish/Pop/Commit discipline that this
+/// function previously rolled by hand, with `catch_unwind` + abort
+/// cleanup on PG ERROR — see
+/// [crates/core/src/backend/spi.rs](spi.rs) for the rationale on why
+/// we don't use `pgrx::BackgroundWorker::transaction` here.
+///
+/// Both implicit (auto-commit between queries) and explicit (inside
+/// an open `BEGIN` block) entry states work: `StartTransactionCommand`
+/// is a no-op from `TBLOCK_INPROGRESS`, and `CommitTransactionCommand`
+/// from `TBLOCK_INPROGRESS` does `CommandCounterIncrement` rather
+/// than an actual commit (PG `src/backend/access/transam/xact.c`).
+///
+/// Deviation from real PG on the panic path: PG would move the xact
+/// state to `TBLOCK_ABORT` (forcing the client to issue `ROLLBACK`
+/// to clean up). `with_spi`'s `AbortCurrentTransaction` collapses
+/// state to `DEFAULT`, so subsequent statements run as if in a fresh
+/// auto-commit context — incorrect in spec terms but harmless for
+/// the pgbench workloads we target.
 fn run_spi_statement(query: &str) -> PgWireResult<Vec<Response>> {
-    // We can't use pgrx's `BackgroundWorker::transaction` directly:
-    // in pgrx 0.18 its `PopActiveSnapshot` + `CommitTransactionCommand`
-    // calls are OUTSIDE the `PgTryBuilder`, so a PG ERROR raised
-    // anywhere in the body leaks an open transaction (xact state =
-    // TBLOCK_STARTED + pushed active snapshot). The next call then
-    // asserts `"StartTransactionCommand: unexpected state STARTED"`,
-    // which we hit running pgbench against the slot. So we open and
-    // close the transaction ourselves with explicit panic cleanup.
-    //
-    // This works for both implicit (auto-commit between queries) and
-    // explicit (inside an open `BEGIN` block) entry states:
-    // `StartTransactionCommand` is a no-op for xact-start when called
-    // from `TBLOCK_INPROGRESS`, and `CommitTransactionCommand` from
-    // `TBLOCK_INPROGRESS` does `CommandCounterIncrement` rather than
-    // an actual commit. See PG `src/backend/access/transam/xact.c`.
     let query_owned = query.to_string();
-
-    unsafe {
-        pg_sys::SetCurrentStatementStartTimestamp();
-        pg_sys::StartTransactionCommand();
-        pg_sys::PushActiveSnapshot(pg_sys::GetTransactionSnapshot());
-    }
-
-    let outcome: Result<Result<Vec<Response>, PgWireError>, Box<dyn Any + Send>> =
-        catch_unwind(AssertUnwindSafe(|| run_via_spi(&query_owned)));
-
-    match outcome {
-        Ok(Ok(responses)) => {
-            // SAFETY: matched Start/Push above. From TBLOCK_STARTED
-            // (implicit-xact entry) Pop+Commit returns to DEFAULT;
-            // from TBLOCK_INPROGRESS (inside an open BEGIN) Pop
-            // unstacks our snapshot and Commit just bumps the
-            // command counter.
-            unsafe {
-                pg_sys::PopActiveSnapshot();
-                pg_sys::CommitTransactionCommand();
-            }
-            Ok(responses)
-        }
-        Ok(Err(err)) => {
-            // Body returned a clean PgWireError (e.g. our SPI-error
-            // translation). Xact state hasn't been corrupted — no PG
-            // ERROR was raised — so Pop+Commit is the right teardown.
-            // We do NOT Abort here: the application-level error is
-            // not an SPI-level rollback request, and forcing one
-            // would mask the fact that nothing PG-side actually
-            // failed.
-            unsafe {
-                pg_sys::PopActiveSnapshot();
-                pg_sys::CommitTransactionCommand();
-            }
-            Err(err)
-        }
-        Err(panic_payload) => {
-            // A PG ERROR (or Rust panic) longjmp'd / unwound through
-            // the body. SPI cleanup is handled by PG's own xact-abort
-            // path inside AbortCurrentTransaction; we must NOT touch
-            // the active snapshot stack here (PG already popped it
-            // during abort).
-            //
-            // SAFETY: AbortCurrentTransaction is safe to call from
-            // any non-DEFAULT TBLOCK_* state; it resets state to
-            // DEFAULT and releases resources.
-            //
-            // Deviation from real PG: PG would set state to
-            // TBLOCK_ABORT (forcing the client to issue ROLLBACK to
-            // clean up) and reject every subsequent statement until
-            // ROLLBACK. We collapse that to DEFAULT, so subsequent
-            // statements run as if in a fresh auto-commit context.
-            // This is incorrect in spec terms but harmless for the
-            // pgbench workloads we target; phase ≥ 9 (extended-query
-            // + proper xact state machine) can fix this when it
-            // matters.
-            unsafe {
-                pg_sys::AbortCurrentTransaction();
-            }
-            Err(panic_to_pgwire(panic_payload))
-        }
-    }
+    with_spi(|ctx: &SpiCtx| -> PgWireResult<Vec<Response>> { run_via_spi(ctx, &query_owned) })
 }
 
 /// Subset of PG's `TransactionStmt` (gram.y) we route around SPI.
@@ -389,119 +334,115 @@ fn handle_xact_control(cmd: XactCmd) -> PgWireResult<Vec<Response>> {
     }
 }
 
-fn run_via_spi(query: &str) -> Result<Vec<Response>, PgWireError> {
-    // Spi::connect_mut runs the closure inside an SPI_connect /
-    // SPI_finish pair, with a read-write SPI session — required for
-    // DDL/DML (pgbench -i, UPDATE, etc.). PG ERRORs from inside
-    // panic out; the outer `execute_simple_query` catches them via
-    // catch_unwind + AbortCurrentTransaction.
-    pgrx::Spi::connect_mut(|client| -> Result<Vec<Response>, PgWireError> {
-        client
-            .update(query, None, &[])
-            .map_err(|e| spi_error_to_pgwire(&e.to_string()))?;
+/// Body of [`run_spi_statement`]'s `with_spi` closure. Executes one
+/// statement via `SPI_execute`, then either:
+///
+/// * Returns a `Response::Execution(Tag::new("OK").with_rows(N))`
+///   for utility / no-RETURNING DML (no result tuples).
+/// * Materialises every result row directly into a per-row
+///   [`BytesMut`] via [`TypeOutput`] (text format only, since the
+///   simple-query protocol is text-format-by-definition), wraps each
+///   in a [`DataRow`], and returns `Response::Query` with a
+///   length-prefixed wire-format-ready stream.
+///
+/// The encoding shape is symmetric with
+/// [`super::extended`]'s extended-query path: cache `TypeOutput`
+/// once per column (one syscache lookup amortised over all rows
+/// instead of per cell — folds in performance.md §3.5), then per
+/// cell either write `-1` (NULL marker) or `(len: i32, bytes)`. We
+/// deliberately bypass pgwire's `DataRowEncoder` (which is
+/// Rust-value-oriented and would force `Vec<Option<String>>`
+/// re-encoding) — see performance.md §3.2.
+///
+/// PG ERRORs raised by `SPI_execute` (syntax error, type mismatch,
+/// constraint violation, …) longjmp out; [`with_spi`]'s `catch_unwind`
+/// catches and converts them to wire `ErrorResponse` frames.
+fn run_via_spi(ctx: &SpiCtx, query: &str) -> PgWireResult<Vec<Response>> {
+    let query_c = CString::new(query)
+        .map_err(|_| generic_error("simple-query", "query string contains a NUL byte"))?;
 
-        // After select succeeds we walk SPI's globals directly: it's
-        // both simpler than fighting pgrx's typed accessors (we want
-        // text-format-for-any-type, not Rust-typed) and gives us the
-        // raw heap tuples we need for SPI_getvalue.
-        //
-        // SAFETY: `SPI_tuptable` / `SPI_processed` are PG globals
-        // populated by the previous SPI call; valid until the next
-        // SPI call or SPI_finish.
-        let (tuptable, nrows) = unsafe { (pg_sys::SPI_tuptable, pg_sys::SPI_processed as usize) };
+    // SAFETY: inside an SPI session (proven by &SpiCtx); SPI_execute
+    // is the documented entry point. `read_only=false` matches the
+    // prior `Spi::connect_mut`-based behaviour (DDL/DML allowed);
+    // `tcount=0` means "unbounded rows".
+    let exec_rc = unsafe { pg_sys::SPI_execute(query_c.as_ptr(), false, 0) };
+    if exec_rc < 0 {
+        return Err(spi_rc_error("SPI_execute", exec_rc));
+    }
 
-        // Utility statements (CREATE TABLE, etc.) leave SPI_tuptable
-        // null and only populate SPI_processed.
-        if tuptable.is_null() {
-            return Ok(vec![Response::Execution(Tag::new("OK").with_rows(nrows))]);
+    // Utility / no-RETURNING DML: SPI_tuptable is null; report row
+    // count only. We preserve the "OK" command tag the previous impl
+    // used (rather than mapping rc → SELECT/INSERT/UPDATE/etc. as
+    // extended.rs does) so the simple-query bridge's externally
+    // observable command tags don't shift in this change.
+    let tuples = match SpiTuples::current(ctx) {
+        Some(t) if t.ncols() > 0 => t,
+        _ => {
+            let processed = SpiTuples::processed_rows_without_table(ctx);
+            return Ok(vec![Response::Execution(
+                Tag::new("OK").with_rows(processed),
+            )]);
         }
+    };
 
-        // SAFETY: SPI_tuptable is non-null per the check above; its
-        // tupdesc and vals are valid for the duration of this SPI
-        // connection.
-        let tupdesc = unsafe { (*tuptable).tupdesc };
-        let ncols = unsafe { (*tupdesc).natts } as usize;
-        if ncols == 0 {
-            return Ok(vec![Response::Execution(Tag::new("OK").with_rows(nrows))]);
-        }
+    let ncols = tuples.ncols();
+    let nrows = tuples.len();
 
-        // Build the RowDescription schema once. Each FieldInfo wraps
-        // a pgwire Type (= postgres_types::Type) derived from the
-        // column's atttypid; columns with an OID we don't recognise
-        // fall back to TEXT — which is harmless because we're
-        // emitting text format anyway and the OID is just a hint
-        // for the client's parsing code.
-        let schema_vec: Vec<FieldInfo> = (0..ncols)
-            .map(|i| {
-                // SAFETY: tupdesc is non-null, i is in 0..natts; the
-                // returned FormData_pg_attribute lives as long as
-                // tupdesc.
-                let attr = unsafe { &*pg_sys::TupleDescAttr(tupdesc, i as i32) };
-                let name = unsafe { CStr::from_ptr(attr.attname.data.as_ptr()) }
-                    .to_string_lossy()
-                    .into_owned();
-                let pgwire_type = Type::from_oid(attr.atttypid.to_u32()).unwrap_or(Type::TEXT);
-                FieldInfo::new(name, None, None, pgwire_type, FieldFormat::Text)
-            })
-            .collect();
+    // SAFETY: tuptable is non-null (proven by SpiTuples::current
+    // returning Some); its tupdesc is valid for the SPI session.
+    let tupdesc = unsafe { (*pg_sys::SPI_tuptable).tupdesc };
 
-        // Materialise every row up-front. The SPI tupdesc + heap
-        // tuples die when the `Spi::connect` closure returns, and
-        // pgwire's row stream is consumed *after* `do_query` returns;
-        // we can't lazily borrow into a future SPI session. Large-
-        // result handling is a phase ≥ 9 concern.
-        let mut materialised: Vec<Vec<Option<String>>> = Vec::with_capacity(nrows);
-        for row_idx in 0..nrows {
-            // SAFETY: row_idx < SPI_processed; vals[row_idx] is a
-            // valid HeapTuple in SPI_tuptable.
-            let heap_tuple = unsafe { *(*tuptable).vals.add(row_idx) };
-            let mut row = Vec::with_capacity(ncols);
-            for col_idx in 0..ncols {
-                // SPI_getvalue calls the type's text output function
-                // and returns a palloc'd C string, or NULL if the
-                // datum is NULL (or if there's an error — phase 4b
-                // treats both as NULL, which is wire-correct for
-                // NULL and at-worst-confusing for the rare error
-                // case; phase ≥ 5 may add SPI_getbinval +
-                // explicit is_null when this bites someone).
-                let cstr_ptr =
-                    unsafe { pg_sys::SPI_getvalue(heap_tuple, tupdesc, (col_idx + 1) as i32) };
-                if cstr_ptr.is_null() {
-                    row.push(None);
-                } else {
-                    // SAFETY: SPI_getvalue returns NUL-terminated.
-                    let s = unsafe { CStr::from_ptr(cstr_ptr) }
-                        .to_string_lossy()
-                        .into_owned();
-                    unsafe { pg_sys::pfree(cstr_ptr as *mut _) };
-                    row.push(Some(s));
+    // Build the RowDescription schema and the per-column TypeOutput
+    // cache in a single tupdesc walk. Columns with an OID pgwire
+    // doesn't recognise fall back to TEXT — harmless because we're
+    // emitting text format anyway; the OID is just a parsing hint
+    // for the client.
+    let mut schema_vec: Vec<FieldInfo> = Vec::with_capacity(ncols);
+    let mut encoders: Vec<TypeOutput> = Vec::with_capacity(ncols);
+    for i in 0..ncols {
+        // SAFETY: tupdesc non-null; i is in 0..natts; the returned
+        // FormData_pg_attribute lives as long as the tupdesc.
+        let attr = unsafe { &*pg_sys::TupleDescAttr(tupdesc, i as i32) };
+        let name = unsafe { CStr::from_ptr(attr.attname.data.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        let pgwire_type = Type::from_oid(attr.atttypid.to_u32()).unwrap_or(Type::TEXT);
+        schema_vec.push(FieldInfo::new(
+            name,
+            None,
+            None,
+            pgwire_type,
+            FieldFormat::Text,
+        ));
+        encoders.push(TypeOutput::for_type(attr.atttypid));
+    }
+
+    // Materialise every row up-front into BytesMut. The SPI tupdesc
+    // and heap tuples die when `with_spi`'s SPI_finish runs (after
+    // this closure returns); pgwire's row stream is consumed *after*
+    // `do_query` returns, so we can't lazily borrow. Large-result
+    // streaming is a phase ≥ 9.5 concern.
+    let mut data_rows: Vec<DataRow> = Vec::with_capacity(nrows);
+    for row_idx in 0..nrows {
+        let mut buf = BytesMut::with_capacity(64);
+        for (c, enc) in encoders.iter().enumerate() {
+            match tuples.cell(row_idx, c) {
+                None => buf.put_i32(-1),
+                Some(datum) => {
+                    let bytes = enc.call(datum);
+                    buf.put_i32(bytes.len() as i32);
+                    buf.put_slice(&bytes);
                 }
             }
-            materialised.push(row);
         }
+        data_rows.push(DataRow::new(buf, ncols as i16));
+    }
 
-        let schema = Arc::new(schema_vec);
-        let schema_for_stream = schema.clone();
-        let row_stream = stream::iter(materialised).map(move |row| {
-            let mut encoder = DataRowEncoder::new(schema_for_stream.clone());
-            for cell in row {
-                encoder.encode_field(&cell)?;
-            }
-            Ok(encoder.take_row())
-        });
-
-        Ok(vec![Response::Query(QueryResponse::new(
-            schema, row_stream,
-        ))])
-    })
-}
-
-fn spi_error_to_pgwire(msg: &str) -> PgWireError {
-    PgWireError::UserError(Box::new(ErrorInfo::new(
-        "ERROR".to_string(),
-        "XX000".to_string(),
-        format!("pg_transport SPI error: {msg}"),
-    )))
+    let schema = Arc::new(schema_vec);
+    let row_stream = stream::iter(data_rows).map(Ok);
+    Ok(vec![Response::Query(QueryResponse::new(
+        schema, row_stream,
+    ))])
 }
 
 // ---------------------------------------------------------------------------
