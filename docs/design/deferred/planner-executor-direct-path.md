@@ -179,10 +179,27 @@ into `SPI_tuptable`, so it's also one copy).
 ROLLBACK route naturally via `PortalRun` → `ProcessUtility` →
 `BeginTransactionBlock` etc.
 
-**PG version coupling:** medium. `Tuplestore` ABI is stable but
-non-trivial; `PortalDefineQuery` signature changed in PG 15.
+**PG version coupling:** medium (arguably low). `Tuplestore` ABI is
+stable but non-trivial; `PortalDefineQuery` signature changed in
+PG 15. Realistic adaptation cost per PG major: ~10–50 LOC of
+`#[cfg(feature = "pg19")]` signature shims.
+
+**Production precedent:** every set-returning function in PG uses
+this pattern. Concrete users in the ecosystem:
+[`dblink`](https://www.postgresql.org/docs/current/dblink.html) and
+[`postgres_fdw`](https://www.postgresql.org/docs/current/postgres-fdw.html)
+in contrib; `plpgsql` refcursors; TimescaleDB continuous
+aggregates. This is the gold-standard PG extension pattern
+— not novel risk.
 
 ### 6.2 Strategy 2 — Custom `DestReceiver`
+
+> **Status: deferred to Stage D.** [§7](#7-phased-adoption-if-and-when-we-un-defer)
+> commits to Strategy 1 (Tuplestore) for the initial §3.1 adoption
+> (Stages A + B). DestReceiver is the perf ceiling but its win is
+> not material for v0 workloads (1–100 row results); the doc's
+> Stage D promotes only when a profile or feature demands it (see
+> [§8](#8-re-entry-conditions) feature-driven triggers).
 
 Implement a `#[repr(C)]` Rust struct that prepends `DestReceiver`'s
 C function-table layout and appends our `BytesMut` + per-column
@@ -237,6 +254,20 @@ removal wins from Strategy 1.
 reworked in PG 12 (TTS_VIRTUAL / TTS_HEAP / TTS_MINIMAL etc.) and is
 the kind of struct PG occasionally touches.
 
+**Production precedent:** [Citus](https://github.com/citusdata/citus)
+implements its own `TupleDestination` abstraction layered over
+`DestReceiver` ([`src/include/distributed/tuple_destination.h`](https://github.com/citusdata/citus/blob/main/src/include/distributed/tuple_destination.h))
+and has tracked it through PG 11 → 18 in production. Other users:
+[PipelineDB](https://github.com/pipelinedb/pipelinedb) (continuous
+queries; archived but shipped in production for years across
+PG 9.6 → 11), [pg_task](https://github.com/RekGRpth/pg_task),
+[Spock](https://github.com/pgEdge/spock). Pattern that survives
+the coupling: wrap the raw function-table struct in a higher-level
+abstraction, use `#[cfg(feature = "pgNN")]` shims for signature
+changes, keep the `receiveSlot` callback minimal (forward to the
+abstraction; don't inline slot-internal logic). If Citus can carry
+this through 5+ PG majors, so can we.
+
 ### 6.3 Strategy 3 — Keep SPI
 
 Current state. Double parse on the SPI side, intermediate
@@ -254,6 +285,20 @@ us); minimum unsafe surface; the `spi.rs` wrappers already provide
 RAII for plans, sessions, and per-type I/O.
 
 ## 7. Phased adoption (if and when we un-defer)
+
+**Decision: Strategy 1 (Tuplestore) is the chosen implementation
+for the initial §3.1 adoption.** Stages A + B both land Tuplestore-
+based bridges; Strategy 2 (custom DestReceiver) is deferred to
+Stage D and promoted only when a profile or feature demands it.
+Rationale: the perf delta on v0 workloads (1–100 row results) is
+noise; Tuplestore is ~half the unsafe LOC of DestReceiver; the
+FFI surface (CachedPlan + Portal lifecycle + slot iteration) is
+identical between the two, so the Stage A work invested in
+Tuplestore carries forward to a Stage D promotion at zero extra
+cost. See [§6.1](#61-strategy-1--tuplestore-destination) /
+[§6.2](#62-strategy-2--custom-destreceiver) for the strategy
+comparison and [§8](#8-re-entry-conditions) for the Stage D
+promotion triggers.
 
 A clean staircase that lets each step land and stabilise before the
 next:
@@ -291,6 +336,64 @@ next:
 
 Each stage is independently shippable and validated by the existing
 `just test` + `just e2e` + `just bench` suite.
+
+### 7.5 Coexistence during migration — runtime GUC
+
+The Stage A → C transition replaces SPI with the direct path on a
+file-by-file basis. To de-risk that migration, **both backends
+should coexist during Stages A+B, gated by a runtime GUC**, with an
+explicit sunset that retires SPI at Stage C.
+
+**GUC.** `pg_transport.execution_backend = 'spi' | 'direct'`,
+`USERSET`, defaults to `'spi'` until soak completes. Per-session and
+per-role (`ALTER ROLE ... SET pg_transport.execution_backend =
+'direct'`) selectability lets operators canary one workload at a
+time without redeploying.
+
+**Dispatch shape.** A small trait at the
+[`SimpleQueryHandler`](../../../crates/core/src/wire/pgwire_v3.rs) /
+[`ExtendedQueryHandler`](../../../crates/core/src/wire/extended.rs)
+boundary; the existing `spi_bridge.rs` / `extended.rs` become one
+impl, the new direct-path code becomes the other. The dispatcher
+reads the GUC at query start (one indirect call per query;
+measurable as zero on the bench harness).
+
+**Migration timeline.**
+
+| Stage | Default backend | What's available |
+| --- | --- | --- |
+| A landed | `spi` | `direct` available for extended-query opt-in |
+| B landed | `spi` | `direct` available for both simple + extended |
+| Soak (~6 months, 2–3 PG minor cycles) | `spi` | operators canary `direct` per-session / per-role; bug + perf reports drive iteration |
+| Soak passes | flip default to `direct` | SPI still selectable; deprecation notice in [`configuration.md`](../configuration.md) |
+| Sunset (one cycle after default flip) | `direct` only | Stage C runs: delete SPI bridge + dispatcher trait + GUC |
+
+**Cost during soak.** ~20–50 LOC for the dispatcher trait + GUC
+plumbing. CI runs `just test` + `just e2e` against both backends
+(doubled bench cost; same e2e cost since tests pass against either).
+Both code paths stay green or the soak resets.
+
+**Why not the alternatives.**
+
+- **Cargo feature flag** (compile-time selection) denies us the
+  runtime canary capability that's the whole point. Considered and
+  rejected unless binary-size becomes a constraint (it won't for v0).
+- **Permanent coexistence** (no sunset) carries the maintenance tax
+  of two query backends forever — every new feature (cancel, COPY,
+  new auth method) must work against both. The sunset is part of
+  the decision; without it this turns into a maintenance hole.
+- **Per-query routing** (SPI for utility, direct for SELECT) is
+  more complex than the win justifies; the GUC lets operators
+  effectively do this themselves via `ALTER ROLE` if they want.
+
+**Open until Stage A is actually scoped.** Concrete decisions
+deferred to that point: exact GUC name (`execution_backend` vs
+`query_path` vs ...); whether the GUC is `SUSET` (admin-only) or
+`USERSET` (any session); how to log per-query backend selection
+without bloating the log; whether to expose a
+`pg_stat_pg_transport_backend` view counting queries by backend.
+These are easy decisions to make once the trait shape exists; not
+worth pre-locking now.
 
 ## 8. Re-entry conditions
 
