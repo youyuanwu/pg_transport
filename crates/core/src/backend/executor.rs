@@ -150,10 +150,21 @@ where
 /// [`Self::save`] to promote into PG's cache memory (so the
 /// source survives MemoryContext resets between parse and
 /// execute). [`Self::get_plan`] returns a per-execute [`CachedPlan`].
+///
+/// `Send + Sync` are unsafe-impl'd by hand (mirrors
+/// [`super::spi::SpiPlan`]): the underlying PG state is per-backend
+/// thread-local, but pgwire's `PortalStore` stashes the
+/// containing [`super::extended::PreparedStatement`] as
+/// `Arc<dyn ... + Send + Sync>`. The slot bgworker is
+/// single-threaded, so the stash never actually crosses threads;
+/// the bound is a type-system constraint, not a runtime one.
 pub struct CachedPlanSource {
     raw: *mut pg_sys::CachedPlanSource,
-    _phantom: PhantomData<*const ()>,
 }
+
+// SAFETY: see CachedPlanSource doc comment — slot is single-threaded.
+unsafe impl Send for CachedPlanSource {}
+unsafe impl Sync for CachedPlanSource {}
 
 impl CachedPlanSource {
     /// Create an empty CachedPlanSource from a raw parse tree.
@@ -176,10 +187,7 @@ impl CachedPlanSource {
         // ERROR on alloc failure which longjmps through us.
         let raw =
             unsafe { pg_sys::CreateCachedPlan(raw_parse_tree, query_string.as_ptr(), command_tag) };
-        CachedPlanSource {
-            raw,
-            _phantom: PhantomData,
-        }
+        CachedPlanSource { raw }
     }
 
     /// Fill in the analyzed querytree list, parameter types, and

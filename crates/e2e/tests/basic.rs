@@ -608,6 +608,34 @@ async fn extended_query_prepare_then_reuse() -> Result<()> {
 }
 
 #[tokio::test]
+async fn extended_query_direct_backend_prepare_reports_types() -> Result<()> {
+    // Commit 4 target: direct backend must handle Parse + Describe
+    // cleanly. We do not Execute the prepared statement yet; that
+    // remains the commit-5 follow-up.
+    let c = Cluster::shared().await;
+    let client = c.connect("postgres").await?;
+    client
+        .simple_query("SET pg_transport.execution_backend = 'direct'")
+        .await?;
+
+    let stmt = client.prepare("SELECT $1::int + 1, 42::int").await?;
+
+    assert_eq!(stmt.params().len(), 1, "expected one inferred parameter");
+    assert_eq!(stmt.params()[0], tokio_postgres::types::Type::INT4);
+
+    assert_eq!(stmt.columns().len(), 2, "expected two result columns");
+    assert_eq!(
+        stmt.columns()[0].type_(),
+        &tokio_postgres::types::Type::INT4
+    );
+    assert_eq!(
+        stmt.columns()[1].type_(),
+        &tokio_postgres::types::Type::INT4
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn extended_query_execute_returns_row_count() -> Result<()> {
     // `execute` runs an INSERT / UPDATE / DELETE without
     // RETURNING and returns the affected row count from the
