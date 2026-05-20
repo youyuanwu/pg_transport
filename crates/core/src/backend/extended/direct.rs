@@ -43,15 +43,21 @@
 //! commit 5 will wire that in.
 
 use std::ffi::{CStr, CString};
+use std::sync::Arc;
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
+use futures::StreamExt;
+use futures::stream;
 use pgrx::pg_sys;
 use pgwire::api::Type;
 use pgwire::api::portal::Format;
-use pgwire::api::results::{FieldFormat, FieldInfo, Response};
+use pgwire::api::results::{FieldFormat, FieldInfo, QueryResponse, Response, Tag};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use pgwire::messages::data::DataRow;
 
-use super::super::executor::{CachedPlanSource, with_xact};
+use super::super::executor::{CachedPlanSource, Portal, with_xact};
+use super::super::spi::{TypeInput, TypeOutput, TypeReceive, TypeSend, generic_error};
+use super::super::tuplestore::{Tuplestore, TuplestoreReceiver};
 use super::{PreparedPlan, PreparedStatement};
 
 // ---------------------------------------------------------------------------
@@ -75,6 +81,8 @@ pub(crate) struct DirectBackendPlan {
     param_oids: Vec<pg_sys::Oid>,
     /// Per-result-column type OIDs (echoes [`super::PreparedStatement::result_schema`]).
     column_oids: Vec<pg_sys::Oid>,
+    /// Parse-time command tag reused in `PortalDefineQuery`.
+    command_tag: pg_sys::CommandTag::Type,
     /// Result-column schema (echoes [`super::PreparedStatement::result_schema`]).
     /// Kept here too so the per-execute response builder can wrap
     /// it in an Arc without re-walking the source.
@@ -82,23 +90,165 @@ pub(crate) struct DirectBackendPlan {
 }
 
 impl PreparedPlan for DirectBackendPlan {
-    /// **Stage A WIP — commit 5 wires Bind+Execute.** Returns
-    /// `0A000` (feature_not_supported) so clients see a clean
-    /// failure rather than a panic if they reach Execute under
-    /// the direct backend before commit 5 lands.
+    /// Execute the direct-path prepared statement via
+    /// `GetCachedPlan` + `PortalRun(..., DestTuplestore, ...)`.
+    ///
+    /// Parameter format is taken from the portal's
+    /// `parameter_format`; per-parameter format can vary if the
+    /// Bind sent `parameter_format_codes` of length > 1. Result
+    /// format is honoured per-column from the portal's
+    /// `result_column_format`.
     fn execute(
         &self,
-        _parameters: &[Option<Bytes>],
-        _parameter_format: &Format,
-        _result_format: &Format,
-        _max_rows: usize,
+        parameters: &[Option<Bytes>],
+        parameter_format: &Format,
+        result_format: &Format,
+        max_rows: usize,
     ) -> PgWireResult<Response> {
-        Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-            "ERROR".to_string(),
-            "0A000".to_string(),
-            "pg_transport.execution_backend = 'direct': Execute path not yet implemented (Stage A commit 5). Parse + Describe work; switch back to pg_transport.execution_backend = 'spi' to execute queries.".to_string(),
-        ))))
+        execute_impl(self, parameters, parameter_format, result_format, max_rows)
     }
+}
+
+/// Free-function body for [`DirectBackendPlan::execute`]; pulled
+/// out so the with_xact closure gets the inner borrows cleanly.
+fn execute_impl(
+    backend: &DirectBackendPlan,
+    parameters: &[Option<Bytes>],
+    parameter_format: &Format,
+    result_format: &Format,
+    max_rows: usize,
+) -> PgWireResult<Response> {
+    if parameters.len() != backend.param_oids.len() {
+        return Err(generic_error(
+            "pg_transport direct",
+            &format!(
+                "bind parameter count mismatch: got {}, expected {}",
+                parameters.len(),
+                backend.param_oids.len()
+            ),
+        ));
+    }
+
+    let base_schema = &backend.base_schema;
+    let ncols = base_schema.len();
+    let result_format_per_col: Vec<FieldFormat> =
+        (0..ncols).map(|i| result_format.format_for(i)).collect();
+    let schema_vec: Vec<FieldInfo> = base_schema
+        .iter()
+        .zip(result_format_per_col.iter())
+        .map(|(fi, fmt)| {
+            FieldInfo::new(
+                fi.name().to_string(),
+                fi.table_id(),
+                fi.column_id(),
+                fi.datatype().clone(),
+                *fmt,
+            )
+        })
+        .collect();
+
+    let param_bytes: Vec<Option<Bytes>> = parameters.to_vec();
+    let param_is_binary: Vec<bool> = (0..parameters.len())
+        .map(|i| parameter_format.is_binary(i))
+        .collect();
+
+    with_xact(|ctx| -> PgWireResult<Response> {
+        let (param_values, param_is_null) =
+            decode_parameters(&param_bytes, &backend.param_oids, &param_is_binary)?;
+        // SAFETY: makeParamList allocates a ParamListInfo with
+        // numParams slots in CurrentMemoryContext.
+        let params =
+            unsafe { build_param_list(&backend.param_oids, &param_values, &param_is_null) };
+
+        // SAFETY: inside with_xact; source is saved/live.
+        let plan = unsafe { backend.source.get_plan(params) };
+        let portal = unsafe { Portal::create_anonymous(ctx) };
+
+        let sql_cstr = CString::new("direct-path statement").expect("literal has no NUL");
+
+        unsafe {
+            portal.define(
+                &sql_cstr,
+                backend.command_tag,
+                plan.stmt_list(),
+                std::ptr::null_mut(),
+            );
+            portal.start(params, 0, pg_sys::GetActiveSnapshot());
+        }
+
+        // Capture rows into a tuplestore so we can encode them
+        // after PortalRun returns.
+        let store = unsafe { Tuplestore::begin_heap(true, false, pg_sys::work_mem) };
+        let target_tupdesc = unsafe { (*backend.source.as_ptr()).resultDesc };
+        let receiver = unsafe {
+            TuplestoreReceiver::for_tuplestore(
+                &store,
+                pg_sys::CurrentMemoryContext,
+                false,
+                target_tupdesc,
+            )
+        };
+
+        let mut qc: pg_sys::QueryCompletion = Default::default();
+        unsafe {
+            pg_sys::InitializeQueryCompletion(&mut qc);
+        }
+        let count = if max_rows == 0 {
+            i64::MAX
+        } else {
+            max_rows as i64
+        };
+        let _done =
+            unsafe { portal.run(count, true, receiver.as_ptr(), receiver.as_ptr(), &mut qc) };
+        unsafe {
+            pg_sys::tuplestore_rescan(store.as_ptr());
+        }
+
+        if ncols == 0 {
+            let tag_name = command_tag_name(qc.commandTag);
+            let mut tag = Tag::new(&tag_name);
+            if unsafe { pg_sys::command_tag_display_rowcount(qc.commandTag) } {
+                tag = tag.with_rows(qc.nprocessed as usize);
+            }
+            return Ok(Response::Execution(tag));
+        }
+
+        let encoders: Vec<ColumnEncoder> = (0..ncols)
+            .map(|c| ColumnEncoder::for_column(backend.column_oids[c], result_format_per_col[c]))
+            .collect();
+
+        let mut data_rows: Vec<DataRow> = Vec::new();
+        unsafe {
+            let tupdesc = (*backend.source.as_ptr()).resultDesc;
+            let slot = pg_sys::MakeSingleTupleTableSlot(tupdesc, &pg_sys::TTSOpsMinimalTuple);
+            let slot_guard = SlotGuard { raw: slot };
+            while pg_sys::tuplestore_gettupleslot(store.as_ptr(), true, true, slot_guard.raw) {
+                pg_sys::slot_getallattrs(slot_guard.raw);
+
+                let mut buf = BytesMut::with_capacity(64);
+                for (c, encoder) in encoders.iter().enumerate() {
+                    let is_null = *(*slot_guard.raw).tts_isnull.add(c);
+                    if is_null {
+                        buf.put_i32(-1);
+                    } else {
+                        let datum = *(*slot_guard.raw).tts_values.add(c);
+                        let bytes = encoder.encode(datum);
+                        buf.put_i32(bytes.len() as i32);
+                        buf.put_slice(&bytes);
+                    }
+                }
+                data_rows.push(DataRow::new(buf, ncols as i16));
+                pg_sys::ExecClearTuple(slot_guard.raw);
+            }
+        }
+
+        let tag_name = command_tag_name(qc.commandTag);
+        let schema_arc = Arc::new(schema_vec);
+        let row_stream = stream::iter(data_rows).map(Ok);
+        let mut response = QueryResponse::new(schema_arc, row_stream);
+        response.set_command_tag(&tag_name);
+        Ok(Response::Query(response))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -280,6 +430,7 @@ pub fn prepare(sql: &str, param_hints: &[Option<u32>]) -> PgWireResult<PreparedS
             source,
             param_oids: resolved_oids,
             column_oids,
+            command_tag,
             base_schema: base_schema.clone(),
         };
 
@@ -330,4 +481,169 @@ unsafe fn result_schema_from_source(source: &CachedPlanSource) -> Vec<FieldInfo>
         ));
     }
     out
+}
+
+/// Decode pgwire's `Vec<Option<Bytes>>` into direct-executor
+/// parameter vectors: one `Datum` per bind slot plus a null mask.
+fn decode_parameters(
+    parameters: &[Option<Bytes>],
+    param_oids: &[pg_sys::Oid],
+    is_binary: &[bool],
+) -> PgWireResult<(Vec<pg_sys::Datum>, Vec<bool>)> {
+    let n = parameters.len();
+    let mut values: Vec<pg_sys::Datum> = Vec::with_capacity(n);
+    let mut nulls: Vec<bool> = Vec::with_capacity(n);
+
+    for i in 0..n {
+        match &parameters[i] {
+            None => {
+                values.push(pg_sys::Datum::from(0_usize));
+                nulls.push(true);
+            }
+            Some(bytes) => {
+                let datum = if is_binary[i] {
+                    TypeReceive::for_type(param_oids[i]).call(bytes)
+                } else {
+                    TypeInput::for_type(param_oids[i]).call(bytes.as_ref())?
+                };
+                values.push(datum);
+                nulls.push(false);
+            }
+        }
+    }
+    Ok((values, nulls))
+}
+
+/// Build a PG `ParamListInfo` from decoded values. Caller keeps
+/// ownership in CurrentMemoryContext; no explicit free is needed.
+///
+/// # Safety
+///
+/// Must run inside an active transaction with a valid
+/// `CurrentMemoryContext`.
+unsafe fn build_param_list(
+    param_oids: &[pg_sys::Oid],
+    values: &[pg_sys::Datum],
+    is_null: &[bool],
+) -> pg_sys::ParamListInfo {
+    let n = param_oids.len();
+    let params = unsafe { pg_sys::makeParamList(n as i32) };
+    if params.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let base = unsafe { (*params).params.as_mut_ptr() };
+    for i in 0..n {
+        let slot = unsafe { base.add(i) };
+        unsafe {
+            (*slot).value = values[i];
+            (*slot).isnull = is_null[i];
+            (*slot).pflags = pg_sys::PARAM_FLAG_CONST as u16;
+            (*slot).ptype = param_oids[i];
+        }
+    }
+    params
+}
+
+/// Per-column result encoder. Holds the cached
+/// (typoutput | typsend) lookup so the row loop just calls
+/// `encoder.encode(datum)` per cell.
+enum ColumnEncoder {
+    Text(TypeOutput),
+    Binary(TypeSend),
+}
+
+impl ColumnEncoder {
+    fn for_column(type_oid: pg_sys::Oid, format: FieldFormat) -> Self {
+        match format {
+            FieldFormat::Text => Self::Text(TypeOutput::for_type(type_oid)),
+            FieldFormat::Binary => Self::Binary(TypeSend::for_type(type_oid)),
+        }
+    }
+
+    fn encode(&self, datum: pg_sys::Datum) -> Vec<u8> {
+        match self {
+            Self::Text(fns) => fns.call(datum),
+            Self::Binary(fns) => fns.call(datum),
+        }
+    }
+}
+
+/// Small RAII guard for a single tuple table slot created by
+/// `MakeSingleTupleTableSlot`.
+struct SlotGuard {
+    raw: *mut pg_sys::TupleTableSlot,
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            unsafe { pg_sys::ExecDropSingleTupleTableSlot(self.raw) };
+            self.raw = std::ptr::null_mut();
+        }
+    }
+}
+
+/// Convert a `CommandTag` enum to its display name.
+fn command_tag_name(tag: pg_sys::CommandTag::Type) -> String {
+    let ptr = unsafe { pg_sys::GetCommandTagName(tag) };
+    if ptr.is_null() {
+        "OK".to_string()
+    } else {
+        unsafe { CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pgrx::pg_schema]
+mod tests {
+    use super::*;
+    use bytes::Buf;
+    use pgrx::pg_test;
+
+    #[pg_test]
+    fn pg_direct_prepare_extracts_types_and_schema() {
+        let stmt = prepare("SELECT $1::int + 10 AS n", &[]).expect("direct prepare should succeed");
+        assert_eq!(stmt.param_types.len(), 1, "expected one inferred parameter");
+        assert_eq!(
+            stmt.param_types[0],
+            Type::INT4,
+            "expected inferred type INT4 for $1::int"
+        );
+        assert_eq!(stmt.result_schema.len(), 1, "expected one result column");
+        assert_eq!(stmt.result_schema[0].name(), "n");
+        assert_eq!(stmt.result_schema[0].datatype(), &Type::INT4);
+    }
+
+    #[pg_test]
+    fn pg_direct_execute_select_one_row_text() {
+        let stmt = prepare("SELECT $1::int + 10", &[]).expect("direct prepare should succeed");
+        let response = stmt
+            .execute(
+                &[Some(Bytes::from_static(b"5"))],
+                &Format::UnifiedText,
+                &Format::UnifiedText,
+                0,
+            )
+            .expect("direct execute should succeed");
+
+        let mut query = match response {
+            Response::Query(q) => q,
+            other => panic!("expected Query response, got: {other:?}"),
+        };
+        let maybe_row = futures::executor::block_on(async { query.data_rows().next().await });
+        let row = maybe_row
+            .expect("expected at least one row")
+            .expect("row stream item should be Ok");
+        assert_eq!(row.field_count, 1);
+
+        let mut data = row.data;
+        let len = data.get_i32();
+        assert!(len > 0, "first column should be non-null");
+        let cell = data.split_to(len as usize);
+        let text = std::str::from_utf8(&cell).expect("valid utf8");
+        assert_eq!(text, "15");
+    }
 }

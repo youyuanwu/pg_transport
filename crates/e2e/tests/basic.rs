@@ -636,6 +636,22 @@ async fn extended_query_direct_backend_prepare_reports_types() -> Result<()> {
 }
 
 #[tokio::test]
+async fn extended_query_direct_backend_executes_typed_row() -> Result<()> {
+    // Commit 5 target: direct backend must execute prepared
+    // statements (Bind + Execute), not just Parse + Describe.
+    let c = Cluster::shared().await;
+    let client = c.connect("postgres").await?;
+    client
+        .simple_query("SET pg_transport.execution_backend = 'direct'")
+        .await?;
+
+    let row = client.query_one("SELECT $1::int + 10", &[&5_i32]).await?;
+    let v: i32 = row.get(0);
+    assert_eq!(v, 15);
+    Ok(())
+}
+
+#[tokio::test]
 async fn extended_query_execute_returns_row_count() -> Result<()> {
     // `execute` runs an INSERT / UPDATE / DELETE without
     // RETURNING and returns the affected row count from the
