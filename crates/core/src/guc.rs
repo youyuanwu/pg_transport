@@ -53,6 +53,19 @@ pub static TLS_CERT_FILE: GucSetting<Option<CString>> = GucSetting::<Option<CStr
 /// only one FATALs at slot boot.
 pub static TLS_KEY_FILE: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 
+/// `pg_transport.execution_backend` — selects whether the
+/// extended-query path executes via SPI (the v0 default) or via
+/// the planner+executor direct path. v0 default is `'spi'`; the
+/// `'direct'` value selects the Stage-A Tuplestore-based
+/// implementation. Simple-query (`'Q'`) is unaffected; it always
+/// uses the SPI bridge until Stage B lands.
+///
+/// Per-session (`USERSET`) so operators can canary one workload at
+/// a time via `ALTER ROLE ... SET pg_transport.execution_backend =
+/// 'direct'`. See [deferred/planner-executor-direct-path.md §7.5](../../docs/design/deferred/planner-executor-direct-path.md).
+pub static EXECUTION_BACKEND: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(Some(c"spi"));
+
 /// Typed view of [`AUTH_SOURCE`]. See module-level docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthSource {
@@ -66,6 +79,18 @@ pub enum AuthSource {
     /// the GUC's either/or model is honest rather than a one-option
     /// fiction.
     PgTransport,
+}
+
+/// Typed view of [`EXECUTION_BACKEND`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionBackend {
+    /// Route extended-query via SPI (`SPI_prepare` /
+    /// `SPI_execute_plan`). v0 default.
+    Spi,
+    /// Route extended-query via the planner+executor direct path
+    /// (`CreateCachedPlan` / `Portal*` + Tuplestore destination).
+    /// Stage A implementation; opt-in until soak completes.
+    Direct,
 }
 
 pub fn register() {
@@ -113,6 +138,20 @@ pub fn register() {
         c"Both tls_cert_file and tls_key_file must be set to enable TLS.",
         &TLS_KEY_FILE,
         GucContext::Postmaster,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        c"pg_transport.execution_backend",
+        c"Extended-query execution backend ('spi' or 'direct').",
+        c"'spi' (default) uses SPI_prepare + SPI_execute_plan; \
+          'direct' uses CreateCachedPlan + Portal* + Tuplestore. \
+          Simple-query is unaffected (always SPI until Stage B).",
+        &EXECUTION_BACKEND,
+        // USERSET: per-session canary capability is the whole
+        // point of the GUC during the soak period. ALTER ROLE
+        // ... SET works as a sticky per-role override.
+        GucContext::Userset,
         GucFlags::default(),
     );
 }
@@ -192,5 +231,29 @@ pub fn tls_files() -> Result<Option<(String, String)>, String> {
         (false, true) => Err(
             "pg_transport.tls_cert_file is set but pg_transport.tls_key_file is not".to_string(),
         ),
+    }
+}
+
+/// Typed accessor for [`EXECUTION_BACKEND`]. Unknown values
+/// (including unset, which shouldn't happen given the default)
+/// silently fall back to [`ExecutionBackend::Spi`] — the safe
+/// default. We log unknown values at WARNING so misconfigurations
+/// are visible.
+pub fn execution_backend() -> ExecutionBackend {
+    let raw = EXECUTION_BACKEND.get();
+    let s = raw
+        .as_ref()
+        .map(|c| c.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    match s.as_str() {
+        "spi" | "" => ExecutionBackend::Spi,
+        "direct" => ExecutionBackend::Direct,
+        other => {
+            pgrx::warning!(
+                "pg_transport.execution_backend = {other:?} is not recognised; \
+                 falling back to 'spi'. Valid values: 'spi', 'direct'."
+            );
+            ExecutionBackend::Spi
+        }
     }
 }

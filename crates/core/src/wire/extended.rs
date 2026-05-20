@@ -140,8 +140,7 @@ impl ExtendedQueryHandler for PgTransportExtendedQuery {
             sql = stmt.sql,
             n = portal.parameters.len()
         );
-        spi_ext::execute(
-            stmt,
+        stmt.execute(
             &portal.parameters,
             &portal.parameter_format,
             &portal.result_column_format,

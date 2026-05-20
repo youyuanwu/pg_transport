@@ -1,0 +1,106 @@
+//! Extended-query backend dispatch — Parse / Bind / Execute,
+//! pluggable between the SPI bridge (v0 default, stable) and the
+//! planner+executor direct path (Stage A, opt-in via
+//! `pg_transport.execution_backend = 'direct'`).
+//!
+//! The wire layer ([`crate::wire::extended`]) calls
+//! [`prepare`] and [`PreparedStatement::execute`] without knowing
+//! which backend is active — the GUC selects the backend at Parse
+//! time and the choice is sticky on the resulting statement (the
+//! statement carries a `Box<dyn PreparedPlan>` whose impl is
+//! provided by either [`spi`] or [`direct`]).
+//!
+//! ## Module layout
+//!
+//! - [`spi`] — `SPI_prepare` + `SPI_execute_plan` path. v0 default.
+//!   Mirrors what [`super::spi_bridge`] does for simple-query.
+//! - [`direct`] — `CreateCachedPlan` + `Portal*` + Tuplestore
+//!   destination path. Stage A of the §3.1 direct-path migration
+//!   (see [deferred/planner-executor-direct-path.md](../../../../docs/design/deferred/planner-executor-direct-path.md)).
+//!   Opt-in until soak completes; default flips after.
+//!
+//! Both backends produce a [`PreparedStatement`] with the same
+//! wire-facing surface (`sql`, `param_types`, `result_schema`), so
+//! the wire layer's `get_parameter_types` / `get_result_schema` /
+//! `do_describe_*` callbacks are backend-agnostic.
+
+pub mod direct;
+pub mod spi;
+
+use bytes::Bytes;
+use pgwire::api::Type;
+use pgwire::api::portal::Format;
+use pgwire::api::results::{FieldInfo, Response};
+use pgwire::error::PgWireResult;
+
+use crate::guc::{self, ExecutionBackend};
+
+/// What the wire layer stores in pgwire's `StoredStatement` for a
+/// successfully parsed query.
+///
+/// The `plan` field is backend-specific (SPI or direct) behind a
+/// `Box<dyn PreparedPlan>`; the wire layer reads `sql`,
+/// `param_types`, and `result_schema` directly without caring
+/// which backend produced the statement.
+pub struct PreparedStatement {
+    /// Original SQL string, retained for diagnostics / logging.
+    pub sql: String,
+    /// Resolved parameter types (after merging client hints with
+    /// the analyzer's inferred types). One entry per `$n`
+    /// placeholder.
+    pub param_types: Vec<Type>,
+    /// Result-column schema. Empty for utility / DML-no-RETURNING
+    /// statements (matches pgwire's `is_no_data()` semantics).
+    pub result_schema: Vec<FieldInfo>,
+    /// Backend-specific plan handle. Drops itself (and releases
+    /// any underlying PG resource — `SPI_freeplan` for SPI,
+    /// `ReleaseCachedPlan` for direct) when the statement is
+    /// dropped.
+    plan: Box<dyn PreparedPlan>,
+}
+
+/// Backend-specific execution surface for a prepared statement.
+///
+/// Both [`spi::SpiBackendPlan`] and (in a later commit)
+/// [`direct::DirectBackendPlan`] implement this trait. The plan
+/// owns its own PG handle (SPI plan or CachedPlanSource) and any
+/// cached per-column metadata it needs.
+pub trait PreparedPlan: Send + Sync + 'static {
+    /// Execute the plan with the bound parameters and return a
+    /// pgwire `Response`. `max_rows` of `0` means "no limit".
+    fn execute(
+        &self,
+        parameters: &[Option<Bytes>],
+        parameter_format: &Format,
+        result_format: &Format,
+        max_rows: usize,
+    ) -> PgWireResult<Response>;
+}
+
+impl PreparedStatement {
+    /// Execute this statement's plan. The wire layer's `do_query`
+    /// callback funnels through here; backend dispatch is
+    /// already-resolved at this point because the plan was created
+    /// by whichever backend won the GUC check at Parse time.
+    pub fn execute(
+        &self,
+        parameters: &[Option<Bytes>],
+        parameter_format: &Format,
+        result_format: &Format,
+        max_rows: usize,
+    ) -> PgWireResult<Response> {
+        self.plan
+            .execute(parameters, parameter_format, result_format, max_rows)
+    }
+}
+
+/// Parse + plan a SQL string. Reads `pg_transport.execution_backend`
+/// to pick the SPI or direct backend; the returned
+/// [`PreparedStatement`] is sticky on that choice (re-executing it
+/// later does not re-consult the GUC).
+pub fn prepare(sql: &str, param_hints: &[Option<u32>]) -> PgWireResult<PreparedStatement> {
+    match guc::execution_backend() {
+        ExecutionBackend::Spi => spi::prepare(sql, param_hints),
+        ExecutionBackend::Direct => direct::prepare(sql, param_hints),
+    }
+}

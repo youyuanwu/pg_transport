@@ -1,19 +1,21 @@
 //! Extended-query SPI bridge — Parse / Bind / Execute backed by
 //! `SPI_prepare` + `SPI_execute_plan`, with all SPI / xact / type
-//! I/O plumbing routed through [`super::spi`].
+//! I/O plumbing routed through [`super::super::spi`].
 //!
-//! Layered alongside [`super::spi_bridge`] (simple-query); both
-//! share the [`spi::with_spi`] xact-wrapping discipline. Per
-//! [backend-wire.md §6](../../../../docs/design/backend-wire.md) +
-//! [§8 Q1](../../../../docs/design/backend-wire.md#8-open-questions),
+//! Layered alongside [`super::super::spi_bridge`] (simple-query);
+//! both share the [`spi::with_spi`] xact-wrapping discipline. Per
+//! [backend-wire.md §6](../../../../../docs/design/backend-wire.md) +
+//! [§8 Q1](../../../../../docs/design/backend-wire.md#8-open-questions),
 //! the wire layer owns the prepared-statement and portal *names*
 //! (via pgwire's `PortalStore`); SPI owns the *plans*. We hand the
-//! wire layer back a [`spi::SpiPlan`] that frees itself on Drop,
-//! so per-handoff reset is "drop the pgwire portal store" — which
-//! the current handoff structure already does, because we build a
-//! fresh [`crate::wire::pgwire_v3::PgTransportHandlers`] (and
-//! therefore a fresh pgwire `DefaultClient` with its own
-//! per-connection store) per `process_socket` call.
+//! wire layer back a [`super::PreparedStatement`] whose `plan`
+//! field is a `Box<SpiBackendPlan>` that holds an
+//! [`spi::SpiPlan`] freeing itself on Drop, so per-handoff reset
+//! is "drop the pgwire portal store" — which the current handoff
+//! structure already does, because we build a fresh
+//! [`crate::wire::pgwire_v3::PgTransportHandlers`] (and therefore
+//! a fresh pgwire `DefaultClient` with its own per-connection
+//! store) per `process_socket` call.
 //!
 //! ## Parameter formats
 //!
@@ -55,30 +57,32 @@ use pgwire::api::results::{FieldFormat, FieldInfo, QueryResponse, Response, Tag}
 use pgwire::error::PgWireResult;
 use pgwire::messages::data::DataRow;
 
-use super::spi::{
+use super::super::spi::{
     self, SpiCtx, SpiPlan, SpiTuples, TypeInput, TypeOutput, TypeReceive, TypeSend, generic_error,
     spi_rc_error, with_spi,
 };
+use super::PreparedPlan;
 
 // ---------------------------------------------------------------------------
-// PreparedStatement — wire-layer-visible result of [`prepare`]
+// SpiBackendPlan — the [`super::PreparedPlan`] impl for the SPI path
 // ---------------------------------------------------------------------------
 
-/// What the wire layer stores in pgwire's `StoredStatement` for a
-/// successfully parsed query. Holds the [`SpiPlan`] alive until the
-/// statement is dropped (i.e. `Close(Statement)` or connection
-/// teardown).
-pub struct PreparedStatement {
-    /// Original SQL string, retained for diagnostics / logging.
-    pub sql: String,
-    /// Kept SPI plan. Freed on Drop.
-    pub plan: SpiPlan,
-    /// Resolved parameter types (after merging client hints with
-    /// SPI's inferred types). One entry per `$n` placeholder.
-    pub param_types: Vec<Type>,
-    /// Result-column schema. Empty for utility / DML-no-RETURNING
-    /// statements (matches pgwire's `is_no_data()` semantics).
-    pub result_schema: Vec<FieldInfo>,
+/// SPI-side execution state for a single prepared statement.
+/// Holds the kept SPI plan plus pre-computed per-column metadata
+/// so per-execute hot-path work is minimal.
+///
+/// Lives behind `Box<dyn PreparedPlan>` inside [`super::PreparedStatement`].
+pub(crate) struct SpiBackendPlan {
+    /// Kept SPI plan. Freed on Drop via [`SpiPlan::Drop`].
+    plan: SpiPlan,
+    /// Per-`$n` parameter OIDs (echoes [`super::PreparedStatement::param_types`]).
+    param_oids: Vec<pg_sys::Oid>,
+    /// Per-result-column type OIDs (echoes [`super::PreparedStatement::result_schema`]).
+    column_oids: Vec<pg_sys::Oid>,
+    /// Result-column schema (echoes [`super::PreparedStatement::result_schema`]).
+    /// Kept here too so the per-execute response builder can wrap
+    /// it in an Arc without re-walking the statement.
+    base_schema: Vec<FieldInfo>,
 }
 
 // ---------------------------------------------------------------------------
@@ -176,8 +180,9 @@ unsafe fn infer_param_types(sql: &CString) -> Vec<pg_sys::Oid> {
 // ---------------------------------------------------------------------------
 
 /// SPI_prepare a query string with the client-supplied parameter
-/// type hints; return a [`PreparedStatement`] with a kept plan,
-/// resolved parameter OIDs, and the result schema (if any).
+/// type hints; return a [`super::PreparedStatement`] whose `plan`
+/// is an [`SpiBackendPlan`] boxed behind
+/// [`super::PreparedPlan`].
 ///
 /// `param_hints` is one entry per `$n` parameter the client
 /// declared in the Parse message; `Some(oid)` is the OID the
@@ -188,13 +193,13 @@ unsafe fn infer_param_types(sql: &CString) -> Vec<pg_sys::Oid> {
 /// pass the resolved OIDs to `SPI_prepare` as fixed types. The
 /// plan is then promoted via [`SpiCtx::keep_plan`] so it survives
 /// `SPI_finish`.
-pub fn prepare(sql: &str, param_hints: &[Option<u32>]) -> PgWireResult<PreparedStatement> {
+pub fn prepare(sql: &str, param_hints: &[Option<u32>]) -> PgWireResult<super::PreparedStatement> {
     let sql_cstring = CString::new(sql)
         .map_err(|_| generic_error("pg_transport extended", "query string contains a NUL byte"))?;
     let sql_owned = sql.to_string();
     let any_hint_present = param_hints.iter().any(|o| o.is_some());
 
-    with_spi(|ctx: &SpiCtx| -> PgWireResult<PreparedStatement> {
+    with_spi(|ctx: &SpiCtx| -> PgWireResult<super::PreparedStatement> {
         // Resolve types (either echo client hints, or run
         // varparams inference).
         let mut arg_oids: Vec<pg_sys::Oid> = if any_hint_present {
@@ -233,8 +238,9 @@ pub fn prepare(sql: &str, param_hints: &[Option<u32>]) -> PgWireResult<PreparedS
         let resolved_types: Vec<Type> = (0..arg_count)
             .map(|i| Type::from_oid(plan.arg_type(i).to_u32()).unwrap_or(Type::UNKNOWN))
             .collect();
+        let param_oids: Vec<pg_sys::Oid> = (0..arg_count).map(|i| plan.arg_type(i)).collect();
 
-        let result_schema = spi::plan_result_columns(plan.as_ptr())
+        let result_schema: Vec<FieldInfo> = spi::plan_result_columns(plan.as_ptr())
             .unwrap_or_default()
             .into_iter()
             .map(|col| {
@@ -247,50 +253,76 @@ pub fn prepare(sql: &str, param_hints: &[Option<u32>]) -> PgWireResult<PreparedS
                 )
             })
             .collect();
+        let column_oids: Vec<pg_sys::Oid> = result_schema
+            .iter()
+            .map(|fi| pg_sys::Oid::from(fi.datatype().oid()))
+            .collect();
 
-        Ok(PreparedStatement {
-            sql: sql_owned,
+        let backend_plan = SpiBackendPlan {
             plan,
+            param_oids,
+            column_oids,
+            base_schema: result_schema.clone(),
+        };
+
+        Ok(super::PreparedStatement {
+            sql: sql_owned,
             param_types: resolved_types,
             result_schema,
+            plan: Box::new(backend_plan),
         })
     })
 }
 
 // ---------------------------------------------------------------------------
-// execute — Bind+Execute path
+// execute — Bind+Execute path (PreparedPlan trait impl)
 // ---------------------------------------------------------------------------
 
-/// Execute a prepared portal's plan with the given parameters and
-/// return a pgwire `Response`. `max_rows` of `0` means "no limit"
-/// (PG's `SPI_execute_plan` uses `tcount = 0` for unbounded).
-///
-/// Parameter format is taken from the portal's `parameter_format`;
-/// per-parameter format can vary if the Bind sent
-/// `parameter_format_codes` of length > 1, which pgwire stores as
-/// `Format::Individual(Vec<i16>)`. Result format is taken from the
-/// portal's `result_column_format` and honoured per-column — see
-/// the module docs.
-pub fn execute(
-    prepared: &PreparedStatement,
+impl PreparedPlan for SpiBackendPlan {
+    /// Execute the SPI plan with bound parameters. `max_rows` of
+    /// `0` means "no limit" (PG's `SPI_execute_plan` uses
+    /// `tcount = 0` for unbounded).
+    ///
+    /// Parameter format is taken from the portal's
+    /// `parameter_format`; per-parameter format can vary if the
+    /// Bind sent `parameter_format_codes` of length > 1, which
+    /// pgwire stores as `Format::Individual(Vec<i16>)`. Result
+    /// format is taken from the portal's `result_column_format`
+    /// and honoured per-column — see the module docs.
+    fn execute(
+        &self,
+        parameters: &[Option<Bytes>],
+        parameter_format: &Format,
+        result_format: &Format,
+        max_rows: usize,
+    ) -> PgWireResult<Response> {
+        execute_impl(self, parameters, parameter_format, result_format, max_rows)
+    }
+}
+
+/// Free-function body for [`SpiBackendPlan::execute`]; pulled out
+/// of the trait method so the with_spi closure has the inner
+/// borrows we want without fighting `&self` lifetimes.
+fn execute_impl(
+    backend: &SpiBackendPlan,
     parameters: &[Option<Bytes>],
     parameter_format: &Format,
     result_format: &Format,
     max_rows: usize,
 ) -> PgWireResult<Response> {
-    if parameters.len() != prepared.param_types.len() {
+    if parameters.len() != backend.param_oids.len() {
         return Err(generic_error(
             "pg_transport extended",
             &format!(
                 "bind parameter count mismatch: got {}, expected {}",
                 parameters.len(),
-                prepared.param_types.len()
+                backend.param_oids.len()
             ),
         ));
     }
 
-    let plan_ptr = prepared.plan.as_ptr();
-    let base_schema = prepared.result_schema.clone();
+    let plan_ptr = backend.plan.as_ptr();
+    let base_schema = &backend.base_schema;
     let ncols = base_schema.len();
     let result_format_per_col: Vec<FieldFormat> =
         (0..ncols).map(|i| result_format.format_for(i)).collect();
@@ -312,15 +344,8 @@ pub fn execute(
             )
         })
         .collect();
-    let column_oids: Vec<pg_sys::Oid> = base_schema
-        .iter()
-        .map(|fi| pg_sys::Oid::from(fi.datatype().oid()))
-        .collect();
-    let param_oids: Vec<pg_sys::Oid> = prepared
-        .param_types
-        .iter()
-        .map(|t| pg_sys::Oid::from(t.oid()))
-        .collect();
+    let column_oids = &backend.column_oids;
+    let param_oids = &backend.param_oids;
     let param_bytes: Vec<Option<Bytes>> = parameters.to_vec();
     let param_is_binary: Vec<bool> = (0..parameters.len())
         .map(|i| parameter_format.is_binary(i))
@@ -330,7 +355,7 @@ pub fn execute(
         // Decode params into the SPI-shaped (values, nulls) pair.
         // Per-type input/receive helpers raise PG ERROR on
         // malformed bytes; with_spi catches that.
-        let (mut values, nulls) = decode_parameters(&param_bytes, &param_oids, &param_is_binary)?;
+        let (mut values, nulls) = decode_parameters(&param_bytes, param_oids, &param_is_binary)?;
 
         // SAFETY: inside SPI; SPI_execute_plan is the documented
         // executor for SPI_prepare'd plans. Negative rc → error.
