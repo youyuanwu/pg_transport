@@ -16,3 +16,4 @@ pub mod pool;
 pub mod slot;
 pub mod spi;
 pub mod spi_bridge;
+pub mod tuplestore;
