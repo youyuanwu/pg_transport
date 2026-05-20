@@ -4,19 +4,21 @@
 > Sibling: [backend-handoff.md](backend-handoff.md) · [frontend-handoff.md](frontend-handoff.md) · [api.md](api.md)
 
 This doc describes the **wire layer** that runs on a fd handed to a
-backend slot by the frontend. The slot runner ([backend-handoff.md](backend-handoff.md))
-owns the fd, the slot lifecycle, and the per-handoff reset; the wire
-layer owns *everything that happens on the byte stream*: TLS
-negotiation, FE/BE v3 startup, authentication, the FE message loop,
-cancel coordination, error reporting, parameter-status emission.
+backend slot by the frontend. The slot runner
+([backend-handoff.md](backend-handoff.md)) owns the fd and the
+per-handoff lifecycle; the wire layer owns *everything that happens
+on the byte stream*: TLS negotiation, FE/BE v3 startup,
+authentication, the FE message loop, cancel coordination, error
+reporting, parameter-status emission.
 
-**`pg_transport` does *not* reuse PG's C-side wire code.** No
-`ProcessStartupPacket`, no `ClientAuthentication`, no
-`secure_open_server`, no `PostgresMain` (extracted or otherwise), no
-`pq_getbyte` / `pq_putmessage`. The wire layer is a Rust-native
-implementation. It still runs *inside* a PG backend bgworker — so it
-can call `SPI_execute` and friends to actually run SQL — but the bytes
-on the socket are ours from accept-after-handoff to disconnect.
+The wire layer is a Rust-native implementation. For why we cannot
+reuse PG's `PostgresMain` / `ProcessStartupPacket` /
+`ClientAuthentication` / `secure_open_server` /
+`pq_getbyte` / `pq_putmessage`, see
+[architecture.md §2](architecture.md#2-why-pg_transport-owns-the-wire-layer).
+The wire layer still runs *inside* a PG backend bgworker, so it can
+call `SPI_execute` and friends — but the bytes on the socket are
+ours from accept-after-handoff to disconnect.
 
 | Layer (BE side)              | Doc                                  |
 | ---------------------------- | ------------------------------------ |
@@ -28,38 +30,31 @@ on the socket are ours from accept-after-handoff to disconnect.
 
 ## 1. The `Wire` trait
 
+**Live source:** [crates/core/src/wire/mod.rs](../../crates/core/src/wire/mod.rs).
+The trait shape:
+
 ```rust
-// crates/core/src/wire/mod.rs
-use std::os::fd::OwnedFd;
-
-/// Pluggable wire-protocol implementation. The slot runner instantiates
-/// one of these per handoff, drives it to completion, then discards it
-/// before the per-handoff reset.
 pub trait Wire {
-    /// Stable identifier (e.g. "pgwire-v3", "pgwire-v4-future").
     fn name() -> &'static str where Self: Sized;
-
-    /// Run the wire on `fd` until the client disconnects, the wire
-    /// returns a fatal error, or `ctx.shutdown` fires.
-    ///
-    /// `ctx` exposes the slot runner's services: per-session SPI
-    /// connection, shutdown token, framework-side auth lookup, etc.
     fn run(fd: OwnedFd, ctx: WireCtx) -> anyhow::Result<()>;
 }
-
-pub struct WireCtx { /* opaque; see §7 */ }
 ```
 
-In v0 there is **one** implementation, `pgwire_v3::PgwireV3`. The trait
-exists so that v0.x can add `pgwire-v4` when PG ships one without
-touching the slot runner, and so the deferred shm_mq path
+The `WireCtx` bundles the per-bgworker tokio runtime (`Rc<Runtime>`,
+built once at slot startup, reused across handoffs) and the optional
+`Arc<TlsAcceptor>`. Per-handoff reset bookkeeping (prepared
+statements, portals) was added in phase 9.
+
+In v0 there is **one** implementation, `pgwire_v3::PgwireV3`. The
+trait exists so that v0.x can add `pgwire-v4` when PG ships one
+without touching the slot runner, and so the deferred shm_mq path
 ([deferred/backend-pool.md](deferred/backend-pool.md)) can eventually
 offer wire-shaped surfaces too.
 
-There is no `Box<dyn Wire>`. The slot runner is generic over `W: Wire`
-because (a) we know the wire at compile time per build, (b) one slot
-runs one wire kind for its lifetime, and (c) avoiding the vtable saves
-no work but does simplify the type signatures.
+There is no `Box<dyn Wire>`. The slot runner picks a concrete wire
+at compile time — one slot runs one wire kind for its lifetime, and
+avoiding the vtable simplifies the type signatures without changing
+behaviour.
 
 ---
 
@@ -103,7 +98,8 @@ acceptable because v0's wire scope (FE/BE v3 server) is exactly what
 
 ## 3. Startup negotiation
 
-The fd we receive may carry, as its first 8 bytes:
+**Live source:** [crates/core/src/wire/pgwire_v3.rs](../../crates/core/src/wire/pgwire_v3.rs)
+(`on_startup`). The fd we receive may carry, as its first 8 bytes:
 
 | Probe              | Reply                                                              |
 | ------------------ | ------------------------------------------------------------------ |
@@ -155,6 +151,13 @@ clients have well-defined handling for this kind of rejection.
 ---
 
 ## 4. Authentication
+
+**Live source:** [crates/core/src/wire/auth/](../../crates/core/src/wire/auth/)
+— [`hba.rs`](../../crates/core/src/wire/auth/hba.rs) wraps
+`hba_getauthmethod`, [`scram.rs`](../../crates/core/src/wire/auth/scram.rs)
+implements SCRAM-SHA-256 via the `pgwire` crate's SCRAM helpers,
+[`verifier.rs`](../../crates/core/src/wire/auth/verifier.rs) reads
+`pg_authid.rolpassword` via SPI.
 
 Two mutually exclusive sources, selected by GUC `pg_transport.auth_source`.
 The GUC has **no default**: an unset value is a startup error
@@ -220,30 +223,37 @@ wire briefly during the SCRAM exchange or `password` auth.
 
 ## 5. TLS
 
-**Default: `rust-openssl` ([`openssl`](https://crates.io/crates/openssl)
-crate + [`tokio-openssl`](https://crates.io/crates/tokio-openssl)).** We
-link against the same OpenSSL the rest of the PG cluster does, so
-distro-managed FIPS modes, OS trust stores, and OpenSSL config files
-keep applying.
+**Live source:** [crates/core/src/wire/tls.rs](../../crates/core/src/wire/tls.rs)
+(`build` returns `Option<Arc<TlsAcceptor>>` for the slot).
+
+**Library: rustls** via [`tokio_rustls`](https://crates.io/crates/tokio-rustls)
+with the `ring` crypto provider (re-resolved as Q26;
+[`_PG_init`](../../crates/core/src/lib.rs) installs the provider
+process-wide). pgwire 0.40's `process_socket` takes a
+`tokio_rustls::TlsAcceptor` and has no plug-in point for a different
+TLS backend, which forced the switch from rust-openssl. Cost: TLS
+material lives in our own GUCs rather than inheriting the cluster's
+`ssl_*`; FIPS via the `aws-lc-rs` provider is a one-feature-flag
+swap later if needed.
 
 | GUC                          | Purpose                                                        | Default               |
 | ---------------------------- | -------------------------------------------------------------- | --------------------- |
-| `pg_transport.tls_cert_file` | Server certificate path                                        | reuse `ssl_cert_file` |
-| `pg_transport.tls_key_file`  | Server private-key path                                        | reuse `ssl_key_file`  |
-| `pg_transport.tls_ca_file`   | Trust roots for client-cert verification (if mTLS configured)  | reuse `ssl_ca_file`   |
-| `pg_transport.tls_min_proto` | Minimum TLS version (`TLSv1.2` / `TLSv1.3`)                    | `TLSv1.2`             |
+| `pg_transport.tls_cert_file` | Server certificate path (PEM)                                  | empty (TLS disabled)  |
+| `pg_transport.tls_key_file`  | Server private-key path (PEM, PKCS#8)                          | empty (TLS disabled)  |
 
-Reuse of cluster `ssl_*` GUCs is via *default expansion*, not via a
-runtime fallthrough: at frontend startup, if `pg_transport.tls_cert_file`
-is empty we resolve it once to the cluster's `ssl_cert_file` and
-remember the result.
+Both GUCs must be set together; setting only one FATALs at slot
+boot. Inheriting the cluster `ssl_cert_file` / `ssl_key_file` /
+`ssl_ca_file` as defaults is a planned ergonomics improvement; not
+implemented in v0.
 
-The wire layer wraps the raw fd in an `SslStream` via
-`tokio_openssl::accept`, runs the handshake on the slot's
-single-threaded tokio runtime (see
+The slot builds the `TlsAcceptor` once at startup (cert/key load
+cost off the handoff hot path) and stores `Arc<TlsAcceptor>` in
+`WireCtx`. For each connection, pgwire wraps the raw fd via
+`tokio_rustls::TlsAcceptor::accept`, runs the handshake on the
+slot's single-threaded tokio runtime (see
 [backend-handoff.md §3](backend-handoff.md) for the runtime's shape
 and rationale), and from then on reads/writes plaintext through the
-SSL adapter. `pgwire` only sees the plaintext side.
+TLS adapter. `pgwire` only sees the plaintext side.
 
 **Per-listener cert variation**: deferred. v0 uses one cert per
 cluster. `HandoffHints` already carries `tls_allowed` (yes/no); a
@@ -251,20 +261,27 @@ later phase can extend it to `cert_id` for per-listener routing.
 
 **`pg_stat_ssl` population**: **deferred from v0.** PG populates
 `pg_stat_ssl` from inside `be-secure-openssl.c`; since we route TLS
-through rust-openssl in the wire layer, we no longer feed it. v0
-accepts the gap — SSL observability comes from operating-system tools
-(`ss -tlnp`, OpenSSL logs) or from clients (`\conninfo` in `psql`, the
-libpq `PQsslAttribute` API). When demand surfaces, the natural fix
-is a framework view `pg_transport.stat_ssl` populated by the wire
-layer; the secondary fix is a hook into `pg_stat_ssl` itself. Neither
-blocks v0.
+through rustls in the wire layer, we no longer feed it. v0 accepts
+the gap — SSL observability comes from operating-system tools
+(`ss -tlnp`) or from clients (`\conninfo` in `psql`, the libpq
+`PQsslAttribute` API). When demand surfaces, the natural fix is a
+framework view `pg_transport.stat_ssl` populated by the wire layer.
 
 ---
 
 ## 6. SPI bridge
 
-Once the wire layer has a parsed FE message (`Q`, `P`, `B`, `E`, …) it
-calls into `crates/core/src/backend/spi_bridge.rs`. The bridge:
+**Live source:** [crates/core/src/backend/spi.rs](../../crates/core/src/backend/spi.rs)
+(safe Rust wrappers — `with_spi`, `SpiCtx`, `SpiPlan`, `SpiTuples`,
+`TypeInput`/`TypeOutput`/`TypeReceive`/`TypeSend`) sits between the
+FE/BE handlers and PG's `SPI_*` C surface.
+[crates/core/src/backend/spi_bridge.rs](../../crates/core/src/backend/spi_bridge.rs)
+is the simple-query (`'Q'`) handler;
+[crates/core/src/backend/extended.rs](../../crates/core/src/backend/extended.rs)
+is the extended-query (`P`/`B`/`D`/`E`/`S`) handler.
+
+Once the wire layer has a parsed FE message (`Q`, `P`, `B`, `E`, …)
+it calls into the bridge. The bridge:
 
 - For `Query` (`'Q'`): `SPI_connect` → `SPI_execute` → walk result
   tuples → emit `RowDescription` + `DataRow…` + `CommandComplete` +
@@ -292,7 +309,74 @@ numbers (roadmap phase 5) tell us whether SPI overhead is material
 for typical workloads, a follow-up ADR may add a "lower-level" mode
 that calls `pg_plan_query` + `CreatePortal` + `PortalDefineQuery` +
 `PortalStart` + `PortalRun` + `PortalDrop` directly. v0 commits to
-SPI; see [roadmap.md §2 Q18](roadmap.md#2-open-questions).
+SPI; see [roadmap.md §2 Q18](roadmap.md#2-open-questions). The
+full option survey (what `postgres.c` dispatchers are / aren't
+callable, what *is* exported, three reuse strategies, phased
+adoption plan) lives in
+[deferred/planner-executor-direct-path.md](deferred/planner-executor-direct-path.md).
+
+### 6.1 Routing `BEGIN` / `COMMIT` / `ROLLBACK` around SPI
+
+SPI in its default ("atomic") mode rejects `TransactionStmt` nodes
+with `ERRCODE_INVALID_TRANSACTION_TERMINATION` ("invalid
+transaction termination"). The check lives in
+[`src/backend/executor/spi.c`](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/executor/spi.c):
+
+```c
+if (IsA(stmt, TransactionStmt))
+{
+    if (context != PROCESS_UTILITY_QUERY_NONATOMIC)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_TRANSACTION_TERMINATION),
+                 errmsg("invalid transaction termination")));
+}
+```
+
+The rejection is a *safety* mechanism, not a missing feature. SPI is
+recursive-SQL-from-C: the typical caller (PL/pgSQL function,
+extension code, our bridge) is itself inside a transaction owned by
+someone *above* it on the call stack, and that someone expects the
+xact to still exist when the SPI call returns. Letting the inner
+SQL `COMMIT` would commit the *caller's* transaction; the caller
+would then try to keep using its now-defunct `CurrentTransactionState`
+— use-after-free at the executor level.
+
+PG 11 added a non-atomic mode (`SPI_OPT_NONATOMIC`) specifically for
+procedures (`CREATE PROCEDURE` / `CALL myproc()`), where the
+immediate caller (`exec_simple_query` running `CALL`) *does* know
+how to recover when the procedure commits underneath it.
+
+We don't use non-atomic mode in pg_transport for two reasons:
+
+1. **Our xact wrapper owns the bracket.** [`spi::with_spi`](../../crates/core/src/backend/spi.rs)
+   opens the xact, runs the closure, commits. A `COMMIT` inside the
+   closure would leave `CommitTransactionCommand` asserting on
+   already-closed state.
+2. **A simpler alternative exists, matching what PG itself does.**
+   PG's `exec_simple_query` doesn't go through SPI at all — it
+   routes `TransactionStmt` parse nodes through `PortalRun` →
+   `ProcessUtility` → `standard_ProcessUtility`, which calls
+   `BeginTransactionBlock` / `EndTransactionBlock` /
+   `UserAbortTransactionBlock` directly on the TBLOCK state machine.
+
+We mirror that shape. [`parse_and_classify`](../../crates/core/src/backend/spi_bridge.rs)
+in the simple-query bridge runs `raw_parser` once over the `'Q'`
+message and tags any `TransactionStmt` nodes it finds. Tagged
+statements skip SPI entirely and route through
+[`handle_xact_control`](../../crates/core/src/backend/spi_bridge.rs),
+which calls `BeginTransactionBlock` /
+`EndTransactionBlock(false)` / `UserAbortTransactionBlock(false)`
+directly inside `catch_unwind` for PG-ERROR recovery. Everything
+else (DML, DDL, `SET`, `LISTEN`, ...) goes through SPI as normal.
+
+The extended-query bridge ([`extended.rs`](../../crates/core/src/backend/extended.rs))
+doesn't need this dance — tokio-postgres / pgbench-prepared / psql
+`\bind` never send `BEGIN` through `Parse` (they always use the
+simple-query path for xact-control), so the question doesn't come
+up at Parse time. If a `TransactionStmt` *did* arrive on the
+extended path, `SPI_prepare` would reject it with the same
+`ERRCODE_INVALID_TRANSACTION_TERMINATION` and the wire-layer error
+translation would surface a clean DbError to the client.
 
 ---
 

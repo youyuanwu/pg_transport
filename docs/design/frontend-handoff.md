@@ -7,34 +7,29 @@ This doc describes the **FE (transport / frontend / IPC) side** of
 `pg_transport`'s v0 fd-pass path: when this path applies, how each
 backend slot's per-slot control socket is set up and torn down, the
 end-to-end per-connection sequence, and the performance / comparison
-story at the dispatch-model level. Its BE companions:
-
-| Doc                                          | What it owns                                      |
-| -------------------------------------------- | ------------------------------------------------- |
-| [backend-handoff.md](backend-handoff.md)     | Slot runner (socket layer): fd receipt, slot lifecycle, per-handoff reset |
-| [backend-wire.md](backend-wire.md)           | Wire layer: TLS, auth, FE/BE v3 protocol, SPI bridge — implemented in Rust, *not* using PG's `ProcessStartupPacket` / `ClientAuthentication` / `secure_open_server` / `PostgresMain` |
+story at the dispatch-model level. BE companions:
+[backend-handoff.md](backend-handoff.md) (slot runner / socket layer)
+and [backend-wire.md](backend-wire.md) (TLS, auth, FE/BE v3, SPI bridge).
 
 A transport that holds an `OwnedFd` for a kernel socket (TCP, UDS,
 future io_uring-backed sockets) hands the fd over to a backend
 bgworker and steps out entirely. The backend's slot runner takes
 ownership of the fd and hands it to its wire layer, which speaks
-FE/BE v3 to the client directly (via the [`pgwire`](https://github.com/sunng87/pgwire)
-crate, see [backend-wire.md](backend-wire.md)) and translates SQL into
-`SPI_*` calls.
+FE/BE v3 to the client directly.
 
 In v0 this is the **only** path. A second path — the shm_mq-based
 *general path* for transports that need plaintext inspection, run
 non-FE/BE wires (HTTP/2 + SQL, custom binary), or have no shareable
-kernel fd (QUIC, DPDK) — is sketched in [backend-pool.md](deferred/backend-pool.md)
-but **deferred**.
+kernel fd (QUIC, DPDK) — is sketched in
+[deferred/backend-pool.md](deferred/backend-pool.md) but **deferred**.
 
-The dispatch model is conceptually identical to default PostgreSQL:
-postmaster `accept()`s, hands the fd to a child via `fork`, and the
-child runs the backend. We replace `fork` with `SCM_RIGHTS` over a
-Unix control socket, and we replace "freshly forked backend" with
-"pre-spawned bgworker pool member". What runs on the fd, however, is
-our wire layer — not unchanged PG code. See
-[backend-wire.md §9](backend-wire.md) for the per-stage comparison.
+**Dispatch model**: conceptually identical to default PostgreSQL
+(postmaster `accept()`s, hands the fd to a child, child runs the
+backend). We replace `fork` with `SCM_RIGHTS` over a Unix control
+socket, and "freshly forked backend" with "pre-spawned bgworker pool
+member". What runs on the fd is our wire layer, not unchanged PG code
+— see [architecture.md §2](architecture.md#2-why-pg_transport-owns-the-wire-layer)
+for why. Per-stage comparison: [backend-wire.md §9](backend-wire.md).
 
 ---
 
@@ -43,27 +38,10 @@ our wire layer — not unchanged PG code. See
 In v0: **always**. The single v0 transport (`tcp_handoff`) has a
 kernel fd and speaks FE/BE v3, so it hands off. Future fd-producing
 transports (deferred `uds_handoff`, io_uring variants, …) will use
-the same path.
-
-The table below records which future transport scenarios fit this path
-versus the deferred general path. "shm_mq" rows are reachable only once
-that path lands:
-
-| Transport scenario                                | Path             |
-| ------------------------------------------------- | ---------------- |
-| TCP + FE/BE v3 (no transport-side processing)     | **handoff** (v0) |
-| UDS + FE/BE v3                                    | **handoff** (v0) |
-| TCP + FE/BE v3 + TLS                              | **handoff** (v0; backend terminates TLS) |
-| io_uring-backed TCP + FE/BE v3                    | **handoff** (fd is a regular socket) |
-| TCP + FE/BE + transport-side per-message logic    | shm_mq (deferred)|
-| HTTP/2 + JSON ↔ SQL adapter                       | shm_mq (deferred)|
-| QUIC + FE/BE                                      | shm_mq (deferred)|
-| DPDK / AF_XDP                                     | shm_mq (deferred; no kernel fd) |
-| Shared-memory loopback                            | shm_mq (deferred)|
-
-The decision rule, once the general path lands: **if you have a kernel
-fd and the wire is FE/BE, use handoff; otherwise use shm_mq.** For v0,
-everything is handoff by construction.
+the same path. The decision rule, once the deferred general path
+lands: **if you have a kernel fd and the wire is FE/BE, use handoff;
+otherwise use shm_mq.** A full scenarios table is in
+[deferred/backend-pool.md](deferred/backend-pool.md).
 
 ---
 

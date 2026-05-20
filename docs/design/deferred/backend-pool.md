@@ -43,6 +43,59 @@ serve multiple sessions sequentially over its lifetime.
 
 ---
 
+## 0. Trait surface (`SessionTransport` + `SessionHandle`)
+
+The second transport trait that sits alongside [`HandoffTransport`](../api.md):
+
+```rust
+// crates/api/src/transport.rs  (planned, not in v0)
+pub trait SessionTransport: 'static {
+    fn name(&self) -> &'static str;
+    fn run(
+        self: Box<Self>,
+        handle: SessionHandle,
+        shutdown: ShutdownToken,
+    ) -> RunFuture;                       // same alias as HandoffTransport
+}
+
+pub type SessionFactory = fn(cfg: &Config) -> anyhow::Result<Box<dyn SessionTransport>>;
+```
+
+`SessionHandle` exposes two methods:
+
+- `execute(opts, payload)` — stateless one-shot; the slot is acquired
+  internally, the payload runs, the slot returns to the pool when
+  the `FrameStream` ends.
+- `acquire(opts).submit(payload)` — stateful multi-submit session;
+  the slot is pinned to the caller until `acquire`'s guard is dropped.
+
+Both route payloads through the backend pool's `req_q` / `resp_q`
+`shm_mq`s (§2 below) and surface responses as a `FrameStream`. The
+`Payload` enum (`Raw` / `Sql` / `Extended` — `#[non_exhaustive]`, so
+additions like `CopyIn` / `CopyOut` stay non-breaking; see
+[roadmap.md Q11](../roadmap.md#22-still-open--deferred-only)) lives
+in the api crate alongside the trait.
+
+### Why two traits rather than one generic `Transport<H>`
+
+- **Object safety drops out for free.** `Box<dyn HandoffTransport>`
+  and `Box<dyn SessionTransport>` are straightforward;
+  `Box<dyn Transport<H>>` needs the generic parameter spelled out at
+  every storage site.
+- **Two clearly-typed registry maps** beat one type-erased map with
+  `Any`-based dispatch.
+- **Error messages are clearer**: "`TcpHandoff` does not implement
+  `HandoffTransport`" is more direct than "`TcpHandoff` does not
+  implement `Transport<HandoffHandle>`".
+- **Mixed-mode transports are rare**, and a transport that genuinely
+  needs both can implement both traits.
+
+Naming the v0 trait `HandoffTransport` (rather than just `Transport`)
+from day one keeps the v0 → v0.x rename-free — when the second trait
+lands, no existing transport changes shape.
+
+---
+
 ## 1. Anatomy of a backend slot
 
 The pool consists of N slots, where N = `pg_transport.backend_pool_size`

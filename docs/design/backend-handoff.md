@@ -59,63 +59,39 @@ rejected lazy path are in
 
 ### What `_PG_init()` does
 
-```rust
-// crates/core/src/lib.rs (sketch)
-#[pg_guard]
-pub extern "C" fn _PG_init() {
-    // Refuse to proceed when not in shared_preload_libraries: in that
-    // case _PG_init runs in a regular backend, not the postmaster, and
-    // RegisterBackgroundWorker is illegal.
-    if !pg_sys::process_shared_preload_libraries_in_progress {
-        ereport!(FATAL, "pg_transport must be in shared_preload_libraries");
-    }
+**Live source:** [crates/core/src/lib.rs](../../crates/core/src/lib.rs).
+The sequence:
 
-    register_gucs();   // pg_transport.backend_pool_size, .auth_source, …
-
-    // Validate required GUCs at postmaster start, BEFORE any tokio
-    // runtime or bgworker resources are allocated. A missing
-    // pg_transport.auth_source is an operator error we surface
-    // immediately rather than letting it FATAL inside a slot bgworker
-    // (which would degrade the pool silently). See configuration.md
-    // and Q4's resolution in roadmap.md.
-    guc::auth_source().unwrap_or_else(|| ereport!(
-        FATAL,
-        "pg_transport.auth_source must be set to 'pg_hba' or 'pg_transport'"
-    ));
-
-    let pool_size = guc::backend_pool_size();   // default max(4, num_cpus)
-    for slot_id in 0..pool_size {
-        BackgroundWorkerBuilder::new(&format!("pg_transport slot {slot_id}"))
-            .set_type("pg_transport_slot")
-            .set_library("pg_transport")
-            .set_function("pg_transport_slot_main")
-            .set_argument(Some((slot_id as i32).into()))
-            .set_start_time(BgWorkerStartTime::RecoveryFinished)
-            .set_restart_time(Some(Duration::from_secs(1)))
-            .enable_shmem_access(None)
-            .load();   // ← static; calls RegisterBackgroundWorker under the hood
-    }
-
-    // The frontend bgworker (Q22 → option (a) in roadmap.md §2.3).
-    // Registered statically here so the operational story is "set
-    // shared_preload_libraries and restart"; pg_transport.start() is
-    // a listener-set operation, not a process-spawn operation.
-    BackgroundWorkerBuilder::new("pg_transport frontend")
-        .set_type("pg_transport_frontend")
-        .set_library("pg_transport")
-        .set_function("pg_transport_frontend_main")
-        .set_start_time(BgWorkerStartTime::RecoveryFinished)
-        .set_restart_time(Some(Duration::from_secs(1)))
-        .enable_shmem_access(None)
-        .load();
-}
-```
+1. Refuse to proceed if `process_shared_preload_libraries_in_progress`
+   is false — FATAL with `ERRCODE_CONFIG_FILE_ERROR` and a clear
+   `"set shared_preload_libraries = 'pg_transport'"` hint.
+2. `guc::register()` + `guc::validate_required()` — register the
+   four phase-9 GUCs (`backend_pool_size`, `auth_source`,
+   `tls_cert_file`, `tls_key_file`) and FATAL immediately if
+   required ones are unset or invalid. See
+   [crates/core/src/guc.rs](../../crates/core/src/guc.rs).
+3. Install the rustls `ring` crypto provider process-wide (phase 8
+   requirement; idempotent).
+4. Register the frontend bgworker statically (Q22 → option (a) in
+   [roadmap.md §2.3](roadmap.md#23-resolved)) with
+   `bgw_restart_time = 1s`.
+5. Register `pg_transport.backend_pool_size` slot bgworkers, each
+   with `bgw_main_arg = slot_id`, `enable_spi_access()`, and a 1 s
+   restart policy.
 
 Once `PostmasterMain` finishes recovery, the postmaster spawns all
 `pool_size` slot workers (each running `pg_transport_slot_main(slot_id)`,
-the entry point for the slot runner loop in §2 below) plus the single
-frontend worker (running `pg_transport_frontend_main`, the entry point
-in [architecture.md §2](architecture.md#2-runtime-integration-tokio--pgrx--pg-signals)).
+the entry point for the slot runner loop in §2 below) plus the
+single frontend worker (running `pg_transport_frontend_main`, see
+[crates/core/src/frontend.rs](../../crates/core/src/frontend.rs)).
+
+**Capacity note.** pgrx's `.load()` wraps `RegisterBackgroundWorker`,
+which silently fails when the postmaster's bgworker table is full
+(bounded by `max_worker_processes`, PG default = 8). Footprint is
+1 FE + `backend_pool_size` slots + PG's own bgworkers. For
+`backend_pool_size > ~6` the operator must bump
+`max_worker_processes`; the `just/{e2e,bench}.just` recipes do this
+automatically.
 
 ### Why static (not `load_dynamic()`)
 
@@ -144,47 +120,36 @@ bench harness.
   entry point (see [§3 Async / threading model](#3-async--threading-model)
   for slots; [architecture.md §2](architecture.md#2-runtime-integration-tokio--pgrx--pg-signals)
   for the frontend).
-- It does not bind any sockets or read the catalog. All of that is
-  deferred to the frontend bgworker, which lazily binds on
-  `pg_transport.start()` (see [Q22 in roadmap.md §2.3](roadmap.md#23-resolved)).
+- It does not bind any sockets or read the catalog. The frontend
+  bgworker binds its listener at boot (currently hard-coded; the
+  planned `pg_transport.start()` / catalog surface in
+  [configuration.md §1.3](configuration.md#13-planned-catalog-surface)
+  will move this under SQL control).
 
 ---
 
 ## 2. The slot runner loop
 
-```rust
-// crates/core/src/backend/slot.rs (sketch; pgrx + raw pg_sys + our wire trait)
+**Live source:** [crates/core/src/backend/slot.rs](../../crates/core/src/backend/slot.rs).
+The entry point (`pg_transport_slot_main`) is a C-ABI function
+registered in `_PG_init()`; pgrx wraps it with `#[pg_guard]` so any
+uncaught panic surfaces as a PG ereport at the boundary. The slot's
+lifetime:
 
-fn run_slot<W: Wire>(slot: SlotCtx) -> anyhow::Result<()> {
-    loop {
-        // Block on the per-slot UDS control socket; receive one
-        // (fd, HandoffHints) per iteration.
-        let (fd, hints) = match slot.unix_ctrl.recvmsg() {
-            Ok(msg)               => decode_handoff(msg)?,
-            Err(EofOrShutdown)    => return Ok(()),
-        };
-
-        // the wire-layer ctx for this handoff; bundles slot.shutdown,
-        // the SPI bridge handle, hints.tls_allowed, etc.
-        let ctx = WireCtx::new(&slot, hints);
-
-        // Hand the fd to the wire layer and let it run until the client
-        // disconnects (or the wire itself errors fatally, or shutdown).
-        // We don't see any protocol bytes; the wire owns them.
-        let outcome = W::run(fd, ctx);
-
-        // Per-handoff reset, regardless of how the wire returned.
-        // Drops the wire's per-session state and any SPI artefacts
-        // the wire created (prepared statements, portals, temp tables,
-        // GUCs touched via SET).
-        reset_per_handoff_state();
-
-        // Log fatal wire errors; non-fatal ones are part of normal
-        // disconnects and don't need attention.
-        if let Err(e) = outcome { tracing::warn!(?e, "wire run failed"); }
-    }
-}
-```
+1. `attach_signal_handlers(SIGHUP | SIGTERM)` and
+   `connect_worker_to_spi("postgres", None)` — standard pgrx
+   bgworker setup.
+2. `connect_with_retry()` to the per-slot UDS listener the FE
+   created (10 s budget over 100 × 100 ms retries to tolerate the
+   FE ↔ slot startup race).
+3. Build the per-bgworker tokio current-thread runtime *once* and
+   keep it across handoffs (Q9-era decision; not rebuilt per
+   handoff). Build the `TlsAcceptor` once from the TLS GUCs.
+4. Loop: `BackgroundWorker::sigterm_received()` quick-check, then
+   blocking `fd_pass::recv_fd()`. On `Ok(Some(fd))`, build a
+   `WireCtx` and call `PgwireV3::run(fd, ctx)`; log warnings on
+   `Err`; on `Ok(None)` (clean EOF from FE) exit cleanly. EINTR
+   loops back.
 
 The slot runner never:
 
@@ -197,12 +162,13 @@ The slot runner never:
 - Looks at FE/BE message types.
 
 Everything in that list is the wire layer's job. The slot runner is
-deliberately small: a `recvmsg` loop, a wire instantiation, a wire
-run, and a reset.
+deliberately small (~190 LOC including comments): a `recv_fd` loop, a
+wire run, and — once phase ≥ 9.5 lands the per-handoff reset — a
+reset step.
 
 > **Silent handoff loss — resolved as accept (option b).** If the
 > backend dies between the frontend's last observation and the
-> `recvmsg` above, the kernel buffers the SCM_RIGHTS payload but
+> `recv_fd` above, the kernel buffers the SCM_RIGHTS payload but
 > nobody consumes it — the current client connection is orphaned
 > (TCP RST). The dead slot is detected on the *next* `sendmsg →
 > EPIPE` and respawned then. No per-handoff ack; zero added cost on
@@ -234,13 +200,14 @@ backend bgworker process (single thread)
 
 ### Why tokio appears in the backend at all
 
-Forced by the choice in [backend-wire.md §2](backend-wire.md) to reuse
-the [`pgwire`](https://github.com/sunng87/pgwire) crate and
-`tokio-openssl` for TLS. Both expose `tokio::io::AsyncRead` /
-`AsyncWrite`-shaped APIs and `async fn` trait methods; running them
-needs an async executor. A hand-rolled sync wire (using `openssl`'s
-sync `SslStream` and our own FE/BE codec) would avoid tokio entirely
-on this side, at the cost of giving up pgwire's protocol code.
+Forced by the choice in [backend-wire.md §2](backend-wire.md) to
+reuse the [`pgwire`](https://github.com/sunng87/pgwire) crate and
+[`tokio_rustls`](https://crates.io/crates/tokio-rustls) for TLS
+(Q26). Both expose `tokio::io::AsyncRead` / `AsyncWrite`-shaped APIs
+and `async fn` trait methods; running them needs an async executor.
+A hand-rolled sync wire (using a sync TLS stream + our own FE/BE
+codec) would avoid tokio entirely on this side, at the cost of
+giving up pgwire's protocol code.
 
 ### What this runtime is *not*
 

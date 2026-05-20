@@ -67,15 +67,18 @@ and adds the next when its subsystem lands.
 ### 3.1 Unit (per-module, no PG)
 
 - `crates/api`: trait-level shape tests; no I/O.
-- `core::handoff::listener`: drive `run_handoff_loop` with a
-  fake `Stream<Item = io::Result<OwnedFd>>` + mock `HandoffHandle`.
-  Assert accept-error backoff and shutdown drain behaviour.
+- `core::handoff::tcp`: drive the inlined `select!`-on-shutdown +
+  `accept()`-and-handoff loop with a `TcpListener` bound to
+  `127.0.0.1:0` and a mock `HandoffSink`. Assert that shutdown
+  cancels promptly and that accept errors don't terminate the loop.
+  (Once a second handoff transport lands and the accept loop is
+  extracted into `handoff/listener.rs` per
+  [transports.md §2](transports.md), this becomes a generic test
+  driven by `Stream<Item = io::Result<OwnedFd>>`.)
 - `core::wire::pgwire_v3`: drive `Wire::run` with `socketpair()` fds
   loaded with recorded FE byte streams (captured via `psql` /
   tcpdump). Mock SPI bridge returns canned `SpiTupleTable`-shaped
   results. Mock HBA bridge returns canned rules.
-- `core::handoff::tcp`: trivial — verify `build()` parses
-  config and `run()` calls the listener-loop helper.
 
 ### 3.2 Integration (in-process PG via pgrx-tests)
 

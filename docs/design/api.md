@@ -38,40 +38,24 @@ In v0 there is **one** transport trait. It is intentionally named
 `HandoffTransport` (not just `Transport`) to leave room for the
 `SessionTransport` sibling sketched in §6.
 
-```rust
-// crates/api/src/transport.rs
-use std::future::Future;
-use std::pin::Pin;
-use crate::{Config, HandoffHandle, ShutdownToken};
+**Live source:** [crates/api/src/lib.rs](../../crates/api/src/lib.rs).
+The trait shape:
 
-/// Future returned by `HandoffTransport::run`. Boxed so the trait stays
-/// object-safe (we need `Box<dyn HandoffTransport>` for the registry).
-///
-/// Not `Send`-bound: the frontend runs a tokio current-thread runtime
-/// with `LocalSet`, so the future can hold `!Send` state across awaits
-/// (pgrx handles, `Rc<…>` for shared per-instance config, etc.).
+```rust
 pub type RunFuture = Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'static>>;
 
-/// For transports that hand kernel sockets to the backend pool.
-/// The handle exposes only `handoff` — no Payload, no Session,
-/// no FrameStream visible to the transport.
 pub trait HandoffTransport: 'static {
-    /// Stable identifier used in catalog config (e.g. "tcp_handoff").
     fn name(&self) -> &'static str;
-
-    /// Run until shutdown. Consumed because the framework spawns it once.
-    /// Implementers typically write `Box::pin(async move { … })`.
-    fn run(
-        self: Box<Self>,
-        handle: HandoffHandle,
-        shutdown: ShutdownToken,
-    ) -> RunFuture;
+    fn run(self: Box<Self>, handle: HandoffHandle, shutdown: ShutdownToken) -> RunFuture;
 }
 
-/// Transport factory. Each transport crate exports one `build` fn of
-/// this type and registers it (see [workspace.md](workspace.md)).
-pub type HandoffFactory = fn(cfg: &Config) -> anyhow::Result<Box<dyn HandoffTransport>>;
+pub type HandoffFactory = fn(cfg: &[u8]) -> anyhow::Result<Box<dyn HandoffTransport>>;
 ```
+
+The `RunFuture` is intentionally **not** `Send`-bound — the frontend
+runs a tokio current-thread runtime with `LocalSet`, so the future
+can hold `!Send` state across awaits (`Rc<…>`, raw fds via
+`OwnedFd`, etc.).
 
 Why manual `Pin<Box<dyn Future + '_>>` and not `#[async_trait]`:
 
@@ -102,32 +86,29 @@ Why the name `HandoffTransport` rather than just `Transport`:
 
 ## 2. `HandoffHandle` — the v0 handle type
 
+**Live source:** [crates/api/src/lib.rs](../../crates/api/src/lib.rs)
+(`HandoffHandle` + the framework-internal `HandoffSink` trait the
+pool implements). The transport-facing surface:
+
 ```rust
-// crates/api/src/handoff.rs
-use std::os::fd::OwnedFd;
-
-/// Handed to `HandoffTransport::run`. One method, deliberately.
-#[derive(Clone)]
-pub struct HandoffHandle { /* opaque */ }
-
 impl HandoffHandle {
-    /// Hand a kernel socket to a backend bgworker. The bgworker takes
-    /// ownership and runs FE/BE v3 (including TLS and auth) on it
-    /// directly. Returns when the client disconnects.
-    ///
-    /// Use this when the transport has an OwnedFd and the wire is FE/BE.
-    /// See [frontend-handoff.md](frontend-handoff.md) for the SCM_RIGHTS mechanism, the
-    /// per-slot control socket, and the backend-side TLS choices.
-    pub async fn handoff(&self, sock: OwnedFd) -> anyhow::Result<()>;
+    pub fn handoff(&self, fd: OwnedFd, hints: HandoffHints) -> anyhow::Result<()>;
 }
 ```
 
-Nothing else. No Payload, no SessionOpts, no FrameStream — the backend
-wire layer reads `StartupMessage` from the fd itself, so the framework
-doesn't need to pass database/user/auth metadata.
+No Payload, no SessionOpts, no FrameStream — the backend wire layer
+reads `StartupMessage` from the fd itself, so the framework doesn't
+need to pass database/user/auth metadata. The handle is cheaply
+cloneable (`Rc` internally) and `!Send` (the sink lives on the
+frontend's current-thread runtime).
+
+`HandoffHints` is a tiny per-handoff metadata block (currently
+`{ tls_allowed: bool }`); a `cert_id` field for per-listener TLS
+variation is deferred per Q13.
 
 For the implementation of `handoff` (`SCM_RIGHTS`, per-slot control
-socket, slot runner, wire layer), see [frontend-handoff.md](frontend-handoff.md),
+socket, slot runner, wire layer), see
+[frontend-handoff.md](frontend-handoff.md),
 [backend-handoff.md](backend-handoff.md), and
 [backend-wire.md](backend-wire.md).
 
@@ -147,140 +128,75 @@ socket, slot runner, wire layer), see [frontend-handoff.md](frontend-handoff.md)
 
 ## 3. The `ShutdownToken` contract
 
-```rust
-// crates/api/src/shutdown.rs
-#[derive(Clone)]
-pub struct ShutdownToken { /* opaque, wraps tokio_util::sync::CancellationToken */ }
+`ShutdownToken` is a type alias for
+[`tokio_util::sync::CancellationToken`](https://docs.rs/tokio-util/latest/tokio_util/sync/struct.CancellationToken.html)
+(see [crates/api/src/lib.rs](../../crates/api/src/lib.rs)). Cheap to
+clone; resolves when shutdown is requested (SIGTERM, postmaster
+death, catalog disable); cancel-safe; supports child tokens for
+per-connection sub-shutdown via `child_token()`.
 
-impl ShutdownToken {
-    /// Resolves when shutdown is requested (SIGTERM, postmaster death,
-    /// catalog disable). Cancel-safe.
-    pub async fn cancelled(&self);
-
-    /// Non-blocking check.
-    pub fn is_cancelled(&self) -> bool;
-
-    /// Child token: cancelled when the parent cancels, *also* cancellable
-    /// independently (e.g. for a per-connection sub-shutdown).
-    pub fn child(&self) -> ShutdownToken;
-}
-```
-
-A transport is expected to `tokio::select!` on `shutdown.cancelled()` in
-its accept loop. (There are no per-connection tasks to cancel under the
-v0 handoff model: once `handoff(fd)` returns, the frontend has no
-further role for that connection.)
+A transport is expected to `tokio::select!` on `shutdown.cancelled()`
+in its accept loop. (There are no per-connection tasks to cancel
+under the v0 handoff model: once `handoff(fd)` returns, the frontend
+has no further role for that connection.)
 
 ---
 
 ## 4. Example transport: `tcp_handoff`
 
-With the in-tree `handoff::listener` helper (see
-[transports.md §2.1](transports.md)), the body of `run` is six lines
-— build a listener, hand it to the shared loop:
+The single v0 transport. Implementation:
+[crates/core/src/handoff/tcp.rs](../../crates/core/src/handoff/tcp.rs).
+The whole accept body fits in ~30 lines — build a `TcpListener`,
+`select!` between `shutdown.cancelled()` and `listener.accept()`,
+convert each accepted `TcpStream` to `OwnedFd` and call
+`handle.handoff(fd, HandoffHints::no_tls())`. Trait surface:
 
 ```rust
-// crates/core/src/handoff/tcp.rs
-use crate::handoff::listener::{run_handoff_loop, tcp_incoming};
-
-pub struct TcpHandoff { cfg: TcpHandoffCfg }
-
-pub fn build(cfg: &Config) -> anyhow::Result<Box<dyn HandoffTransport>> {
-    Ok(Box::new(TcpHandoff { cfg: TcpHandoffCfg::from(cfg)? }))
-}
-
 impl HandoffTransport for TcpHandoff {
     fn name(&self) -> &'static str { "tcp_handoff" }
-
-    fn run(
-        self: Box<Self>,
-        handle: HandoffHandle,           // ← only `handoff` is reachable
-        shutdown: ShutdownToken,
-    ) -> RunFuture {
-        Box::pin(async move {
-            let listener = tokio::net::TcpListener::bind(&self.cfg.bind_addr).await?;
-            run_handoff_loop(tcp_incoming(listener), handle, shutdown).await
-        })
+    fn run(self: Box<Self>, handle: HandoffHandle, shutdown: ShutdownToken) -> RunFuture {
+        Box::pin(run_inner(*self, handle, shutdown))
     }
 }
 ```
 
-That's the entire transport. The only async tax is the
-`Box::pin(async move { … })` wrapper at the top of `run` (because the
-trait method returns a `Pin<Box<dyn Future>>` rather than using the
-`#[async_trait]` macro — see §1 and
-[roadmap.md §2 Q8](roadmap.md#2-open-questions)). The accept loop
-itself, including shutdown discipline and per-accept error logging,
-lives in `handoff::listener` and is shared across every fd-producing
-transport (today and future ones). No FE/BE parsing, no
-auth code, no TLS code, no per-conn state machine: the backend
-([backend-handoff.md](backend-handoff.md) slot runner +
-[backend-wire.md](backend-wire.md) wire layer) handles FE/BE v3 itself
-via the `pgwire` crate, terminates TLS via rust-openssl, runs auth
-against `pg_hba.conf` via `hba_getauthmethod`, and executes SQL via
-`SPI_*`.
+The only async tax is the `Box::pin(async move { … })` wrapper at the
+top of `run` (because the trait method returns a
+`Pin<Box<dyn Future>>` rather than using the `#[async_trait]` macro
+— see §1 and [roadmap.md §2 Q8](roadmap.md#2-open-questions)). No
+FE/BE parsing, no auth code, no TLS code, no per-conn state machine:
+the backend ([backend-handoff.md](backend-handoff.md) slot runner +
+[backend-wire.md](backend-wire.md) wire layer) handles FE/BE v3
+itself via the `pgwire` crate, terminates TLS via rust-openssl, runs
+auth against `pg_hba.conf` via `hba_getauthmethod`, and executes SQL
+via `SPI_*`.
 
 ---
 
 ## 5. Registry & wiring
 
-For how transports are registered at compile time and how the catalog
-binds names to factories, see [workspace.md §4](workspace.md#4-registry--how-transports-get-wired-in).
-
+For how transports are registered at compile time, see
+[workspace.md §4](workspace.md#4-registry--how-transports-get-wired-in).
 v0 has no Cargo features and exactly one registered transport
-(`tcp_handoff`); any other name in `pg_transport.transports` fails with
-a clear `"transport X is not present"` error at start-up. See
-[configuration.md](configuration.md) and
-[workspace.md §5](workspace.md#5-catalog--registry-interaction).
+(`tcp_handoff`), instantiated directly in
+[crates/core/src/frontend.rs](../../crates/core/src/frontend.rs); no
+catalog table exists yet. When the catalog surface lands (see
+[configuration.md §1.3](configuration.md#13-planned-catalog-surface)),
+unknown `kind` values will fail with a clear `"transport X is not
+present"` error.
 
 ---
 
-## 6. Deferred surface: `SessionTransport` (sketch)
+## 6. Deferred surface: `SessionTransport`
 
-> **Status: not implemented in v0.** This section captures the planned
-> shape so it can land without breaking the v0 surface. The full design
-> is in [backend-pool.md](deferred/backend-pool.md).
-
-A second trait is anticipated for transports whose wire is *not* FE/BE
-on a kernel socket (HTTP/2 + SQL, custom binary, future QUIC/DPDK) or
-that need to inspect plaintext FE/BE bytes before submission:
-
-```rust
-// crates/api/src/transport.rs  (planned, not in v0)
-pub trait SessionTransport: 'static {
-    fn name(&self) -> &'static str;
-    fn run(
-        self: Box<Self>,
-        handle: SessionHandle,
-        shutdown: ShutdownToken,
-    ) -> RunFuture;                       // same alias as HandoffTransport
-}
-
-pub type SessionFactory = fn(cfg: &Config) -> anyhow::Result<Box<dyn SessionTransport>>;
-```
-
-The handle exposes two methods — `execute(opts, payload)` for stateless
-one-shots and `acquire(opts)` for stateful multi-submit sessions — that
-route payloads through the backend pool's `shm_mq`s and surface
-responses as a `FrameStream`. The chooser table (when to use `execute`
-vs `acquire`), the `Payload` enum (`Raw` / `Sql` / `Extended`), and the
-`ExecutorSession` type all live in [backend-pool.md](deferred/backend-pool.md).
-
-Why two traits rather than one generic `Transport<H>` when the second
-lands:
-
-- **Object safety drops out for free.** `Box<dyn HandoffTransport>` and
-  `Box<dyn SessionTransport>` are straightforward; `Box<dyn Transport<H>>`
-  needs the generic parameter spelled out at every storage site.
-- **The registry is two clearly-typed maps**, not one type-erased map
-  with `Any`-based dispatch.
-- **Error messages are clearer**: "`TcpHandoff` does not implement
-  `HandoffTransport`" is more direct than
-  "`TcpHandoff` does not implement `Transport<HandoffHandle>`".
-- **Mixed-mode transports are rare**, and a transport that genuinely
-  needs both can implement both traits.
-
-Roadmap: see [roadmap.md §4 — Deferred for v0](roadmap.md).
+A second trait — for transports whose wire is *not* FE/BE on a
+kernel socket (HTTP/2 + SQL, custom binary, future QUIC/DPDK) or
+that need to inspect plaintext FE/BE bytes before submission — is
+**deferred**. Trait signature, rationale for keeping two traits
+(`HandoffTransport` + `SessionTransport`) rather than one generic
+`Transport<H>`, and full handle/`Payload`/`FrameStream` design live
+in [deferred/backend-pool.md §0](deferred/backend-pool.md#0-trait-surface-sessiontransport--sessionhandle).
+Roadmap entry: [roadmap.md §4](roadmap.md#4-deferred-for-v0).
 
 ---
 
@@ -292,5 +208,5 @@ Roadmap: see [roadmap.md §4 — Deferred for v0](roadmap.md).
   `HandoffHandle::handoff`.
 - [transports.md](transports.md) — which concrete transports implement
   the v0 trait.
-- [backend-pool.md](deferred/backend-pool.md) — *deferred* design for
-  `SessionHandle::execute` / `acquire` / `submit`.
+- [deferred/backend-pool.md](deferred/backend-pool.md) — *deferred*
+  design for `SessionHandle::execute` / `acquire` / `submit`.

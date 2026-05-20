@@ -5,22 +5,73 @@
 
 ## 1. Configuration model
 
-Borrowed from Omnigres: configuration is **catalog state**, modifiable from
-SQL, watched via cache-invalidation triggers (see the user-memory note on
-`CacheInvalidateRelcache*` for the trigger pattern).
+v0 ships **GUCs only**. The eventual model (borrowed from Omnigres)
+is catalog state modifiable from SQL and watched via cache-invalidation
+triggers; that surface is **not implemented yet** (see
+[§1.3 Planned catalog surface](#13-planned-catalog-surface) below for
+the sketch).
 
-### Catalog tables (schema `pg_transport`)
+### 1.1 GUCs (implemented)
+
+Defined in [crates/core/src/guc.rs](../../crates/core/src/guc.rs)
+and registered from `_PG_init()`
+([crates/core/src/lib.rs](../../crates/core/src/lib.rs)). All four
+are `PGC_POSTMASTER` — read once at boot; changing them requires a
+cluster restart.
+
+| GUC | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `pg_transport.backend_pool_size` | int (1–64) | `2` | Number of slot bgworkers `_PG_init()` registers. The design's eventual default is `max(4, num_cpus)`; the testing-friendly `2` lets `cargo pgrx test` run inside PG's default `max_worker_processes = 8`. See [backend-handoff.md §1](backend-handoff.md). |
+| `pg_transport.auth_source` | string | **required, no default** | `'pg_hba'` or `'pg_transport'`. Validated at `_PG_init()`; an unset/invalid value FATALs at cluster start so operators see the mistake at boot rather than via mid-flight slot deaths. See [backend-wire.md §4](backend-wire.md). |
+| `pg_transport.tls_cert_file` | string | empty | Path to the server TLS certificate (PEM). Empty disables TLS. See [backend-wire.md §5](backend-wire.md). |
+| `pg_transport.tls_key_file` | string | empty | Path to the server TLS private key (PEM, PKCS#8). Empty disables TLS. Setting only one of `tls_cert_file` / `tls_key_file` FATALs at slot boot. |
+
+GUCs the [original design](#13-planned-catalog-surface) reserved but
+that aren't registered yet — `pg_transport.socket_directory`,
+`pg_transport.tls_ca_file`, `pg_transport.tls_min_proto`,
+`pg_transport.default_queue_size`, `pg_transport.metrics_port` — land
+in their respective follow-on phases (mTLS / live reload / shm_mq /
+metrics endpoint) and not before. See
+[roadmap.md §2.3 Q23](roadmap.md#23-resolved) for the
+"GUC surface starts at the phase that needs it" rule.
+
+### 1.2 SQL surface (implemented)
+
+One function, exported from
+[crates/core/src/lib.rs](../../crates/core/src/lib.rs):
+
+```sql
+SELECT pg_transport_extension_version();
+--  pg_transport_extension_version
+-- --------------------------------
+--                              1
+-- (packed: MAJOR * 10_000 + MINOR * 100 + PATCH)
+```
+
+That is the entire SQL surface today. No catalog tables, no
+`start()` / `stop()` / `reload()` — the v0 frontend bgworker comes up
+with the postmaster and the single v0 transport binds at frontend
+boot from `pg_transport.tls_*` and a hard-coded bind address.
+
+### 1.3 Planned catalog surface (not implemented)
+
+The design intent, kept here so the implementation phase has a target.
+**None of this is implemented in v0.** Implementing it is gated on a
+real need to reconfigure listeners without a restart — today there's
+one transport bound to one address and an operator restart suffices.
+
+#### Catalog tables (schema `pg_transport`)
 
 | Table                          | Columns                                                       |
 | ------------------------------ | ------------------------------------------------------------- |
 | `pg_transport.transports`      | id, kind, bind_addr, options jsonb, enabled bool              |
-| `pg_transport.backend_pools`  | id, size, options                                             |
+| `pg_transport.backend_pools`   | id, size, options                                             |
 
 `kind` is the transport name registered at compile time. In v0 the
 only registered name is `tcp_handoff`; additional handoff transports
 (`uds_handoff`, …) are deferred (see
 [roadmap.md §1](roadmap.md#1-phased-build-plan) and
-[../future-transports.md](deferred/future-transports.md)). The
+[deferred/future-transports.md](deferred/future-transports.md)). The
 `options jsonb` column is **deliberately free-form**: each transport
 interprets it as it sees fit (TLS cert paths, auth method, h2
 settings, …). The framework neither parses nor validates the contents
@@ -28,13 +79,14 @@ beyond handing the blob to the transport's factory.
 
 (`pg_transport.backend_pools.options` is the parking spot for
 sizing knobs the deferred shm_mq path will need — `queue_depth`,
-shared-slot policy, etc. — see [backend-pool.md](deferred/backend-pool.md).)
+shared-slot policy, etc. — see
+[deferred/backend-pool.md](deferred/backend-pool.md).)
 
 There is **no** `plugins` catalog table — the set of available
 transports is fixed at compile time. v0 has no Cargo features (see
 [workspace.md §2](workspace.md#2-cargo-features--deliberately-minimal));
-the registry is a single `insert` in `core` for `tcp_handoff`. A
-read-only function surfaces what's compiled in:
+when the catalog lands, a read-only function will surface what's
+compiled in:
 
 ```sql
 SELECT * FROM pg_transport.available();
@@ -48,53 +100,12 @@ The name describes *what the transport does with the fd* (handoff) on
 speaks on the handed-off fd is the backend's concern — FE/BE v3 in v0,
 but the transport doesn't claim or care.
 
-For the error path when a row references a transport that isn't
-registered, see
-[workspace.md §5](workspace.md#5-catalog--registry-interaction).
-
-### GUCs
-
-Registered on first use, à la `pg_background`:
-
-- `pg_transport.backend_pool_size` (default `max(4, num_cpus)`).
-- `pg_transport.socket_directory` (default `""` — fall back to the first
-  entry of `unix_socket_directories`, then `/tmp`). Directory in which
-  per-slot handoff control sockets live, named
-  `.s.PG_TRANSPORT.<frontend_pid>.<slot_id>`. Mirrors PG's own
-  `unix_socket_directories` story; set it to `/var/run/postgresql` on
-  distros that put PG's client UDS there. See
-  [frontend-handoff.md §2.1](frontend-handoff.md).
-- **Backend wire layer** ([backend-wire.md](backend-wire.md)) GUCs:
-  - `pg_transport.auth_source` (**no default; required**). One of
-    `"pg_hba"` or `"pg_transport"`. Selects whether the wire-layer
-    auth lookup goes through PG's `pg_hba.conf` helpers or a
-    framework-owned `pg_transport.hba` catalog. The two are mutually
-    exclusive: a connection's auth is resolved against exactly one
-    source, with no fall-through. **Validated at `_PG_init()`** (i.e.
-    inside the postmaster, before any bgworker is allocated), not at
-    the slot's first auth; missing or invalid values raise `FATAL` at
-    cluster start so the operator sees the problem during boot rather
-    than via mid-flight slot deaths. See
-    [backend-handoff.md §1](backend-handoff.md#1-pool-spawning-_pg_init--shared_preload_libraries)
-    and [backend-wire.md §4](backend-wire.md).
-  - `pg_transport.tls_cert_file` / `pg_transport.tls_key_file` /
-    `pg_transport.tls_ca_file` (defaults reuse cluster `ssl_cert_file`
-    / `ssl_key_file` / `ssl_ca_file` if empty). TLS material for the
-    backend's rust-openssl-based wire layer. See
-    [backend-wire.md §5](backend-wire.md).
-  - `pg_transport.tls_min_proto` (default `"TLSv1.2"`).
-- `pg_transport.default_queue_size` (default 64 KiB) — reserved for the
-  deferred shm_mq path; unused in v0.
-- `pg_transport.metrics_port` (Prometheus scrape endpoint).
-- Per-transport GUCs (e.g. `pg_transport.dpdk_cores`) are added as their
-  phase begins. See [../future-transports.md](deferred/future-transports.md).
-
-### SQL surface
+#### Planned SQL functions
 
 The frontend bgworker is registered statically in `_PG_init()` (see
 [Q22 in roadmap.md §2.3](roadmap.md#23-resolved)) and is therefore
-running from postmaster start onward. The functions below operate
-on *listeners*, not on the frontend bgworker itself:
+running from postmaster start onward. The functions below would
+operate on *listeners*, not on the frontend bgworker itself:
 
 ```sql
 SELECT pg_transport.start();    -- bind listeners for every row where enabled=true
@@ -105,7 +116,7 @@ SELECT * FROM pg_transport.available(); -- compile-time transport inventory
 SELECT * FROM pg_transport.list_v2();   -- live frontend state
 ```
 
-Semantics worth pinning:
+Semantics worth pinning when the surface lands:
 
 - `start()` is idempotent — calling it twice is a no-op on the
   second call.
@@ -117,15 +128,14 @@ Semantics worth pinning:
 - The frontend bgworker itself only exits on postmaster shutdown
   or `SIGTERM`; none of these SQL functions can take it down.
 
-> **Open — Q23 ([roadmap.md §2.1](roadmap.md#21-still-open--v0-path)).**
-> The GUC list above is the phase-≥2 surface. Phase 1 needs zero,
-> one, or two of {`frontend_heartbeat_interval`,
-> `postmaster_watchdog_interval`, `log_level`}. The leaning is
-> *zero* — hard-code the defaults until someone hits the wall.
-
 ---
 
-## 2. Observability
+## 2. Observability (planned, not implemented)
+
+None of the surface below exists in v0. Today's observability is
+`pgrx::log!` / `pgrx::info!` lines in the standard PG log, plus
+`pg_stat_activity` for the slot bgworkers (they show up as regular
+backends because they `connect_worker_to_spi`).
 
 ### Prometheus metrics (text format on `metrics_port`)
 
@@ -138,11 +148,11 @@ Semantics worth pinning:
 
 ### Per-connection introspection
 
-`pg_transport.list_v2()` surfaces the live frontend state — active
-transports, their connections, backend-slot assignments, last error.
-Mirrors `pg_background_list_v2()` in style. See
-[../background/pg_background.md](../background/pg_background.md) for the
-spiritual ancestor.
+`pg_transport.list_v2()` would surface the live frontend state —
+active transports, their connections, backend-slot assignments, last
+error. Mirrors `pg_background_list_v2()` in style. See
+[../background/pg_background.md](../background/pg_background.md) for
+the spiritual ancestor.
 
 ---
 
@@ -150,5 +160,5 @@ spiritual ancestor.
 
 - [workspace.md](workspace.md) — the compile-time registry that backs
   `available()`; v0 has no Cargo features.
-- [backend-pool.md](deferred/backend-pool.md) — `backend_pool_size` sizing,
-  `metrics_port` exposure.
+- [deferred/backend-pool.md](deferred/backend-pool.md) —
+  `backend_pool_size` sizing, `metrics_port` exposure.

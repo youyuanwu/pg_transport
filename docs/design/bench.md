@@ -1,7 +1,7 @@
 # Bench harness — what it measures, what to read into it
 
 > Parent: [README.md](README.md)
-> Siblings: [testing.md](testing.md) · [roadmap.md](roadmap.md)
+> Siblings: [testing.md](testing.md) · [roadmap.md](roadmap.md) · [performance.md](performance.md) (what the numbers mean + ranked optimisations)
 
 The bench harness is the phase-5 deliverable per
 [roadmap.md §1](roadmap.md#1-phased-build-plan). Two complementary

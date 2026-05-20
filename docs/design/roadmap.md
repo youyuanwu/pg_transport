@@ -150,565 +150,142 @@ v0-feature defer rather than shm_mq-path defer.)
 
 ### 2.3 Resolved
 
-Decisions made. Kept here so the reasoning is auditable and so future
-readers don't re-litigate them by accident.
+Decisions made. Each entry is the headline + pointers to the live
+code / authoritative design doc. Full deliberation lives in git
+history (the original verbose rationale was compressed in 2026-05;
+see commit log for the survey / rejected alternatives).
 
-**Q1. Auth handshake location.** ~~Open~~ **Resolved.** v0 runs auth
-in the backend's wire layer ([backend-wire.md §4](backend-wire.md)):
-it calls PG's `hba_getauthmethod` to obtain the `(method, options)`
-tuple, then implements the method itself in Rust (SCRAM via `pgwire`
-crate helpers, MD5 via a small wrapper, trust/reject trivially). We do
-**not** call PG's `ClientAuthentication`. Method coverage in v0:
-trust / reject / password / md5 / scram-sha-256; cert/peer next, the
-rest later as needed. When the deferred shm_mq path lands, FE/BE-aware
-transports on it will need to run auth themselves before calling
-`acquire`; a thin `protocol-pgwire-auth` helper crate wrapping SCRAM
-is a likely addition then.
+**Q1. Auth handshake location** — wire-layer in Rust; call
+`hba_getauthmethod` for the `(method, options)` tuple, implement the
+method ourselves. **Not** PG's `ClientAuthentication`. Methods in v0:
+trust / reject / password / md5 / scram-sha-256. See
+[backend-wire.md §4](backend-wire.md) and
+[crates/core/src/wire/auth/](../../crates/core/src/wire/auth/).
 
-**Q3. TLS termination location.** ~~Open~~ **Resolved.** v0
-handoff-path transports terminate TLS in the backend wire layer using
-rust-openssl (`openssl` + `tokio-openssl` crates); see
-[backend-wire.md §5](backend-wire.md). We do **not** call PG's
-`secure_open_server`. Cert/key default to the cluster's `ssl_*` GUCs
-at frontend startup; framework GUCs (`pg_transport.tls_cert_file` etc)
-can override. The deferred shm_mq path would have its transports
-terminate TLS themselves via the (also deferred) `tls-rustls` helper.
+**Q2. Per-session backend pinning** — forced by architecture: handoff
+moves the `OwnedFd` into the slot via `SCM_RIGHTS`; migration between
+processes is impossible. Slot pinned for connection lifetime. Failure
+model: dropped client connection + slot respawn for uncaught panics
+(Q9 + Q20 + Q21); clean wire `ErrorResponse` for caught SPI errors.
 
-**Q2. Per-session backend pinning vs. session migration.** ~~Open~~
-**Resolved — forced by architecture and the other resolutions.** Two
-sub-questions, both decided:
+**Q3. TLS termination location** — wire layer, **not** PG's
+`secure_open_server`. (TLS lib subsequently re-litigated as rustls in
+[Q26](#23-resolved).) See [backend-wire.md §5](backend-wire.md).
 
-- *Pinning vs. migration.* Architecturally forced in v0: the handoff
-  path moves the `OwnedFd` into the slot via `SCM_RIGHTS`; once
-  received, the fd lives in that slot bgworker's process. You can't
-  migrate an open TCP connection between processes, so migration is
-  impossible by construction. The slot is pinned for the connection's
-  lifetime.
-- *Failure model when a backend dies mid-session.* Determined by the
-  cluster Q9 + Q20 + Q21. With `panic = "unwind"` (Q9 re-resolved
-  via Q24) a fault in a slot unwinds; the wire layer catches it via
-  `PgTryBuilder` and emits a wire `ErrorResponse` where it can,
-  otherwise the slot exits and the postmaster respawns; with the
-  simplest `handoff()` error contract (Q20) the dying slot doesn't
-  surface a special error — the future already returned `Ok(())`;
-  with Q21 (accept silent loss) the current client connection sees
-  TCP RST and the slot is respawned on the *next* `sendmsg → EPIPE`.
-  Net: **dropped client connection, slot respawn, no replay** for
-  uncaught panics; clean wire `ErrorResponse` for caught SPI errors.
+**Q4. `shared_preload_libraries` requirement** — SPL is **required**.
+`_PG_init()` checks `process_shared_preload_libraries_in_progress`
+and FATALs otherwise (`crates/core/src/lib.rs`). Trade: operator
+config burden vs. first-connection latency excluding pool spawn +
+postmaster-owned restart policy. Live pool resize deferred to Q15.
 
-The deferred shm_mq path inherits the same pinning policy by default;
-see [backend-pool.md §7](deferred/backend-pool.md#7-slot-allocation-pinning-and-lifetime).
+**Q5. Cargo feature defaults** — none in v0 beyond pgrx's `pg18` +
+`pg_test`. Reopens when a second transport lands; for now
+`tcp_handoff` is compiled in unconditionally. See
+[workspace.md §2](workspace.md#2-cargo-features--deliberately-minimal).
 
-**Q4. `shared_preload_libraries` requirement.** ~~Open~~ **Resolved:
-SPL is required.** v0 ships a pre-spawned bgworker pool whose lifetime
-matches the cluster's; the natural fit is static registration in
-`_PG_init()` from the postmaster, which means
-`shared_preload_libraries = 'pg_transport'` is mandatory. `_PG_init()`
-checks `process_shared_preload_libraries_in_progress` and raises
-`FATAL("pg_transport must be in shared_preload_libraries")` if it's
-running in a regular backend instead of the postmaster. The full spawn
-sequence (pgrx `BackgroundWorkerBuilder::load()`, restart policy, why
-we don't use `load_dynamic()`) is in
-[backend-handoff.md §1](backend-handoff.md#1-pool-spawning-_pg_init--shared_preload_libraries).
-Trade-offs we accept: operator-side config burden (the SoT review's F2
-risk); no `CREATE EXTENSION`-and-go ergonomics like `pg_background`.
-Trade-offs we get: first-connection latency excludes pool spawn;
-postmaster owns restart policy; one operational story ("pool up iff
-postmaster up"). Live pool resize via `load_dynamic()` is deferred
-(see Q15).
+**Q8. `async_trait` lifetime** — **no `async_trait`, ever.**
+`HandoffTransport::run` returns a manual `RunFuture =
+Pin<Box<dyn Future + 'static>>`; impls write `Box::pin(async move {
+… })`. Reasons in [api.md §1](api.md#1-the-handofftransport-trait).
 
-**Q5. Cargo feature defaults.** ~~Open~~ **Resolved: no Cargo features
-in v0.** v0 ships exactly one transport (`tcp_handoff`), compiled in
-unconditionally. There is no `[features]` table in
-`crates/core/Cargo.toml` in the first plan. Cargo features come back
-into the picture only when a second transport lands (post-v0) and the
-decision can be made with a concrete second transport in front of us,
-not in the abstract.
+**Q9. Panic isolation in tokio tasks** — ~~`abort`~~ → **`unwind`**,
+re-resolved via [Q24](#23-resolved). pgrx 0.18 uses Rust panics as
+its ERROR-propagation mechanism, so `abort` SIGABRTs instead of
+emitting readable errors. Workspace `[profile.dev]` and
+`[profile.release]` both set `panic = "unwind"`. Cost: `catch_unwind`
+/ `AssertUnwindSafe` boilerplate where we deliberately want to
+capture a panic.
 
-**Q8. `async_trait` lifetime.** ~~Open~~ **Resolved: no `async_trait`,
-ever.** The `HandoffTransport` trait returns a manual
-`Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'static>>` (aliased
-as `RunFuture`); impls write `Box::pin(async move { … })` at the top
-of `run`. Reasons in [api.md §1](api.md#1-the-handofftransport-trait):
-one async method called once per transport lifetime makes the macro's
-ergonomic payoff invisible; same runtime shape as the macro desugar;
-no proc-macro dep in `crates/api/`; cleaner errors; trivial migration
-to native `async fn in traits` (drop `Box::pin`, change `RunFuture` to
-`impl Future<…>`) without first un-injecting `'async_trait` lifetime
-mangling. (Same call will apply to the deferred `SessionTransport`.)
+**Q12. TLS implementation** — ~~rust-openssl~~ → **rustls**,
+re-resolved via [Q26](#23-resolved) (pgwire 0.40 hard-binds to
+`tokio_rustls`).
 
-**Q9. Panic isolation in tokio tasks.** ~~Open~~ ~~Resolved:
-`panic = "abort"`~~ **Re-resolved: `panic = "unwind"`** (after
-[Q24](#23-resolved) showed the original choice was incompatible with
-pgrx 0.18's error machinery). Both the workspace `[profile.dev]` and
-`[profile.release]` set `panic = "unwind"`.
+**Q13. Per-listener TLS variation** — one cert per cluster in v0,
+from `pg_transport.tls_{cert,key}_file` GUCs. Extension point
+(`cert_id` on `HandoffHints`) pre-allocated but not built; un-defer
+when a real deployment needs distinct certs per listener address.
 
-The original Q9 rationale for `abort` (kept here for the auditable
-record) was:
+**Q17. Extended-query state ownership** — option (a): wire layer owns
+the name maps (`HashMap<String, SpiPlan>` and `HashMap<String,
+BoundPortal>`); SPI owns the underlying plans. See
+[crates/core/src/backend/extended.rs](../../crates/core/src/backend/extended.rs).
+Per-handoff reset bookkeeping lands as a phase-9 spec item in
+[backend-wire.md §8 Q1](backend-wire.md#8-open-questions).
 
-- **Consistent with PG's posture.** `ereport(FATAL)` already exits
-  the backend process; making Rust panics behave the same (process
-  abort, no Drop-based recovery) keeps one mental model for
-  "something is wrong, this process is over."
-- **No `catch_unwind` boilerplate.** Wrapping every `spawn_local` or
-  `W::run` call in `AssertUnwindSafe` + `catch_unwind` is invasive,
-  foot-gun-prone (`UnwindSafe` bounds bite at the wrong moment), and
-  loses the actual panic location in the log.
-- **Slot death is already handled.** When a backend bgworker dies
-  (which is exactly what a panic now does), the frontend's per-slot
-  `sendmsg` returns `EPIPE` on the next handoff and the slot is
-  respawned (see [Q21](#23-resolved) and
-  [backend-handoff.md §6](backend-handoff.md#6-slot-lifecycle)). We
-  don't need a *second* recovery path for the in-process case.
-- **Per-handoff reset becomes simpler.** With no unwind, the reset
-  step in [backend-wire.md §8 Q1](backend-wire.md#8-open-questions)
-  doesn't need a `Drop`-guarded fallback path — a panicking slot
-  just dies; the next handoff lands in a fresh one.
+**Q18. SPI vs. planner+executor direct path** — v0 uses SPI
+exclusively (`SPI_execute` for simple, `SPI_prepare` +
+`SPI_execute_plan_with_params` for extended). The direct-path option
+survey (which `exec_*` dispatchers are `static`, which lower-level
+symbols are exported, three reuse strategies) lives in
+[deferred/planner-executor-direct-path.md](deferred/planner-executor-direct-path.md);
+performance impact analysed in
+[performance.md §3.1](performance.md). Un-defer if bench numbers
+show SPI overhead is material for typical workloads.
 
-Those arguments were correct in isolation but missed that pgrx
-itself uses Rust panics as its ERROR-propagation mechanism (see
-[Q24](#23-resolved)). Under `panic = "abort"` we get SIGABRT instead
-of readable errors, and `PgTryBuilder` / `catch_unwind` (which the
-phase-4 wire bridge needs to convert SPI errors into wire
-`ErrorResponse` frames) cannot fire. Q24 surveyed three options and
-picked option (a): switch to `unwind`. The cost is the
-`catch_unwind` / `AssertUnwindSafe` boilerplate Q9 was trying to
-avoid, applied where we deliberately want to capture (rather than
-propagate) a panic.
-**Q12. TLS implementation in the backend wire layer.** ~~Open~~
-**Resolved.** rust-openssl (`openssl` + `tokio-openssl` crates), by
-default. Reuses the same OpenSSL the rest of the cluster links
-against, so FIPS modes / OS trust stores / OpenSSL config files keep
-applying. The original OpenSSL-vs-rustls-sidecar question became moot
-once we decided not to use PG's `secure_open_server` at all. See
+**Q20. `HandoffHandle::handoff()` error contract** — simplest answer
+in each case. Pool exhausted: block on a semaphore (no error
+variant). Slot died mid-`sendmsg`: invisible to caller, observed as
+`EPIPE` on the next handoff (per Q21). `EAGAIN`/`EINTR`: tokio retry,
+caller never sees. Frontend shutdown mid-handoff: `Err(Cancelled)`,
+fd dropped (client RST). Surface: only `Err(Cancelled)` and raw I/O
+errors. See [api.md §2](api.md#2-handoffhandle--the-v0-handle-type).
+
+**Q21. Silent handoff loss in the slot runner** — option (b), accept
+silent loss. If the slot dies between `sendmsg` and `recvmsg`, the
+kernel buffers the fd, nobody consumes it, the client sees TCP RST,
+the dead slot is detected on the next `sendmsg → EPIPE`. No
+per-handoff ack syscall. Lets Q20 keep `handoff()` returning `Ok(())`
+to mean "kernel accepted the fd-pass".
+
+**Q22. Frontend bgworker spawn mechanism** — option (a): static FE
+alongside the slots in `_PG_init()`. Operator workflow is "set SPL
+and restart". `pg_transport.reload()` (planned, see
+[configuration.md §1.3](configuration.md#13-planned-catalog-surface))
+reconciles listeners against the catalog; it does not bounce the FE.
+
+**Q23. Phase-1 GUC inventory** — zero new GUCs in phase 1. Heartbeat
++ watchdog intervals are hard-coded constants. GUC surface starts at
+phase 2 (`backend_pool_size`) and grows as each phase adds knobs
+without defensible defaults. See
+[configuration.md §1.1](configuration.md#11-gucs-implemented).
+
+**Q24. `panic = "abort"` × pgrx error propagation** — option (a):
+switch to `panic = "unwind"`. Drove the [Q9](#23-resolved)
+re-resolution. Cause: pgrx's `ereport!(ERROR, …)` raises via
+`std::panic::panic_any(report)`, and SPI ERROR longjmps are caught
+by pgrx's `cee-scape` wrapper and re-raised as Rust panics — neither
+works under `abort`. Workspace `Cargo.toml` profiles updated.
+
+**Q25. SQL parsing in the wire layer** — call PG's in-process
+`raw_parser` via `pgrx::pg_sys`. Tried (a) `libpg_query`
+(static-TLS allocation failure under `dlopen`), (b) `sqlparser-rs`
+(~15 µs/query, ~5% regression). (c) `raw_parser` adopted: ~5 µs,
+perfect grammar fidelity, zero new deps. Returns `RawStmt` list with
+`stmt_location` + `stmt_len` spans for SPI hand-off and node-tag
+classification for xact-control detection. See
+[crates/core/src/backend/spi_bridge.rs](../../crates/core/src/backend/spi_bridge.rs)
+(`parse_and_classify`).
+
+**Q26. TLS library — rust-openssl vs rustls** — **rustls** (via
+`tokio_rustls` + ring), re-litigating Q12. Forced by pgwire 0.40
+hard-binding its TLS plumbing to `tokio_rustls`. Cost: TLS material
+in our own GUCs rather than reusing the cluster's `ssl_*`; FIPS path
+(aws-lc-rs) available later if needed. See
+[crates/core/src/wire/tls.rs](../../crates/core/src/wire/tls.rs) +
 [backend-wire.md §5](backend-wire.md).
 
-**Q13. Per-listener TLS variation.** ~~Open~~ **Resolved: one cert per
-cluster in v0.** TLS material comes from `pg_transport.tls_cert_file`
-/ `pg_transport.tls_key_file` / `pg_transport.tls_ca_file`, defaulting
-to the cluster's `ssl_cert_file` / `ssl_key_file` / `ssl_ca_file` when
-unset. The single v0 transport (`tcp_handoff`) speaks one cert for
-all handoffs. Rationale: with exactly one transport and a research
-framework focus, per-listener cert variation has no concrete consumer
-yet; building the indirection in advance would be speculative.
-
-The extension point is pre-allocated, not built: when a real
-deployment asks for per-listener certs (e.g. distinct cert per
-listener address, or per-transport-row cert from the catalog), the
-shape is to add a `cert_id: Option<u32>` field to `HandoffHints` (see
-[backend-handoff.md §4](backend-handoff.md#4-handoffhints)) and have
-the wire layer resolve it per-handoff against a small cert registry
-in the frontend. The `HandoffHints` struct is the framework-internal
-seam; the wire layer is the consumer; no public-trait churn.
-
-**Q17. Extended-query state ownership.** ~~Open~~ **Resolved: option
-(a)** — the wire layer owns the names (`HashMap<String, SpiPlan>` and
-`HashMap<String, BoundPortal>`) and SPI owns the underlying plans.
-Option (b) (a new SPI-side naming surface) was rejected as
-PG-version-coupled work that doesn't earn its keep. **Spec work that
-remains** — per-handoff reset correctness (order, partial-failure
-handling, GUC/temp-table scope, mid-flow `Sync`) is enumerated as a
-phase-9 ADR checklist in
-[backend-wire.md §8 Q1](backend-wire.md#8-open-questions); it's a
-specification item, no longer an architectural choice.
-
-**Q18. SPI vs. planner+executor direct path.** ~~Open~~ **Resolved:
-v0 uses SPI exclusively.** `SPI_execute` for simple-query and
-`SPI_prepare` + `SPI_execute_plan_with_params` for extended-query, in
-the wire layer's SQL dispatch. Reasoning in
-[backend-wire.md §6](backend-wire.md#6-spi-bridge): SPI is the
-standard "run SQL inside a backend" surface; it handles snapshot
-management, transaction-state checks, and result materialisation;
-it's well-supported across PG versions. The cost — one extra
-`MemoryContext` layer and result-cursor materialisation — is
-acceptable for a research framework whose first job is correctness,
-not peak throughput.
-
-A **planner+executor direct path** (`pg_plan_query` + `CreatePortal`
-+ `PortalDefineQuery` + `PortalStart` + `PortalRun` + `PortalDrop`)
-would trade more PG-version-coupled code for lower per-query
-overhead. That's a **post-phase-5 optimization**, not a v0
-architectural question: the phase-5 bench harness produces numbers,
-and only if those numbers show SPI overhead is material for typical
-workloads does a follow-up ADR explore the direct path. Until then,
-the v0 wire layer uses SPI without qualification.
-
-**Q20. `HandoffHandle::handoff()` error contract.** ~~Open~~
-**Resolved: take the simplest answer in each case.** Research
-framework; the API can grow more sophisticated later if real usage
-finds the simple answer insufficient.
-
-- **Backend pool exhausted.** Block on a `tokio::sync::Semaphore`
-  sized to the pool. `acquire().await` is the cancellation point if
-  the frontend shuts down. No special error variant for this case —
-  the wait period is invisible to the caller; the docstring "returns
-  when the client disconnects" still holds.
-- **Slot died between health-check and `sendmsg`.** No special
-  handling. `sendmsg` succeeds (kernel buffers); the slot's death is
-  observed on the *next* handoff via `EPIPE` (per Q21).
-  The current client connection is the one orphaned. `handoff()`
-  returns `Ok(())`; the caller sees no error; the client sees TCP RST
-  when its packets aren't ACKed.
-- **`sendmsg` returns `EAGAIN`/`EINTR`.** Not surfaced to the caller.
-  tokio's `AsyncFd` already handles `EAGAIN` (await fd-writable);
-  `EINTR` is retried by the runtime / std::io wrappers. The
-  `handoff()` future re-polls transparently; the caller never sees
-  these.
-- **Frontend shutdown while `handoff` is in-flight.** Standard
-  cancellation pattern: the slot-acquire `await` is inside a
-  `tokio::select!` against `shutdown.cancelled()`. On the shutdown
-  branch, the moved-in `OwnedFd` is dropped (closing the kernel
-  socket; client sees RST) and the future returns `Err(Cancelled)`.
-
-The concrete signature stays as written in
-[api.md §2](api.md#2-handoffhandle--the-v0-handle-type). Only two
-error variants surface to callers: `Err(Cancelled)` (frontend
-shutting down) and any I/O error that tokio surfaces from a syscall
-outside the retry-able set.
-
-**Q21. Silent handoff loss in the slot runner.** ~~Open~~ **Resolved:
-option (b) — accept silent loss.** The data path is
-`frontend.sendmsg(fd) → kernel buffer → backend.recvmsg(fd)`. If the
-backend dies between the frontend's last observation and the
-`recvmsg`, the kernel buffers the SCM_RIGHTS payload but nobody
-consumes it. v0 accepts that one client connection is lost per slot
-death (the client sees TCP RST); the dead slot is detected on the
-*next* `sendmsg → EPIPE` and respawned then. Zero per-handoff cost.
-
-The rejected alternative (option (a): 1-byte `[0x06]` ack on the
-control socket after `recvmsg`, with a bounded timeout in `handoff()`
-returning `Err(SlotDied)`) would have cost one extra syscall and a
-roundtrip latency floor on every connection — a high tax for a
-rare-and-operationally-obvious failure mode in a research framework.
-If real usage shows slot deaths happen often enough to matter,
-revisit; the implementation work is small (one syscall in the slot
-runner, one `select!` arm in `handoff()`).
-
-This is the choice that lets [Q20](#23-resolved) keep `Ok(())` from
-`handoff()` meaning "kernel accepted the fd-pass" rather than
-"backend has the fd in hand".
-
-**Q22. Frontend bgworker spawn mechanism.** ~~Open~~ **Resolved:
-option (a) — static FE alongside the slots in `_PG_init()`.** The
-frontend bgworker is registered via `BackgroundWorkerBuilder::load()`
-at postmaster start, identically to the slot bgworkers. The
-operator workflow is "set `shared_preload_libraries =
-'pg_transport'` and restart"; nothing else is required to get a
-running frontend. Rationale:
-
-- **Phase-1 acceptance criterion is automatically met** ("FE
-  bgworker boots a tokio current-thread runtime") with no
-  additional spawn-path machinery to write.
-- **One spawn site, one mental model.** Both FE and slots are
-  registered in `_PG_init()`; the postmaster owns restart policy
-  for both via `bgw_restart_time`. No dynamic registration in v0.
-- **`pg_transport.reload()` becomes unambiguous.** It re-reads
-  `pg_transport.transports` from the catalog and reconciles the
-  set of live listeners; it does *not* bounce the FE process.
-  `start()` / `stop()` map to "enable listeners for all rows where
-  `enabled = true`" / "drop all live listeners" respectively
-  (drop ≠ disable: catalog state is untouched). Operationally,
-  `start()` after a fresh `CREATE EXTENSION` is the first time
-  any listener is bound; before that the FE is up but idle on its
-  `select!` loop.
-- **Cost accepted.** One extra bgworker even when no transports
-  are configured. For a research framework this is in the noise;
-  the operator can drop `pg_transport` from
-  `shared_preload_libraries` if they want zero overhead.
-
-Affects [backend-handoff.md §1](backend-handoff.md#1-pool-spawning-_pg_init--shared_preload_libraries)
-("does not register the frontend" bullet inverts),
-[architecture.md §2](architecture.md#2-runtime-integration-tokio--pgrx--pg-signals)
-(callout removed), [configuration.md](configuration.md) (SQL-surface
-semantics pinned). Option (b) "dynamic FE via start()" and option (c)
-"pause/resume" are kept in this entry for the record; if a
-later phase needs to defer FE startup (e.g. for multi-tenant
-clusters where most DBs don't enable the extension), option (c) is
-the natural follow-on.
-
-**Q23. Phase-1 GUC inventory.** ~~Open~~ **Resolved: phase 1 ships
-with zero new GUCs.** Heartbeat interval (1 s) and postmaster
-watchdog interval (500 ms) are hard-coded constants in the frontend
-bgworker; log routing uses `pgrx::log!` / `pgrx::info!` against PG's
-existing `log_min_messages`. Rationale:
-
-- **Phase-1 acceptance is operational, not configurable** —
-  "heartbeat logs every 1 s, SIGHUP / SIGTERM honoured" needs no
-  knob to verify.
-- **GUC surface starts at phase 2** with `auth_source` +
-  `backend_pool_size`, because those have no defensible default
-  (auth_source is policy; pool_size depends on workload). Phase 1
-  has no comparable forced choice.
-- **YAGNI applies hard to research-framework knobs.** Every GUC
-  is a forever-API; the cost of adding one now and changing the
-  default later is higher than the cost of adding one later when
-  someone actually wants a different value.
-
-If phase-1 operational experience surfaces a need, the knob lands
-in its phase — same precedent as `pg_transport.tls_min_proto`
-(arrives in phase 8) and `pg_transport.metrics_port` (arrives when
-the metrics endpoint does). No doc updates required by this
-resolution: the [configuration.md](configuration.md) GUC list
-already enumerates only phase-≥2 knobs.
-
-**Q24. `panic = "abort"` × pgrx error propagation.** ~~Open~~
-**Resolved: option (a) — switch to `panic = "unwind"`.** The Q9
-resolution (`panic = "abort"`) was incompatible with pgrx 0.18's
-error machinery on two paths:
-
-- `pgrx::error!()` / `ereport!(ERROR, …)` raise via
-  `std::panic::panic_any(report)` (see
-  `pgrx-pg-sys-0.18.0/src/submodules/panic.rs:158`). Under
-  `panic = "abort"` this SIGABRTs instead of emitting a readable
-  error. **Workaround applied in phase 1**: use
-  `ereport!(FATAL, …)` for boundary errors (FATAL routes through
-  `do_ereport()` → `proc_exit(1)` directly, no Rust panic
-  involved). Now unnecessary, but kept where FATAL is the right
-  semantic.
-- When PG raises an ERROR from inside a pgrx-mediated call (e.g.
-  SPI), pgrx's `cee-scape` wrapper catches the longjmp and
-  re-raises as a Rust panic so `PgTryBuilder` / `catch_unwind` can
-  inspect it. Under `panic = "abort"` the catch never happens —
-  *any* PG ERROR aborts the bgworker. **Fatal for the phase-4 wire
-  bridge**, which needs to convert user SQL errors into wire
-  `ErrorResponse` frames.
-
-Option (a) (`unwind`) was the only one that keeps pgrx working as
-documented. Options (b) (raw `cee_scape::call_with_setjmp` per
-SPI call) and (c) (let SPI errors kill the slot, accept
-wire-protocol incorrectness) were considered and rejected; the
-phase-1 commit message captures the survey.
-
-The cost we accept: `catch_unwind` / `AssertUnwindSafe` boilerplate
-at boundaries where we deliberately want to capture (rather than
-propagate) a panic. Q9's original rationale arguments for `abort`
-are preserved verbatim in the Q9 entry above as the auditable
-record; they were correct in isolation but missed the pgrx-uses-
-panic invariant.
-
-Affects [Q9](#23-resolved) (re-resolved as "unwind"), workspace
-[Cargo.toml](../../../Cargo.toml) `[profile.dev]` / `[profile.release]`
-(now `panic = "unwind"`), and the phase-1/2/3 code comments that
-mentioned `abort` (updated in the same commit as this resolution).
-
-**Q25. SQL parsing in the wire layer (multi-statement simple-query
-and full xact-control classification).** ~~Open~~ **Resolved: call
-PG's in-process `raw_parser` directly via `pgrx::pg_sys`.** Two
-correctness gaps in the SPI bridge that share one root cause — we
-have no SQL parser at the simple-query layer:
-
-- **Multi-statement simple-query.** pgwire's `'Q'` body can contain
-  multiple statements separated by `;`. Passing the whole string
-  to SPI's `client.update(...)` ran every statement but only
-  retained the last `SPI_tuptable`, so `SELECT 1; SELECT 2` silently
-  returned `2` only and the wire frames were wrong.
-- **Partial xact-control classification.** The bare-keyword
-  `parse_xact_control` missed every transaction-mode-list variant
-  (`BEGIN ISOLATION LEVEL SERIALIZABLE`, `START TRANSACTION READ
-  ONLY`, …) AND every multi-statement string containing xact-
-  control — both fell through to SPI's atomic-mode rejection.
-
-Options considered, in order of attempt:
-
-- **(a) `pg_query` / libpg_query bindings.** Tried first for
-  grammar fidelity. Built fine, classifier rewrite landed, but the
-  cluster failed to start with `"cannot allocate memory in static
-  TLS block"`. libpg_query bundles a chunky C parser with its own
-  `__thread`-style storage; when statically linked into our
-  cdylib and `dlopen`'d by the postmaster it exceeds glibc's
-  reserved static-TLS surplus. The
-  `GLIBC_TUNABLES=glibc.rtld.optional_static_tls=…` workaround
-  was ineffective on the test box. For a Postgres extension that
-  has to load via `shared_preload_libraries`, "you need to tune
-  glibc" deployment friction is worse than the grammar-fidelity
-  gap. **Abandoned.**
-- **(b) `sqlparser-rs`** (pure-Rust). Switched and shipped a
-  working version. No TLS / `dlopen` issues, slightly less
-  grammar fidelity, ~15 µs/query parse cost → ~5% throughput
-  regression on pgbench. Worked correctly but the perf cost was
-  noticeable. **Shipped briefly, then replaced.**
-- **(c) PG's `raw_parser` via `pgrx::pg_sys`.** The bison-
-  generated C parser that *PG itself* uses internally — and is
-  already loaded by every Postgres backend, so the libpg_query
-  TLS problem doesn't apply (it's the same parser, not a second
-  copy). Perfect grammar fidelity by definition; ~3-5× faster
-  than sqlparser (the parser is C and decades-tuned); ~10 µs/query
-  parse cost dropped to ~5 µs. **Adopted.**
-
-Implementation: `parse_and_classify(query)` in
-[`crates/core/src/backend/spi_bridge.rs`](../../crates/core/src/backend/spi_bridge.rs)
-calls `pg_sys::raw_parser` once per `'Q'` message. The returned
-`List*` of `RawStmt*` gives us both jobs in one pass:
-
-- Each `RawStmt` carries `stmt_location` + `stmt_len` → byte slice
-  into the original `query` string for SPI (no re-stringification;
-  SPI sees exactly the bytes the client sent).
-- Each `RawStmt->stmt` is a `Node*` whose `type` tag we check
-  against `T_TransactionStmt`. If matched, cast to
-  `TransactionStmt*` and inspect `kind` against
-  `TRANS_STMT_BEGIN` / `_START` / `_COMMIT` / `_ROLLBACK`.
-
-Memory: scratch `MemoryContext` per call (parented at
-`CurrentMemoryContext`) holds the palloc'd parse tree. We extract
-spans + classifications into Rust-owned values and delete the
-context before returning, so nothing leaks into the slot's
-long-lived `TopMemoryContext`.
-
-Errors: `raw_parser` raises PG ERRORs for syntax errors. The call
-is wrapped in `pgrx::PgTryBuilder` (cee-scape `sigsetjmp`) so the
-longjmp is caught locally rather than escaping to the bgworker's
-outer `pg_guard`. The `CaughtError` is converted to a wire
-`ErrorResponse` via the existing error-report helpers — bonus:
-the message is PG's actual syntax-error message (e.g. `"syntax
-error at or near \"SELECTT\""`), not a synthetic one.
-
-Note on the "parse once vs twice" question. SPI still parses the
-statement internally when executing it, so we DO parse twice — but
-both parses are PG's own ~5 µs parser, not the sqlparser ~15 µs
-parser. Getting to "parse once" would require bypassing SPI
-entirely (build `Portal` + `pg_analyze_and_rewrite_fixedparams` +
-`pg_plan_queries` + `PortalRun` directly, the way PG's `exec_simple_query`
-in `postgres.c` does). Estimated ~5 µs/query additional savings,
-~100 LOC of unsafe FFI; deferred to phase 9 (which needs the
-parse-tree-direct path for the extended-query `Parse` message
-anyway).
-
-Affects [`crates/core/src/backend/spi_bridge.rs`](../../crates/core/src/backend/spi_bridge.rs)
-(`parse_and_classify` replaces the sqlparser tokenizer + classifier),
-workspace [Cargo.toml](../../../Cargo.toml) (dropped `sqlparser`
-dep entirely; `raw_parser` is in `pg_sys`), and
-[bench.md §2.6](bench.md) (numbers restored to near-parity).
-
-**Q26. TLS library choice — rust-openssl vs rustls.** ~~Open~~
-**Resolved: rustls (via `tokio_rustls` + ring), re-litigating Q12.**
-
-Q12 picked rust-openssl on the rationale that PG itself links
-against OpenSSL and reusing it would inherit FIPS modes, OS trust
-stores, and OpenSSL config files. During phase 8 implementation
-we found that **pgwire 0.40 hard-binds its TLS plumbing to
-`tokio_rustls`**: the `TlsAcceptor` type alias in
-[`pgwire-0.40.0/src/tokio/mod.rs`](../../../target/doc/pgwire/tokio/index.html)
-is gated on the `_ring` / `_aws-lc-rs` cargo features, and
-`process_socket`'s second arg is typed as that alias. There's no
-extension point for a different TLS backend.
-
-Options considered:
-
-- **(a) Switch to rustls** (adopted). One cargo feature flip
-  (`server-api` → `server-api-ring`) + a small `wire/tls.rs`
-  module that builds a `tokio_rustls::TlsAcceptor` from the
-  `pg_transport.tls_{cert,key}_file` GUCs. Plus a one-line
-  `_PG_init` call to install the rustls process-wide crypto
-  provider. ~150 LOC end-to-end.
-- **(b) Fork pgwire and plumb in tokio-openssl.** Would preserve
-  Q12's rationale but introduces a long-term maintenance burden
-  (every pgwire upstream change has to be re-applied) and
-  duplicates an upstream feature.
-- **(c) Implement the SSLRequest peek + handshake ourselves,
-  feed pgwire a wrapped stream.** Blocked by `process_socket`
-  taking a concrete `TcpStream` (not a generic stream type).
-  Would require reimplementing pgwire's full inner message-
-  dispatch loop. Worst cost.
-
-Q12's rationale survives criticism:
-
-- **FIPS modes:** rustls has ring (no FIPS) and aws-lc-rs (FIPS-
-  validated). v0 isn't a FIPS environment; aws-lc-rs is a
-  one-feature-flag swap later if needed.
-- **OS trust stores:** server-side TLS doesn't validate client
-  certs in v0 (mTLS lands later); we only present a server cert,
-  for which no trust store matters.
-- **OpenSSL config files:** specific to clients using libpq;
-  pg_transport's wire layer is server-side only.
-
-The cost we accept: server-side TLS material lives in
-`pg_transport.tls_{cert,key}_file` (independent of the cluster's
-`ssl_cert_file`). For v0 this is a single explicit-config burden;
-the design's "default from cluster `ssl_*`" path can be added
-later without a wire-layer change.
-
-Affects [Q12](#23-resolved) (re-resolved as rustls),
-[`crates/core/src/wire/tls.rs`](../../crates/core/src/wire/tls.rs)
-(new), [`crates/core/src/wire/pgwire_v3.rs`](../../crates/core/src/wire/pgwire_v3.rs)
-(passes `Some(acceptor)` to `process_socket`), workspace
-[Cargo.toml](../../../Cargo.toml) (drops `openssl` + `tokio-openssl`,
-adds `tokio-rustls` + `rustls-pemfile` + `rustls-pki-types`), and
-[backend-wire.md §5](backend-wire.md) (TLS lib reference updated).
-
-**Q27. Extended-query parameter-type inference path.** ~~Open~~
-**Resolved: two-pass at Parse time — varparams analyser then
-`SPI_prepare` with resolved fixed types.**
-
-The phase-9 wire layer accepts `Parse` messages with empty
-`type_oids` (tokio-postgres' default for `client.query(sql, &[...])`
-when the client doesn't ask for explicit types). PG's standard
-inference path is `parse_analyze_varparams` inside
-`exec_parse_message`; the SPI surface we use for plan caching
-(`SPI_prepare`) instead runs the analyser in *fixedparams* mode,
-which refuses `InvalidOid` parameters with "could not determine
-data type of parameter $N".
-
-Three options surveyed during impl:
-
-- **(a) `SPI_prepare_params` with a `parserSetup` callback** (first
-  attempted, rejected). The callback would invoke
-  `setup_parse_variable_parameters` (declared manually — pgrx 0.18
-  filters `parser/parse_param.h` out of its bindings) and read
-  the resolved OIDs back from our setup arg after
-  `SPI_prepare_params` returns. *Failed in testing:* the analyser
-  fills the `Oid[]` array in a memory context that gets clobbered
-  before our post-call read, leaving us reading `0x7F7F7F7F`
-  (PG's `CLOBBER_FREED_MEMORY` pattern) instead of the inferred
-  OIDs. Tracing which memory context the analyser uses for the
-  varparams array is a deeper PG-internals question than the v0
-  budget supports.
-
-- **(b) Two-pass: varparams pre-pass, then `SPI_prepare` with
-  resolved fixed types** (adopted). At Parse time, when the client
-  supplied no hints, run `pg_parse_query` → `pg_analyze_and_rewrite_varparams`
-  to extract resolved OIDs, **copy them into a Rust `Vec`
-  immediately** (before the analyser's memory context goes away),
-  upgrade any remaining `UNKNOWNOID` slots to `TEXTOID` (matching
-  real PG's `check_variable_parameters` behaviour), then call
-  `SPI_prepare(sql, n, oids)` with the resolved fixed types. Cost:
-  one extra parse + analyse per Parse message (~5–10 µs), and the
-  Rust `Vec` copy. Acceptable for v0 — Parse is once-per-prepare,
-  Execute is the hot loop.
-
-- **(c) Hand-roll a CachedPlanSource** without going through
-  `SPI_prepare` at all (use
-  `pg_analyze_and_rewrite_varparams` directly, then
-  `CreateCachedPlan` + `CompleteCachedPlan` + `SaveCachedPlan`).
-  Rejected — would replace one SPI wrapper call with three
-  PG-internals calls plus a manual cache-validity bookkeeping
-  surface, gaining nothing for v0.
-
-**Result-format handling.** Same Q27 covers binary-result encoding
-(tokio-postgres' typed accessors request binary by default for
-every type they know how to deserialise). v0 honours the per-column
-format from `Bind.result_column_format_codes`:
-
-- *Text* (or column-unspecified) — `SPI_getbinval` → `OidOutputFunctionCall`
-  → cstring bytes. Same path the simple-query bridge would have
-  taken if it used the binval/output split rather than `SPI_getvalue`.
-- *Binary* — `SPI_getbinval` → `OidSendFunctionCall` → `bytea`,
-  with `pgrx::varlena::varlena_to_byte_slice` to pull the raw
-  bytes out of the varlena (handles short / long / external
-  headers).
-
-DataRow bytes are built manually with `BytesMut::put_i32` (length
-prefix) + `put_slice` (column body), bypassing pgwire's
-`DataRowEncoder` (which is Rust-value-oriented and not a fit for
-"raw PG-formatted bytes").
-
-Affects [backend-wire.md §8 Q1](backend-wire.md#8-open-questions)
-(status updated from "spec checklist" to "shipped"),
-[`crates/core/src/backend/extended.rs`](../../crates/core/src/backend/extended.rs)
-(new — ~640 LOC),
-[`crates/core/src/wire/extended.rs`](../../crates/core/src/wire/extended.rs)
-(new — `ExtendedQueryHandler` + `QueryParser` impls), and
-[`crates/core/src/wire/pgwire_v3.rs`](../../crates/core/src/wire/pgwire_v3.rs)
-(registers the handler in `PgWireServerHandlers::extended_query_handler`).
+**Q27. Extended-query parameter-type inference** — two-pass at Parse
+time. Run `pg_parse_query` + `pg_analyze_and_rewrite_varparams` to
+extract resolved OIDs (copy into a Rust `Vec` before the analyser's
+memory context is freed), upgrade remaining `UNKNOWNOID` to
+`TEXTOID`, then call `SPI_prepare` with the resolved fixed types.
+Rejected (a) `SPI_prepare_params` + parserSetup callback (analyser
+clobbers the OID array) and (c) hand-rolled `CachedPlanSource` (more
+PG-internals surface for no v0 benefit). Result-format handling also
+shipped: `OidOutputFunctionCall` for text, `OidSendFunctionCall` for
+binary. See
+[crates/core/src/backend/extended.rs](../../crates/core/src/backend/extended.rs)
++ [crates/core/src/wire/extended.rs](../../crates/core/src/wire/extended.rs).
 
 ---
 

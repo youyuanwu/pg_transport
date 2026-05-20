@@ -5,96 +5,91 @@
 
 ## 1. Cargo workspace layout
 
+Four crates under `crates/`; documentation under `docs/`. The tree
+below reflects the actual on-disk layout as of phase 9.
+
 ```
 pg_transport/
-├── Cargo.toml                     # workspace
-├── docs/
-│   ├── design/                    # this design dir (active v0 design)
-│   │   ├── README.md
-│   │   ├── architecture.md
-│   │   ├── api.md
-│   │   ├── frontend-handoff.md
-│   │   ├── backend-handoff.md
-│   │   ├── backend-wire.md
-│   │   ├── transports.md
-│   │   ├── workspace.md           # ← this file
-│   │   ├── configuration.md
-│   │   ├── testing.md
-│   │   ├── comparison.md
-│   │   ├── roadmap.md
-│   │   └── deferred/              # design captured for deferred work
-│   │       ├── backend-pool.md         # shm_mq general path / SessionTransport
-│   │       ├── cancel-routing.md       # wire-layer CancelRequest plumbing
-│   │       └── future-transports.md    # QUIC, io_uring, AF_XDP, DPDK, RDMA, shmem
-│   ├── background/
-│   │   ├── pg_background.md
-│   │   └── omnigres.md
-│   └── adr/                       # architecture decision records
+├── Cargo.toml                     # workspace manifest
+├── Justfile                       # build / test / bench recipes
 ├── crates/
-│   ├── api/                       # rlib; no PG deps; trait definitions only.
-│   │   └── src/{transport.rs, handoff.rs, shutdown.rs, types.rs}
-│   ├── core/                      # the pgrx extension (cdylib via pgrx).
-│   │   │                          # Cargo package name = `pg_transport`; this
-│   │   │                          # name becomes the `.so` and `.control`.
+│   ├── api/                       # rlib; no PG deps; trait definitions only
+│   │   └── src/lib.rs              # HandoffTransport, HandoffHandle, ShutdownToken
+│   ├── core/                      # the pgrx extension (cdylib via pgrx)
 │   │   ├── pg_transport.control
 │   │   └── src/
-│   │       ├── lib.rs              # `_PG_init`, `pg_module_magic!`
-│   │       ├── frontend.rs         # tokio current-thread + LocalSet
-│   │       ├── registry.rs         # transport-name → factory map
+│   │       ├── lib.rs              # _PG_init, pg_module_magic!
+│   │       ├── frontend.rs         # frontend bgworker: tokio + LocalSet supervisor
 │   │       ├── guc.rs              # GUC registration / validation
-│   │       ├── catalog.rs          # SQL-surface tables and triggers
-│   │       ├── metrics.rs          # cumulative counters
-│   │       ├── backend/            # backend pool / slot bgworker
+│   │       ├── backend/            # backend pool + slot bgworker
 │   │       │   ├── mod.rs
-│   │       │   ├── pool.rs         # frontend-side slot table + sendmsg
-│   │       │   ├── slot.rs         # backend-side per-slot loop
-│   │       │   ├── spi_bridge.rs   # wire → SPI execution
-│   │       │   └── hba.rs          # `hba_getauthmethod` wrapper
-│   │       ├── wire/               # FE/BE v3 wire implementation
-│   │       │   ├── mod.rs          # `Wire` trait
-│   │       │   └── pgwire_v3.rs    # impl using sunng87/pgwire
-│   │       └── handoff/            # accept loop + tcp_handoff transport
+│   │       │   ├── pool.rs         # FE-side slot table + sendmsg(SCM_RIGHTS)
+│   │       │   ├── slot.rs         # BE-side per-slot loop (recvmsg + Wire::run)
+│   │       │   ├── fd_pass.rs      # SCM_RIGHTS sendmsg/recvmsg helpers
+│   │       │   ├── paths.rs        # well-known per-slot UDS paths
+│   │       │   ├── spi.rs          # safe Rust wrappers around SPI_* (see source)
+│   │       │   ├── spi_bridge.rs   # simple-query handler (Q')
+│   │       │   └── extended.rs     # extended-query handler (P/B/D/E/S)
+│   │       ├── wire/               # FE/BE v3 wire layer
+│   │       │   ├── mod.rs          # Wire trait
+│   │       │   ├── pgwire_v3.rs    # impl atop the pgwire crate (sunng87)
+│   │       │   ├── extended.rs     # ExtendedQueryHandler + QueryParser glue
+│   │       │   ├── tls.rs          # rustls TlsAcceptor builder
+│   │       │   └── auth/           # SCRAM, MD5, password, trust/reject
+│   │       │       ├── mod.rs
+│   │       │       ├── hba.rs      # hba_getauthmethod wrapper
+│   │       │       ├── scram.rs
+│   │       │       └── verifier.rs # pg_authid.rolpassword lookup
+│   │       └── handoff/            # transport plugins
 │   │           ├── mod.rs
-│   │           ├── listener.rs     # shared accept-loop helper
-│   │           └── tcp.rs          # the `tcp_handoff` HandoffTransport
-│   └── bench/                     # std binary; latency + throughput harness
+│   │           └── tcp.rs          # the tcp_handoff HandoffTransport
+│   ├── bench/                     # bin: latency + throughput harness
+│   │   └── src/
+│   └── e2e/                       # in-process integration tests against a real cluster
+│       ├── src/                    # Cluster helper (initdb + pg_ctl start)
+│       └── tests/                  # tokio-postgres + psql scenarios
+├── docs/
+│   ├── design/                    # this design dir
+│   │   └── deferred/              # design captured for not-yet-built work
+│   └── background/                # prior art (pg_background, Omnigres)
 └── README.md
 ```
 
-Three crates: `api`, `core`, `bench`. The split is the minimum needed
-to keep two distinct concerns honest:
+Four crates: `api`, `core`, `bench`, `e2e`. The split is the minimum
+needed to keep distinct concerns honest:
 
-- **`api/`** has no `pgrx`, no PG headers, no proc-macros, and never
-  will. A plugin author writes pure Rust against the trait
-  definitions without dragging in the extension toolchain. Trait
-  async methods return `Pin<Box<dyn Future + 'static>>` (see [api.md
-  §1](api.md)); no `#[async_trait]`. It depends on `tokio` (for fd
-  types and async fundamentals) and `futures` (for the `Stream` trait
-  used by the handoff listener helper).
-- **`core/`** is the `cdylib` pgrx emits. Everything that statically
-  links into the `.so` — pool, slot, wire, handoff listener, the
-  `tcp_handoff` transport, GUCs, catalog, registry — lives here as
-  modules under `src/`. The module tree (`backend/`, `wire/`,
+- **`api/`** ([crates/api/src/lib.rs](../../crates/api/src/lib.rs)) has
+  no `pgrx`, no PG headers, no proc-macros, and never will. A plugin
+  author writes pure Rust against the trait definitions without
+  dragging in the extension toolchain. Trait async methods return
+  `Pin<Box<dyn Future + 'static>>` (see [api.md §1](api.md)); no
+  `#[async_trait]`. Deps: `tokio`, `futures`, `tokio-util`, `anyhow`.
+  The whole crate is one file — the surface really is that small.
+- **`core/`** is the `cdylib` pgrx emits. Cargo package name is
+  `pg_transport`, so the resulting `.so` and `.control` carry the
+  user-facing extension name. Everything that statically links into
+  the `.so` — pool, slot, wire, handoff transport, auth, TLS, GUCs —
+  lives as modules under `src/`. The module tree (`backend/`, `wire/`,
   `handoff/`) preserves the conceptual partitioning earlier drafts
-  expressed as separate crates, but without the per-crate
-  `Cargo.toml` upkeep that gives nothing back while there's exactly
-  one wire and one transport.
+  expressed as separate crates, without per-crate `Cargo.toml` upkeep
+  that gives nothing back while there's exactly one wire and one
+  transport.
 - **`bench/`** is a `bin` target, not a lib, so it stays separate.
+  See [bench.md](bench.md) for what it measures and how.
+- **`e2e/`** is an in-process integration suite. The shared `Cluster`
+  helper does `initdb` + `pg_ctl start` with our extension preloaded,
+  exposes a `tokio-postgres` client, and is reused across all tests
+  via a process-wide `OnceCell`. See [testing.md §3.3](testing.md).
 
 When a second wire impl or a second transport lands, the trigger to
 *split* a module out into its own crate is concrete: an external
 consumer (another extension, an out-of-tree plugin, a binary that
 isn't `bench`) needs the contract without `pgrx`. Moving Rust modules
-between crates is a no-op refactor — `mv` plus one `mod` line. Doing
-it speculatively now buys nothing.
+between crates is a no-op refactor — `mv` plus one `mod` line.
+Doing it speculatively now buys nothing.
 
-`testutil` (helpers for integration tests) is intentionally absent in
-v0. It comes back as either a `crates/testutil/` rlib or a
-`crates/core/tests/common/` module on the first test that needs
-shared helpers — see [testing.md](testing.md).
-
-pgrx schema generation: only `core` runs `cargo pgrx`. `api` and
-`bench` have no SQL surface.
+pgrx schema generation: only `core` runs `cargo pgrx`. The other
+crates have no SQL surface.
 
 ## 2. Cargo features — deliberately minimal
 
@@ -143,80 +138,28 @@ default on, and there's nothing else to toggle.
 
 ## 4. Registry — how transports get wired in
 
-A single explicit function in `core` registers built-in transports. v0
-has **one** trait (`HandoffTransport`) and one transport (`tcp_handoff`),
-so the registry is correspondingly small. A second map (`session:
-HashMap<&'static str, SessionFactory>`) is reserved in the `Registry`
-shape so the deferred `SessionTransport` (see
-[backend-pool.md](deferred/backend-pool.md)) can land without a
-registry-shape change; in v0 that map is always empty.
+v0 has **one** trait (`HandoffTransport`) and one transport
+(`tcp_handoff`), so there is **no registry abstraction**: the frontend
+bgworker imports the transport type directly and instantiates it once
+at boot.
 
-We deliberately do **not** use the `inventory` crate or ctor-based
-auto-registration: explicit lines here keep the dependency graph greppable.
+See [crates/core/src/frontend.rs](../../crates/core/src/frontend.rs)
+(`use crate::handoff::tcp::{TcpHandoff, TcpHandoffCfg}` and the
+`TcpHandoff::boxed` call site). A `kind` → factory map will land when
+the second transport does — alongside (and not before) a SQL catalog
+table that names it. We deliberately don't use the `inventory` crate
+or ctor-based auto-registration: explicit imports keep the dependency
+graph greppable.
 
-```rust
-// crates/core/src/registry.rs
-use api::HandoffFactory;
-use std::collections::HashMap;
-
-use crate::handoff;
-
-pub struct Registry {
-    pub handoff: HashMap<&'static str, HandoffFactory>,
-    // Reserved for the deferred SessionTransport path; always empty in v0.
-    // pub session: HashMap<&'static str, SessionFactory>,
-}
-
-pub fn register_builtin_transports(reg: &mut Registry) {
-    // The single v0 transport. Compiled in unconditionally; no Cargo
-    // feature gates this. A second handoff transport (uds-handoff, etc.)
-    // is deferred — see docs/design/deferred/future-transports.md and
-    // docs/design/deferred/backend-pool.md — and would add another
-    // insert here (and another module under handoff/) when it lands.
-    reg.handoff.insert("tcp_handoff", handoff::tcp::build);
-}
-```
-
-At spawn time the frontend looks the row's `kind` up in the handoff
-map and dispatches accordingly:
-
-```rust
-match reg.handoff.get(kind) {
-    Some(build) => {
-        let t = build(&row.cfg)?;
-        let h = HandoffHandle::new(pool.clone());
-        local.spawn_local(async move { t.run(h, shutdown).await });
-    }
-    None => bail!("transport {kind:?} not present (or deferred)"),
-}
-```
-
-When the deferred `SessionTransport` path lands the `match` grows a
-second arm that resolves through the `session` map. No new catalog
-column is required — the registry knows which category each name
-belongs to.
-
-## 5. Catalog ↔ registry interaction
-
-The `pg_transport.transports` catalog table references a transport by name
-(e.g. `"tcp_handoff"`). The frontend resolves the name against the
-**compile-time** registry. In v0 the only registered name is
-`tcp_handoff`; any other name fails with a clear error:
-
-```
-ERROR:  transport "uds_handoff" referenced by transport id 7 is not present
-DETAIL: this transport is currently deferred (see docs/design/deferred/future-transports.md).
-```
-
-This keeps "configure via SQL" while trading runtime plugin choice for
-compile-time enablement. Once a second transport lands (post-v0) and
-the Cargo-features question is reopened (see [roadmap.md §2
-Q5](roadmap.md#2-open-questions)), the error message may grow a
-build-flag hint.
+When the deferred `SessionTransport` path lands
+([deferred/backend-pool.md](deferred/backend-pool.md)) the dispatch
+grows a second category (handoff vs. session); doing the partition
+speculatively now buys nothing.
 
 ## See also
 
-- [api.md](api.md) — `HandoffTransport`, `HandoffFactory` (and the
-  deferred `SessionTransport` / `SessionFactory`).
-- [configuration.md](configuration.md) — the catalog schema this resolves against.
+- [api.md](api.md) — `HandoffTransport`, `HandoffHandle` (and the
+  deferred `SessionTransport`).
+- [configuration.md](configuration.md) — current GUCs and the planned
+  catalog surface.
 - [roadmap.md](roadmap.md) — phased plan; v0 has no transport-feature gates.

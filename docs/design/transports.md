@@ -27,107 +27,46 @@ v0 ships exactly **one** transport (`tcp_handoff`). No Cargo features
 gate it; it's compiled into `core` directly (see
 [workspace.md §2](workspace.md#2-cargo-features--deliberately-minimal)).
 
-| Transport         | Trait               | Bundles                                                       | Helper crates used                       | Notes                                                  |
-| ----------------- | ------------------- | ------------------------------------------------------------- | ---------------------------------------- | ------------------------------------------------------ |
-| `tcp_handoff`      | `HandoffTransport`  | TCP accept + blind `SCM_RIGHTS` fd-pass                       | (none in transport)                      | The single v0 transport. ~20 lines of code. TLS / auth / FE/BE all happen in the backend (see [frontend-handoff.md](frontend-handoff.md)). |
+| Transport         | Trait               | Bundles                                                       | Source                                                                                  |
+| ----------------- | ------------------- | ------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| `tcp_handoff`      | `HandoffTransport`  | TCP accept + blind `SCM_RIGHTS` fd-pass                       | [crates/core/src/handoff/tcp.rs](../../crates/core/src/handoff/tcp.rs) (~150 LOC, mostly comments) |
 
-Deferred (not built in v0): `uds_handoff` (Unix-domain accept, otherwise
-identical shape to `tcp_handoff`), `http2_sql` (a `SessionTransport`
-on TCP), and every transport in
-[../future-transports.md](deferred/future-transports.md). Adding a
-second transport is what reopens the Cargo-features question (see
-[roadmap.md §2 Q5](roadmap.md#2-open-questions)).
+TLS, auth, and FE/BE all happen in the backend (see
+[frontend-handoff.md](frontend-handoff.md)); the transport never
+reads or writes a byte of client data.
 
-## 2. In-tree helpers the framework ships
+Deferred (not built in v0): `uds_handoff` (Unix-domain accept,
+otherwise identical shape to `tcp_handoff`), `http2_sql` (a
+`SessionTransport` on TCP), and every transport in
+[deferred/future-transports.md](deferred/future-transports.md).
+Adding a second transport is what reopens the Cargo-features
+question (see [roadmap.md §2 Q5](roadmap.md#2-open-questions)).
 
-These live as modules under `crates/core/src/` (see
-[workspace.md §1](workspace.md#1-cargo-workspace-layout)) — not as
-separate crates. Transports use them via `use crate::…`. The
-"helper crate" framing is reserved for the deferred shm_mq /
-`SessionTransport` path, where external transports may want them
-without the pgrx toolchain.
+## 2. Shared helpers
 
-| Helper                       | Wraps                                  | Used by                                                                 |
-| ---------------------------- | -------------------------------------- | ----------------------------------------------------------------------- |
-| `handoff::listener` (module) | (none — small std + tokio glue)        | **`handoff::tcp` (`tcp_handoff`)** in v0                                |
-| `wire::pgwire_v3` (module)   | [`pgwire`](https://github.com/sunng87/pgwire) (sunng87) | the slot runner in v0; reserved for deferred shm_mq-path FE/BE transports too |
-| `protocol-http2` (deferred crate) | [`h2`](https://github.com/hyperium/h2) | *(none in v0)* — reserved for deferred `http2_sql`                      |
-| `tls-rustls` (deferred crate) | [`tokio-rustls`](https://github.com/rustls/tokio-rustls) | *(none in v0)* — reserved for deferred shm_mq-path transports that terminate TLS themselves; v0 handoff transports use backend-side TLS instead |
-| `polled-bridge` (deferred)   | data-plane-thread ↔ main-thread eventfd bridge | Future polled transports (DPDK / AF_XDP / RDMA-CM)                   |
+v0 has **no extracted accept-loop helper**. The `select!`-on-shutdown
++ `accept()`-and-handoff loop is inlined directly in
+[handoff/tcp.rs](../../crates/core/src/handoff/tcp.rs) because
+`tcp_handoff` is its only consumer; ~30 lines of straightforward
+tokio. When a second handoff transport lands (deferred `uds_handoff`,
+`iouring_handoff`, abstract-namespace UDS, `sd_listen_fds`-fed
+listener, …), the natural refactor is to extract a generic
+`run_accept_loop<S: Stream<Item = io::Result<OwnedFd>>>` into
+`crates/core/src/handoff/listener.rs` at that point. Doing it
+speculatively now buys nothing while there's exactly one transport.
 
-### 2.1 `handoff::listener`
+The wire layer ([crates/core/src/wire/](../../crates/core/src/wire/),
+built on the sunng87 [`pgwire`](https://github.com/sunng87/pgwire)
+crate) is the other piece a future handoff transport will reuse; that
+one *is* shared today (the slot runner picks `PgwireV3` at compile
+time), but it's not transport-facing — transports never touch wire
+bytes.
 
-The entire accept loop — `select!` on shutdown, drain the listener, hand
-each fd to `HandoffHandle::handoff`, log accept errors — is the same in
-every handoff transport. Rather than duplicate it per transport module,
-we keep it in one module that takes a generic stream of incoming fds:
-
-```rust
-// crates/core/src/handoff/listener.rs
-use api::{HandoffHandle, ShutdownToken};
-use futures::Stream;
-use std::{io, os::fd::OwnedFd};
-
-/// Drive an `OwnedFd` stream until shutdown, handing each fd to the
-/// backend pool. Returns when the shutdown token fires or the stream
-/// terminates.
-pub async fn run_handoff_loop<S>(
-    mut incoming: S,
-    handle: HandoffHandle,
-    shutdown: ShutdownToken,
-) -> anyhow::Result<()>
-where
-    S: Stream<Item = io::Result<OwnedFd>> + Unpin,
-{
-    use futures::StreamExt;
-    loop {
-        tokio::select! {
-            _ = shutdown.cancelled() => break,
-            next = incoming.next() => match next {
-                Some(Ok(fd)) => {
-                    if let Err(e) = handle.handoff(fd).await {
-                        tracing::warn!(?e, "handoff failed");
-                    }
-                }
-                Some(Err(e)) => tracing::warn!(?e, "accept failed"),
-                None         => break,                  // listener closed
-            },
-        }
-    }
-    Ok(())
-}
-
-/// Adapter: turn a `tokio::net::TcpListener` into an `OwnedFd` stream.
-pub fn tcp_incoming(l: tokio::net::TcpListener)
-    -> impl Stream<Item = io::Result<OwnedFd>>;
-
-// `uds_incoming(UnixListener)` and analogues for the deferred
-// uds_handoff / abstract-namespace / sd_listen_fds variants are
-// trivially added in their own crate when those transports land.
-```
-
-Why a stream-shaped helper rather than collapsing every future
-fd-producing transport into one combined plugin:
-
-- **The framework's stance** — "one transport plugin = one network entry
-  point" — stays intact. v0's `tcp_handoff` is one self-describing row
-  in `pg_transport.transports`; the deferred `uds_handoff` (and any
-  other future fd-producing transport) gets its own row, not buried
-  inside another transport's `options jsonb`.
-- **Catalog readability**: `SELECT kind, bind_addr FROM pg_transport.transports`
-  shows the listener kind directly.
-- **Future fd-producing transports compose for free.** When the
-  deferred `uds_handoff` lands (or `iouring_handoff`, or an
-  abstract-namespace UDS variant, or a systemd-`sd_listen_fds`-fed
-  listener), each ships its own tiny transport crate that builds
-  whatever listener it needs and hands the resulting stream to
-  `run_handoff_loop`.
-- **Per-loop concerns** — accept-error backoff, future per-listener
-  metrics, `tracing` integration — live in one place and stay in sync.
-
-The duplication that's *not* eliminated (per-kind config parsing,
-per-kind listener construction) is genuinely different per kind and
-wouldn't shrink under a combined transport either.
+Helper crates the original design penciled in (`protocol-http2`,
+`tls-rustls`, `polled-bridge`) are all tied to the deferred shm_mq
+/ `SessionTransport` path and are not built in v0; see
+[deferred/backend-pool.md](deferred/backend-pool.md) and
+[deferred/future-transports.md](deferred/future-transports.md).
 
 ## 3. FE/BE specifics
 
