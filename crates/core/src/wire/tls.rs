@@ -24,8 +24,12 @@
 //!   `pg_transport.tls_{cert,key}_file` once. Per-listener cert
 //!   variation (Q13 in the roadmap) is deferred.
 //! - **Server-only auth.** No client-cert verification; the
-//!   `pg_transport.tls_ca_file` GUC + `cert` auth method come with
-//!   the v0 acceptance criterion only requiring `sslmode=require`.
+//!   `pg_transport.tls_ca_file` GUC + `cert` auth method are
+//!   deferred until an upstream pgwire bug in
+//!   `ClientInfo::client_certificates()` lands a fix (the downcast
+//!   targets `TlsStream<TcpStream>` but pgwire wraps in `MaybeTls`,
+//!   so the accessor panics on every call). See
+//!   [backend-wire.md §4](../../../../docs/design/backend-wire.md).
 //! - **TLS 1.2+ via the rustls default.** rustls' default
 //!   `ServerConfig` rejects < TLS 1.2; we don't expose
 //!   `tls_min_proto` as a GUC in v0.
@@ -100,7 +104,9 @@ pub fn build() -> Result<Option<Arc<TlsAcceptor>>, IoError> {
     // ServerConfig::builder picks the default crypto provider
     // installed in _PG_init() (ring). `with_no_client_auth` =
     // server-only TLS; client-cert verification (and the `cert`
-    // auth method) come in a later phase.
+    // auth method) come in a later phase — currently deferred
+    // pending a pgwire 0.40 upstream fix to
+    // `ClientInfo::client_certificates()` (see module-level docs).
     let config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs_vec, key)

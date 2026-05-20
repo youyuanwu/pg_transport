@@ -26,6 +26,12 @@ Most recent bench run (`just bench pg18 5000 2`, post-§3.2 port):
 doesn't exercise the per-cell allocation path that the custom
 bench above does).
 
+`just pgbench pg18 tpcb 30 8` (TPC-B-like, 4 UPDATEs + SELECT + INSERT
+per multi-statement `'Q'`): vanilla PG 1884 tps / 4.25 ms avg latency,
+pg_transport 2060 tps / 3.88 ms (**1.09x qps**, 0.91x latency). This
+is the workload [§3.3](#33-per-query-xact-bracket-overhead) targets;
+we lead by ~9%, so §3.3's re-entry trigger is not met.
+
 **Pre-§3.2 baseline for comparison** (`just bench pg18 200 2`,
 recorded before the simple-query BytesMut direct path landed):
 
@@ -218,11 +224,14 @@ to open one bracket per `'Q'` rather than per inner statement, with
 xact-control statements routed through a small state machine that
 knows the bracket is already open.
 
-**Status:** Opportunistic. Would fold naturally into 3.1's
-restructure (the direct-path refactor restructures the xact bracket
-anyway). Doing it independently before 3.1 is ~80 LOC for a use
-case (multi-statement `'Q'` in pgbench-tpcb) that isn't in our
-current acceptance bar.
+**Status:** Trigger not met. Measured: `just pgbench pg18 tpcb 30 8`
+yields pg_transport at **1.09x vanilla qps** (2060 vs 1884 tps),
+0.91x latency — we *lead* on the workload §3.3 targets. The
+per-statement xact bracket exists, but its overhead is dominated by
+the bgworker-reuse / no-fork-tax advantage we have over vanilla on
+the rest of the path. Re-evaluate only if a future workload shows
+multi-statement `'Q'` regressing below parity, or fold the
+restructure into 3.1 when *that* re-entry trigger fires.
 
 ### 3.4 pgwire's per-message `Arc<dyn>` + async overhead
 
@@ -283,7 +292,7 @@ further on the workloads that exercise it):
 | Source | Estimated µs/query | Reference | Status |
 | --- | --- | --- | --- |
 | Parse pass #2 (SPI's inner) | ~5 | §3.1 | deferred (largest open win) |
-| Per-query xact bracket (Start + Snapshot + SPI_connect + reverse) | ~5–10 | §3.3 | deferred (multi-statement `'Q'` only) |
+| Per-query xact bracket (Start + Snapshot + SPI_connect + reverse) | ~5–10 | §3.3 | deferred (trigger not met — tpcb at 1.09x) |
 | Row materialisation `Vec<Option<String>>` intermediate | ~2–5 | ~~§3.2~~ | **shipped** |
 | Per-cell `SPI_getvalue` syscache lookup | ~50 ns/cell | ~~§3.5~~ | **shipped** (with §3.2) |
 | Misc — pgwire framing, async dispatch, MemoryContext, `with_spi` closure scaffolding | ~5 | §3.4 | non-starter |
@@ -301,11 +310,12 @@ are gated on bench signal:
 
 - **Trigger 3.1:** bench shows >10% qps gap attributable to SPI on a
   representative workload. (Post-§3.2 we *lead* by ~11% on the
-  custom harness; pgbench tpcb is at parity. Re-evaluate once a
+  custom harness and ~9% on pgbench-tpcb. Re-evaluate once a
   wider-row representative workload exists.)
 - **Trigger 3.2:** — (shipped).
 - **Trigger 3.3:** profile of pgbench-tpcb (or any multi-statement-
-  `'Q'` workload) showing xact bracket overhead.
+  `'Q'` workload) showing xact bracket overhead. **Not met** — we
+  lead tpcb 1.09x post-§3.2.
 - **Trigger 3.4:** profile shows pgwire dispatch above 5% of
   per-query latency. Unlikely.
 - **Trigger 3.5:** — (shipped with 3.2).

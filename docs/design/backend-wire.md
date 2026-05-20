@@ -192,8 +192,29 @@ out of the no-cache implementation in v0.
 Methods supported in v0: `trust`, `reject`, `password` (cleartext over
 TLS only), `md5`, `scram-sha-256`. Methods *not* in v0 (need new
 phases): `cert`, `gss`, `sspi`, `ldap`, `pam`, `radius`, `peer`,
-`bsd`, `ident`. `cert` and `peer` are next-priority because they're
-high-value and don't need network IO.
+`bsd`, `ident`.
+
+**`cert` and `peer` were originally next-priority but are both
+blocked on prerequisites:**
+
+- `cert` is blocked on a [pgwire 0.40 upstream
+  bug](https://github.com/sunng87/pgwire/blob/master/src/tokio/server.rs)
+  in `ClientInfo::client_certificates()` — the downcast targets
+  `TlsStream<TcpStream>` but `process_socket` wraps in `MaybeTls`,
+  so `.unwrap()` panics on every call. Reproduced with a working
+  rustls `WebPkiClientVerifier` (allow_unauthenticated mode) +
+  x509-certificate-based CN extraction; the dispatch logic is
+  trivially correct but the bridge from rustls to the auth
+  dispatcher panics. Un-block path: a 5-line upstream fix (or a
+  local pgwire fork via `[patch.crates-io]`). Tracking upstream;
+  un-defer when a patched pgwire release is available or we elect
+  to carry a fork.
+- `peer` is blocked on `uds_handoff` — a client-facing UDS
+  transport is a separate v0+ work item per
+  [frontend-handoff.md §1](frontend-handoff.md#1-when-to-use-this-path).
+  `peer` semantics require `SO_PEERCRED` which is AF_UNIX-only;
+  with v0's TCP-only listener there's nothing to authenticate
+  against.
 
 **`pg_transport.hba` catalog schema (when `auth_source = 'pg_transport'`).**
 The table layout for the framework-owned HBA mode is intentionally
