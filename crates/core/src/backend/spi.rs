@@ -549,7 +549,7 @@ impl TypeReceive {
 /// resulting bytes as an owned `Vec<u8>` (freeing the palloc'd
 /// cstring).
 pub struct TypeOutput {
-    typoutput: pg_sys::Oid,
+    pub(crate) typoutput: pg_sys::Oid,
 }
 
 impl TypeOutput {
@@ -582,7 +582,7 @@ impl TypeOutput {
 /// resulting bytes as an owned `Vec<u8>` (freeing the palloc'd
 /// `bytea`).
 pub struct TypeSend {
-    typsend: pg_sys::Oid,
+    pub(crate) typsend: pg_sys::Oid,
 }
 
 impl TypeSend {

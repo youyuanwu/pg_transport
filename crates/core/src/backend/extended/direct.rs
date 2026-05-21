@@ -87,6 +87,9 @@ pub(crate) struct DirectBackendPlan {
     /// Kept here too so the per-execute response builder can wrap
     /// it in an Arc without re-walking the source.
     base_schema: Vec<FieldInfo>,
+    /// Cached CString for `PortalDefineQuery` — avoids a heap
+    /// alloc per Execute.
+    portal_src_text: CString,
 }
 
 impl PreparedPlan for DirectBackendPlan {
@@ -164,11 +167,9 @@ fn execute_impl(
         let plan = unsafe { backend.source.get_plan(params) };
         let portal = unsafe { Portal::create_anonymous(ctx) };
 
-        let sql_cstr = CString::new("direct-path statement").expect("literal has no NUL");
-
         unsafe {
             portal.define(
-                &sql_cstr,
+                &backend.portal_src_text,
                 backend.command_tag,
                 plan.stmt_list(),
                 std::ptr::null_mut(),
@@ -177,8 +178,9 @@ fn execute_impl(
         }
 
         // Capture rows into a tuplestore so we can encode them
-        // after PortalRun returns.
-        let store = unsafe { Tuplestore::begin_heap(true, false, pg_sys::work_mem) };
+        // after PortalRun returns. random_access=false — we only
+        // need a single forward pass.
+        let store = unsafe { Tuplestore::begin_heap(false, false, pg_sys::work_mem) };
         let target_tupdesc = unsafe { (*backend.source.as_ptr()).resultDesc };
         let receiver = unsafe {
             TuplestoreReceiver::for_tuplestore(
@@ -200,9 +202,6 @@ fn execute_impl(
         };
         let _done =
             unsafe { portal.run(count, true, receiver.as_ptr(), receiver.as_ptr(), &mut qc) };
-        unsafe {
-            pg_sys::tuplestore_rescan(store.as_ptr());
-        }
 
         if ncols == 0 {
             let tag_name = command_tag_name(qc.commandTag);
@@ -232,9 +231,7 @@ fn execute_impl(
                         buf.put_i32(-1);
                     } else {
                         let datum = *(*slot_guard.raw).tts_values.add(c);
-                        let bytes = encoder.encode(datum);
-                        buf.put_i32(bytes.len() as i32);
-                        buf.put_slice(&bytes);
+                        encoder.encode_into(datum, &mut buf);
                     }
                 }
                 data_rows.push(DataRow::new(buf, ncols as i16));
@@ -432,6 +429,7 @@ pub fn prepare(sql: &str, param_hints: &[Option<u32>]) -> PgWireResult<PreparedS
             column_oids,
             command_tag,
             base_schema: base_schema.clone(),
+            portal_src_text: CString::new("direct-path statement").expect("literal has no NUL"),
         };
 
         Ok(PreparedStatement {
@@ -561,10 +559,32 @@ impl ColumnEncoder {
         }
     }
 
-    fn encode(&self, datum: pg_sys::Datum) -> Vec<u8> {
+    /// Encode `datum` directly into `buf` as a length-prefixed
+    /// field, avoiding the intermediate `Vec<u8>` allocation.
+    fn encode_into(&self, datum: pg_sys::Datum, buf: &mut BytesMut) {
         match self {
-            Self::Text(fns) => fns.call(datum),
-            Self::Binary(fns) => fns.call(datum),
+            Self::Text(fns) => {
+                // SAFETY: OidOutputFunctionCall returns a palloc'd
+                // NUL-terminated cstring.
+                unsafe {
+                    let ptr = pg_sys::OidOutputFunctionCall(fns.typoutput, datum);
+                    let slice = CStr::from_ptr(ptr).to_bytes();
+                    buf.put_i32(slice.len() as i32);
+                    buf.put_slice(slice);
+                    pg_sys::pfree(ptr as *mut _);
+                }
+            }
+            Self::Binary(fns) => {
+                // SAFETY: OidSendFunctionCall returns a palloc'd
+                // bytea (varlena).
+                unsafe {
+                    let ptr = pg_sys::OidSendFunctionCall(fns.typsend, datum);
+                    let slice = pgrx::varlena::varlena_to_byte_slice(ptr as *const pg_sys::varlena);
+                    buf.put_i32(slice.len() as i32);
+                    buf.put_slice(slice);
+                    pg_sys::pfree(ptr as *mut _);
+                }
+            }
         }
     }
 }
