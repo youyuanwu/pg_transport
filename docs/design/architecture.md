@@ -32,13 +32,19 @@
 │      postmaster-death watchdog                                       │
 │    - HandoffHandle vending; metrics; GUCs                            │
 └────────────────────────────┬─────────────────────────────────────────┘
-                             │ sendmsg(SCM_RIGHTS) over per-slot UDS
-┌────────────────────────────┴─────────────────────────────────────────┐
+                             │ send_fd_async (b'\0' + SCM_RIGHTS) over
+                             │ single UDS listener at frontend.sock
+┌──────────────────────────┴───────────────────────────────────────────┐
 │  Backend Pool  (in-tree crate `backend`)                             │
+│    │ Pool dispatcher (pool.md)                                      │
+│    │   - one UDS listener at paths::frontend_socket_path()           │
+│    │   - autoscaling: grow_one() on demand, idle_reaper() shrinks    │
+│    │   - three containers: ready / in_flight / draining              │
 │    │ Slot runner (socket layer; backend-handoff.md)                  │
-│    │   - pre-spawned bgworker per slot                               │
-│    │   - recvmsg per-slot UDS → (fd, HandoffHints)                   │
-│    │   - drive a Wire to completion; per-handoff reset               │
+│    │   - dynamic bgworker per slot (load_dynamic)                    │
+│    │   - recv_ctrl on UDS → CtrlMsg::FdHandoff | DrainRequest | Eof  │
+│    │   - drive a Wire to completion; per-handoff reset; cooperative  │
+│    │     drain (b'X' → b'A')                                          │
 │    │ Wire layer (backend-wire.md; v0 = pgwire-v3 crate-based)        │
 │    │   - TLS via rust-openssl; auth via hba_getauthmethod + our Rust │
 │    │   - FE/BE v3 message loop; *not* PG's PostgresMain               │
@@ -60,11 +66,12 @@ Three layers, sharply separated by interface size:
 - **Frontend core** — the *thin* layer. tokio runtime, signal handling,
   postmaster-death watchdog, transport registry, `HandoffHandle`
   vending, metrics. Knows nothing about wire protocols.
-- **Backend pool** — pre-spawned bgworkers, each running a slot runner
-  (socket layer; see [backend-handoff.md](backend-handoff.md)) that
-  receives handed-off fds and drives the wire layer (FE/BE v3 via the
+- **Backend pool** — a dynamically-spawned fleet of slot bgworkers
+  ([pool.md](pool.md)), each running a slot runner
+  ([backend-handoff.md](backend-handoff.md)) that receives handed-off
+  fds and drives the wire layer (FE/BE v3 via the
   [`pgwire`](https://github.com/sunng87/pgwire) crate; TLS via
-  rust-openssl; SQL execution through SPI — see
+  rustls; SQL execution through SPI — see
   [backend-wire.md](backend-wire.md)).
 
 The framework deliberately does **not** define a `Connection` trait, an
@@ -75,12 +82,15 @@ fd is handed off, the frontend has no further role for that connection.
 
 The handle a transport receives in its `run` method has one method:
 
-- **Handoff** — `HandoffHandle::handoff(fd)`. The transport holds an
-  `OwnedFd` on which the wire is FE/BE v3; the frontend hands the
-  socket to a bgworker via `SCM_RIGHTS`; the bgworker's slot runner
-  drives the wire layer on it, which speaks FE/BE v3 via the `pgwire`
-  crate (with our own TLS / auth / SPI bridge on top — *not* PG's
-  `ProcessStartupPacket`/`ClientAuthentication`/`PostgresMain`). See
+- **Handoff** — `HandoffHandle::handoff(fd).await`. The transport
+  holds an `OwnedFd` on which the wire is FE/BE v3; the framework's
+  pool dispatcher waits for a ready slot (growing one if needed)
+  and ships the socket to the slot bgworker via `SCM_RIGHTS`; the
+  bgworker's slot runner drives the wire layer on it, which speaks
+  FE/BE v3 via the `pgwire` crate (with our own TLS / auth / SPI
+  bridge on top — *not* PG's
+  `ProcessStartupPacket`/`ClientAuthentication`/`PostgresMain`).
+  See [pool.md](pool.md) for the dispatcher,
   [frontend-handoff.md](frontend-handoff.md) for the FE/IPC side,
   [backend-handoff.md](backend-handoff.md) for the slot runner,
   [backend-wire.md](backend-wire.md) for the wire layer.

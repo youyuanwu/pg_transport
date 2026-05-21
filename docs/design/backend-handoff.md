@@ -1,12 +1,14 @@
 # Backend slot runner — the socket layer
 
 > Parent: [README.md](README.md)
-> Sibling: [frontend-handoff.md](frontend-handoff.md) · [backend-wire.md](backend-wire.md) · [api.md](api.md)
+> Sibling: [pool.md](pool.md) · [frontend-handoff.md](frontend-handoff.md) · [backend-wire.md](backend-wire.md) · [api.md](api.md)
 
 This doc describes the **socket layer** of the BE side of `pg_transport`'s
-v0 fd-pass path. The slot runner owns the fd, the per-slot lifecycle,
-and the per-handoff reset. It does **no** wire-protocol work — that's
-the [backend-wire.md](backend-wire.md) layer.
+v0 fd-pass path. The slot runner owns the fd, the per-handoff
+lifecycle, and the per-handoff reset. It does **no** wire-protocol work
+— that's the [backend-wire.md](backend-wire.md) layer. The pool-level
+design (autoscaling, single UDS listener, cooperative drain) lives in
+[pool.md](pool.md); this doc is the per-slot view.
 
 Companions:
 
@@ -15,27 +17,31 @@ Companions:
 | **Slot runner — socket layer (this doc)** | **backend-handoff.md**  |
 | Wire — TLS, auth, FE/BE v3 protocol | [backend-wire.md](backend-wire.md) |
 | Execution — SQL via SPI       | (implicit; see backend-wire.md §6)   |
+| **Pool** — slot lifecycle, dispatch, autoscaling | [pool.md](pool.md) |
 
-The FE/IPC companion ([frontend-handoff.md](frontend-handoff.md)) covers when this path
-applies, the per-slot control socket setup/teardown, and the
-`sendmsg(SCM_RIGHTS)` mechanics that bring an fd into the slot runner.
+The FE/IPC companion ([frontend-handoff.md](frontend-handoff.md))
+covers when this path applies and the transport-facing per-connection
+sequence; [pool.md](pool.md) covers single-listener topology, slot
+spawn/drain, and the four-opcode wire protocol on the UDS. The slot
+runner picks up at the moment its main loop receives one
+`CtrlMsg::FdHandoff(fd)` over the UDS; it ends when the wire layer's
+`run` returns and the slot runner performs the per-handoff reset (or
+when a `CtrlMsg::DrainRequest` arrives and the slot exits cleanly).
 
-The slot runner picks up at the moment its main loop pulls one
-`(fd, hints)` off the per-slot control socket; it ends when the wire
-layer's `run` returns and the slot runner performs the per-handoff
-reset.
-
-The slot runner never speaks the IPC protocol directly; it just
-receives `OwnedFd`s and a small `HandoffHints` block accompanying each
-one. The deferred shm_mq general path's slot-runner equivalent lives
-in [backend-pool.md](deferred/backend-pool.md).
+The slot runner never speaks the IPC protocol bytes directly; it just
+receives `CtrlMsg`s from `fd_pass::recv_ctrl_async` and forwards the
+contained fd to the wire. The deferred shm_mq general path's
+slot-runner equivalent lives in
+[backend-pool.md](deferred/backend-pool.md).
 
 ---
 
-## 1. Pool spawning (`_PG_init` + `shared_preload_libraries`)
+## 1. Bgworker registration
 
-Before there is a slot runner there has to be a *slot bgworker* for it
-to run in. v0 spawns the entire pool statically at postmaster start.
+The frontend bgworker is registered **statically** in `_PG_init()`;
+slot bgworkers are **dynamic** and spawned on demand by the FE's
+pool dispatcher. The full design lives in [pool.md](pool.md); this
+section covers the BE side of the contract.
 
 ### Requirement: `pg_transport` must be in `shared_preload_libraries`
 
@@ -50,8 +56,8 @@ the extension's `_PG_init()` to run inside the postmaster, very early
 in `PostmasterMain()` — the only context where PG accepts static
 `RegisterBackgroundWorker` calls.
 
-If SPL is missing, `_PG_init()` never runs in the postmaster; the pool
-is never registered; the first `SELECT pg_transport.start()` raises a
+If SPL is missing, `_PG_init()` never runs in the postmaster; the FE
+bgworker is never registered; nothing comes up. `_PG_init()` raises a
 clear `FATAL` ("pg_transport must be in shared_preload_libraries").
 We do not have a lazy-spawn fallback in v0. (Rationale and the
 rejected lazy path are in
@@ -66,59 +72,62 @@ The sequence:
    is false — FATAL with `ERRCODE_CONFIG_FILE_ERROR` and a clear
    `"set shared_preload_libraries = 'pg_transport'"` hint.
 2. `guc::register()` + `guc::validate_required()` — register the
-   four phase-9 GUCs (`backend_pool_size`, `auth_source`,
-   `tls_cert_file`, `tls_key_file`) and FATAL immediately if
+   GUCs (`max_backend_pool_size`, `auth_source`, `tls_cert_file`,
+   `tls_key_file`, `execution_backend`) and FATAL immediately if
    required ones are unset or invalid. See
    [crates/core/src/guc.rs](../../crates/core/src/guc.rs).
 3. Install the rustls `ring` crypto provider process-wide (phase 8
    requirement; idempotent).
-4. Register the frontend bgworker statically (Q22 → option (a) in
+4. Register the **frontend bgworker only** (Q22 → option (a) in
    [roadmap.md §2.3](roadmap.md#23-resolved)) with
    `bgw_restart_time = 1s`.
-5. Register `pg_transport.backend_pool_size` slot bgworkers, each
-   with `bgw_main_arg = slot_id`, `enable_spi_access()`, and a 1 s
-   restart policy.
 
-Once `PostmasterMain` finishes recovery, the postmaster spawns all
-`pool_size` slot workers (each running `pg_transport_slot_main(slot_id)`,
-the entry point for the slot runner loop in §2 below) plus the
-single frontend worker (running `pg_transport_frontend_main`, see
+That's it. No slot bgworkers are statically registered. The FE's
+pool dispatcher creates them via `BackgroundWorkerBuilder::load_dynamic()`
+on demand (see [pool.md §5.2](pool.md#52-grow-on-demand)).
+
+Once `PostmasterMain` finishes recovery, the postmaster spawns only
+the single FE bgworker (`pg_transport_frontend_main`, see
 [crates/core/src/frontend.rs](../../crates/core/src/frontend.rs)).
+The FE binds the single UDS listener at
+`paths::frontend_socket_path()` and spawns its `accept_loop` +
+`idle_reaper` tasks; slots arrive lazily as traffic does.
 
-**Capacity note.** pgrx's `.load()` wraps `RegisterBackgroundWorker`,
-which silently fails when the postmaster's bgworker table is full
-(bounded by `max_worker_processes`, PG default = 8). Footprint is
-1 FE + `backend_pool_size` slots + PG's own bgworkers. For
-`backend_pool_size > ~6` the operator must bump
-`max_worker_processes`; the `just/{e2e,bench}.just` recipes do this
-automatically.
+**Capacity note.** pgrx's `.load_dynamic()` wraps
+`RegisterDynamicBackgroundWorker`, which returns `Err` when the
+postmaster's bgworker table is full (bounded by
+`max_worker_processes`, PG default = 8). Footprint is 1 FE + up to
+`max_backend_pool_size` slots + PG's own bgworkers. For a meaningful
+pool the operator must bump `max_worker_processes`; the
+`just/{e2e,bench}.just` recipes do this automatically. A failed
+`load_dynamic` is surfaced to the dispatcher as a WARNING
+(`"bgworker table full (raise max_worker_processes)"`) and the
+handoff falls back to waiting on existing slots until `HANDOFF_WAIT`.
 
-### Why static (not `load_dynamic()`)
+### Why dynamic (not static `.load()`)
 
-pgrx also exposes `BackgroundWorkerBuilder::load_dynamic()`, which
-wraps PG's `RegisterDynamicBackgroundWorker` and lets a regular
-backend register workers at run time. We don't use it in v0 because:
+The earlier static-registration model is documented in
+[pool.md §0](pool.md#0-problem-this-design-solves) as the design it
+replaces. Briefly:
 
-- The pool is sized once and lives for the whole cluster lifetime;
-  there is no per-request spawn pattern (unlike `pg_background`).
-- Static registration makes the postmaster the parent and the
-  restart-policy owner (`bgw_restart_time`). Dynamic registration
-  ties the worker's lifetime to the backend that registered it
-  unless `bgw_notify_pid` is zeroed — a foot-gun we don't need.
-- First-connection latency does not include pool spawn time.
-- One operational story: "the pool is up iff the postmaster is up."
+- Static sizing required a cluster restart to change `backend_pool_size`.
+- An idle cluster paid the resident-RAM cost for N slot bgworkers
+  even if no one was connected.
+- Round-robin dispatch over a static N had no way to grow into
+  bursty load.
 
-Live pool resize via `load_dynamic()` (grow-only) is sketched in
-[roadmap.md §2 Q15](roadmap.md#2-open-questions) and **deferred** —
-static sizing at `_PG_init()` is sufficient for v0 and the phase-5
-bench harness.
+Dynamic per-demand spawn lets the pool quiesce to zero, grow up to
+the operator's ceiling under load, and shrink back via the idle
+reaper without an operator in the loop. The single-FE-bgworker
+operational story ("the framework is up iff the postmaster is up")
+is preserved: the FE is static; only the slots are dynamic.
 
 ### What `_PG_init()` does *not* do
 
 - It does not start the tokio runtime in the postmaster. Runtimes
   are per-bgworker, created inside each bgworker's `*_main`
   entry point (see [§3 Async / threading model](#3-async--threading-model)
-  for slots; [architecture.md §2](architecture.md#2-runtime-integration-tokio--pgrx--pg-signals)
+  for slots; [architecture.md §3](architecture.md#3-runtime-integration-tokio--pgrx--pg-signals)
   for the frontend).
 - It does not bind any sockets or read the catalog. The frontend
   bgworker binds its listener at boot (currently hard-coded; the
@@ -132,24 +141,41 @@ bench harness.
 
 **Live source:** [crates/core/src/backend/slot.rs](../../crates/core/src/backend/slot.rs).
 The entry point (`pg_transport_slot_main`) is a C-ABI function
-registered in `_PG_init()`; pgrx wraps it with `#[pg_guard]` so any
-uncaught panic surfaces as a PG ereport at the boundary. The slot's
-lifetime:
+registered by `pool::grow_one`'s `BackgroundWorkerBuilder` call;
+pgrx wraps it with `#[pg_guard]` so any uncaught panic surfaces as a
+PG ereport at the boundary. The slot's lifetime:
 
 1. `attach_signal_handlers(SIGHUP | SIGTERM)` and
    `connect_worker_to_spi("postgres", None)` — standard pgrx
    bgworker setup.
-2. `connect_with_retry()` to the per-slot UDS listener the FE
-   created (10 s budget over 100 × 100 ms retries to tolerate the
-   FE ↔ slot startup race).
-3. Build the per-bgworker tokio current-thread runtime *once* and
+2. `connect_with_retry()` to the FE's single UDS listener at
+   `paths::frontend_socket_path()` (10 s budget over 100 × 100 ms
+   retries to tolerate the FE ↔ slot startup race).
+3. `stream.set_nonblocking(true)` so the stream is `AsyncFd`-compatible
+   for the per-step `block_on` windows below.
+4. Build the per-bgworker tokio current-thread runtime *once* and
    keep it across handoffs (Q9-era decision; not rebuilt per
    handoff). Build the `TlsAcceptor` once from the TLS GUCs.
-4. Loop: `BackgroundWorker::sigterm_received()` quick-check, then
-   blocking `fd_pass::recv_fd()`. On `Ok(Some(fd))`, build a
-   `WireCtx` and call `PgwireV3::run(fd, ctx)`; log warnings on
-   `Err`; on `Ok(None)` (clean EOF from FE) exit cleanly. EINTR
-   loops back.
+5. `rt.block_on(fd_pass::wrap_for_async(stream))` — register the
+   stream with the reactor as an `AsyncFd<UnixStream>`. The
+   resulting handle is held across subsequent `block_on` windows.
+6. `rt.block_on(send_ready_byte_async(...))` — announce initial
+   readiness to the FE (`b'R'`).
+7. Loop:
+   - `BackgroundWorker::sigterm_received()` quick-check.
+   - `rt.block_on(timeout(100ms, recv_ctrl_async(...)))` — wait up
+     to 100 ms for the next control message. The timeout makes
+     SIGTERM polling responsive without a dedicated tokio task.
+   - On `Ok(CtrlMsg::FdHandoff(fd))`: build a `WireCtx`, call
+     `PgwireV3::run(fd, ctx)` (sync, with its *own* internal
+     `block_on`), then `rt.block_on(send_ready_byte_async(...))` to
+     announce readiness for the next handoff.
+   - On `Ok(CtrlMsg::DrainRequest)`: call `cleanup_per_slot_state()`,
+     `rt.block_on(send_drain_ack_async(...))`, exit cleanly.
+   - On `Ok(CtrlMsg::Eof)`: FE closed UDS; exit cleanly.
+   - On `Err(timeout)`: re-check SIGTERM and loop.
+   - On `Err(other)`: log + exit; postmaster does not auto-respawn
+     (slots are dynamic with `BGW_NEVER_RESTART`).
 
 The slot runner never:
 
@@ -162,17 +188,22 @@ The slot runner never:
 - Looks at FE/BE message types.
 
 Everything in that list is the wire layer's job. The slot runner is
-deliberately small (~190 LOC including comments): a `recv_fd` loop, a
-wire run, and — once phase ≥ 9.5 lands the per-handoff reset — a
+deliberately small (~250 LOC including comments): a `recv_ctrl`
+loop, a wire run, a `send_ready_byte` between iterations, drain
+handling, and — once phase ≥ 9.5 lands the per-handoff reset — a
 reset step.
 
+The four-opcode UDS protocol (BE → FE: `b'R'` / `b'A'`; FE → BE:
+`b'\0' + SCM_RIGHTS(fd)` / `b'X'`) and its race-freedom analysis
+live in [pool.md §1–§2](pool.md).
+
 > **Silent handoff loss — resolved as accept (option b).** If the
-> backend dies between the frontend's last observation and the
-> `recv_fd` above, the kernel buffers the SCM_RIGHTS payload but
+> backend dies between the frontend's `send_fd` and the slot's
+> `recv_ctrl` above, the kernel buffers the SCM_RIGHTS payload but
 > nobody consumes it — the current client connection is orphaned
-> (TCP RST). The dead slot is detected on the *next* `sendmsg →
-> EPIPE` and respawned then. No per-handoff ack; zero added cost on
-> the happy path. Full reasoning in
+> (TCP RST). The dead slot is observed by the FE's per-slot reader
+> task on EOF and removed from the pool. No per-handoff ack; zero
+> added cost on the happy path. Full reasoning in
 > [roadmap.md §2 Q21](roadmap.md#2-open-questions).
 
 ---
@@ -180,23 +211,62 @@ reset step.
 ## 3. Async / threading model
 
 The slot runner runs on the bgworker's **main thread — the only
-thread**. That thread also hosts a small **single-threaded tokio
-runtime** that the wire layer uses; everything else is sync.
+thread**. That thread hosts a small **single-threaded tokio
+runtime** that the wire layer uses *and* that the slot runner uses
+for short async I/O windows; the outer loop body is sync.
 
 ```
 backend bgworker process (single thread)
-├─ slot runner loop                              (plain sync, no tokio)
+├─ slot runner loop                                    (sync)
+│    rt.block_on(wrap_for_async(stream))               ← reactor registration
+│    rt.block_on(send_ready_byte_async(uds))           ← initial b'R'
 │    loop {
-│      let (fd, hints) = unix_ctrl.recvmsg();   // blocking syscall
-│      runtime.block_on(W::run(fd, build_ctx())); // ← tokio enters here
-│      reset_per_handoff_state();
+│      if sigterm_received() { exit }
+│      msg = rt.block_on(timeout(100ms, recv_ctrl_async(uds)))   // sync await
+│      match msg {
+│        Ok(FdHandoff(fd))  => {
+│          PgwireV3::run(fd, ctx)                      // SYNC; uses ctx.rt.block_on internally
+│          rt.block_on(send_ready_byte_async(uds))     // next b'R'
+│        }
+│        Ok(DrainRequest)   => {
+│          cleanup_per_slot_state()
+│          rt.block_on(send_drain_ack_async(uds))      // b'A'
+│          exit
+│        }
+│        Ok(Eof) | Err(_)   => exit
+│        Err(timeout)       => continue                // re-check SIGTERM
+│      }
 │    }
 │
 └─ runtime: tokio::runtime::Builder::new_current_thread()
              .enable_all()
              .build()                              // built once at bgworker boot
-                                                   // reused across handoffs
+                                                   // reused across all block_on windows
 ```
+
+### Why the outer loop is sync (sequential `block_on`, not nested)
+
+The wire's `PgwireV3::run` is sync at the call site and uses
+`ctx.rt.block_on(...)` internally to drive its own async machinery
+(pgwire's `process_socket`, TLS handshake, etc.). Wrapping the
+slot's outer loop in `rt.block_on(async { loop { ... wire::run ... } })`
+would make the wire's internal `block_on` a **nested** `block_on` on
+the same runtime, which tokio rejects with
+`"Cannot start a runtime from within a runtime"` and the slot
+process exits with code 1. (We found this during integration; see
+the slot.rs module docstring for the post-mortem.)
+
+The fix is to keep the outer loop sync and use short-lived
+`rt.block_on` windows only around the async UDS helpers
+(`recv_ctrl_async`, `send_ready_byte_async`, `send_drain_ack_async`).
+Between those windows the wire's internal `block_on` is a sequential
+entry on the same runtime — not nested.
+
+SIGTERM cancellation comes from `tokio::time::timeout(100ms, ...)`
+around `recv_ctrl_async`: every 100 ms the recv future times out, we
+re-check `BackgroundWorker::sigterm_received()`, and loop. Bounded
+shutdown latency, no `CancellationToken` plumbing, no separate
+signal-poller task.
 
 ### Why tokio appears in the backend at all
 
@@ -205,31 +275,33 @@ reuse the [`pgwire`](https://github.com/sunng87/pgwire) crate and
 [`tokio_rustls`](https://crates.io/crates/tokio-rustls) for TLS
 (Q26). Both expose `tokio::io::AsyncRead` / `AsyncWrite`-shaped APIs
 and `async fn` trait methods; running them needs an async executor.
-A hand-rolled sync wire (using a sync TLS stream + our own FE/BE
-codec) would avoid tokio entirely on this side, at the cost of
-giving up pgwire's protocol code.
+The UDS-side async helpers piggyback on the same runtime — building
+them on the synchronous `recv_fd` we had before the autoscaling pool
+(`fd_pass::recv_ctrl_nonblocking` is still there for that variant)
+would forgo `tokio::time::timeout` for SIGTERM responsiveness.
 
 ### What this runtime is *not*
 
-- **Not a concurrency primitive.** Exactly one task runs on it (the
-  current handoff's `W::run` future). One client per slot at a time,
-  by construction.
+- **Not a concurrency primitive.** Exactly one task runs on it at a
+  time (the current handoff's `W::run` future, or the brief UDS-IO
+  window). One client per slot at a time, by construction.
 - **Not multi-threaded.** That would violate C-2 (PG state is
   single-threaded). Current-thread only.
 - **Not a `LocalSet`-bearer.** No `spawn_local`; the wire's `run`
-  future is the whole workload. The frontend uses `LocalSet` because
-  it multiplexes per-transport tasks; the backend has nothing to
+  future is the whole workload. (An early prototype put a
+  `spawn_local`'d SIGTERM poller here; it panicked because the
+  bare current-thread runtime is not entered through a `LocalSet`.
+  The `tokio::time::timeout` pattern above is what works.) The
+  frontend uses `LocalSet` because it multiplexes per-transport,
+  per-reader, per-watchdog tasks; the backend has nothing to
   multiplex.
-- **Not rebuilt per handoff.** One `Runtime` per bgworker, reused for
-  every `block_on(...)`. Building tokio runtimes costs hundreds of
-  microseconds; per-handoff construction would dominate connection
-  setup.
-- **Not running the slot runner loop itself.** The `recvmsg` loop and
-  the per-handoff reset are plain sync code *outside* `block_on`. The
-  runtime is entered per handoff and exited when the wire returns.
+- **Not rebuilt per handoff.** One `Runtime` per bgworker, reused
+  for every `block_on(...)` (slot loop UDS-IO *and* wire run).
+  Building tokio runtimes costs hundreds of microseconds;
+  per-handoff construction would dominate connection setup.
 
 It's effectively a **trampoline / executor for the wire's async
-future**, not a scheduler.
+future and the slot's UDS helpers**, not a scheduler.
 
 ### SPI blocking the runtime is fine
 
@@ -254,11 +326,13 @@ Satisfied by construction:
 ### Cost
 
 - ~1 MB of resident state per bgworker (timer wheel + I/O reactor
-  allocations). With `backend_pool_size = max(4, num_cpus)` that's
-  small in absolute terms.
-- Per-handoff `block_on` entry cost is microseconds (no runtime
-  construction; just polling the first frame of the wire's `run`
-  future).
+  allocations). With autoscaling and a quiescable pool
+  (`MIN_WARM_SLOTS = 0`), an idle cluster pays zero — no resident
+  bgworkers at all.
+- Per-handoff cost: one `rt.block_on(recv_ctrl_async)` round-trip
+  (microseconds when a message is already queued) + the wire's own
+  `block_on` entry + one `rt.block_on(send_ready_byte_async)` after.
+  All microseconds; dominated by the actual wire work.
 - Per pgwire call: whatever `Future::poll` adds over a sync call —
   negligible next to `read`/`write` syscalls or SPI execution.
 
@@ -309,54 +383,73 @@ never built one. The wire layer's own constructs are its own
 
 ## 6. Slot lifecycle
 
-The slot runner doesn't make any choices about the slot's lifetime
-itself — that's policy enforced by the pool above. What it observes
-and responds to:
+The slot runner doesn't make any policy choices about the slot's
+lifetime — that's the pool's job (see [pool.md §5](pool.md)). What
+it observes and responds to:
 
-| Event                              | Slot runner's response                                                              |
-| ---------------------------------- | ----------------------------------------------------------------------------------- |
-| `recvmsg` returns a handoff        | Build `WireCtx`, run the wire, reset, loop                                          |
-| `recvmsg` returns EOF              | Frontend's end of the per-slot UDS closed; clean exit                               |
-| `shutdown.cancelled()` fires       | Stop accepting new handoffs; if a wire is currently running, wait for it to observe the shutdown token via `WireCtx`; reset and exit |
-| Wire returns `Err`                 | Log, reset, continue the loop (slot remains in the pool)                            |
-| Postmaster-death detected          | Behaves the same as shutdown                                                        |
+| Event                                  | Slot runner's response                                                              |
+| -------------------------------------- | ----------------------------------------------------------------------------------- |
+| `recv_ctrl` returns `FdHandoff(fd)`    | Build `WireCtx`, run the wire, send `b'R'`, loop                                    |
+| `recv_ctrl` returns `DrainRequest`     | Call `cleanup_per_slot_state`, send `b'A'`, exit cleanly (bgworker terminates)      |
+| `recv_ctrl` returns `Eof`              | Frontend closed the UDS (crash or shutdown); exit cleanly                           |
+| `recv_ctrl` returns timeout (100 ms)   | Re-check `sigterm_received()`; loop                                                 |
+| SIGTERM observed                       | Exit cleanly. The FE's per-slot reader sees EOF on the stream and removes the slot from whichever container it was in. |
+| Wire returns `Err`                     | Log warning, send `b'R'`, continue the loop (slot remains in the pool)              |
+| Postmaster-death detected              | Postmaster will SIGTERM all bgworkers; handled via the SIGTERM path                 |
 
 The slot runner has no concept of "session" beyond the bounds of one
 wire `run` call.
+
+**Drain ack timeout.** If the wire is mid-session when a
+`DrainRequest` arrives, the ack only fires after `wire::run`
+returns. The FE protects against an arbitrarily long wait with a
+`DRAIN_ACK_TIMEOUT` (60 s default) watchdog that falls back to
+`shutdown(SHUT_WR)` on the FE side — the slot's next `recv_ctrl`
+then returns `Eof` and the slot exits. See
+[pool.md §5.3](pool.md#53-shrink-on-idle-reaper--cooperative-drain).
 
 ---
 
 ## 7. Limitations specific to the slot layer
 
-- **One wire instance per handoff.** The slot runner doesn't multiplex
-  wire-layer sessions onto one slot. (The framework's [comparison.md](comparison.md)
-  discussion of "slot pinning" applies here unchanged.)
+- **One wire instance per handoff.** The slot runner doesn't
+  multiplex wire-layer sessions onto one slot. (The framework's
+  [comparison.md](comparison.md) discussion of "slot pinning"
+  applies here unchanged.)
 - **Wire trait is compile-time, not configurable per row.** A slot
-  runs whichever `W: Wire` the build was compiled with. In v0 that's
-  always `pgwire_v3::PgwireV3`. A future "let the catalog row pick the
-  wire" feature would require either pluggable factories (the
-  framework already has those for transports — same shape) or one slot
-  pool per wire kind.
+  runs whichever `W: Wire` the build was compiled with. In v0
+  that's always `pgwire_v3::PgwireV3`. A future "let the catalog
+  row pick the wire" feature would require either pluggable
+  factories (the framework already has those for transports — same
+  shape) or one slot pool per wire kind.
 - **No transport-side message inspection.** The transport's
-  [frontend-handoff.md §5](frontend-handoff.md) limitation pulls all the way through:
-  the slot runner doesn't see protocol bytes either. Anything that
-  needs them must live in the wire layer.
+  [frontend-handoff.md §5](frontend-handoff.md) limitation pulls
+  all the way through: the slot runner doesn't see protocol bytes
+  either. Anything that needs them must live in the wire layer.
+- **Dynamic slots are `BGW_NEVER_RESTART`.** If a slot crashes (or
+  exits cleanly via drain / Eof), the postmaster does not respawn
+  it. The next saturation event will grow a fresh slot via
+  `pool::grow_one`; see [pool.md §5.2](pool.md#52-grow-on-demand).
 
-(Wire-layer-side concerns — TLS, auth, extended-query state — live in
-[backend-wire.md](backend-wire.md). Cancel routing is deferred from v0;
-design in [deferred/cancel-routing.md](deferred/cancel-routing.md).)
+(Wire-layer-side concerns — TLS, auth, extended-query state — live
+in [backend-wire.md](backend-wire.md). Cancel routing is deferred
+from v0; design in
+[deferred/cancel-routing.md](deferred/cancel-routing.md).)
 
 ---
 
 ## See also
 
-- [frontend-handoff.md](frontend-handoff.md) — the FE/IPC side: when this path applies,
-  per-slot control socket setup/teardown, `SCM_RIGHTS` mechanics, the
-  end-to-end per-connection sequence.
+- [pool.md](pool.md) — the pool-level design: single UDS listener,
+  three slot containers, autoscaling, cooperative drain, race-freedom
+  proofs.
+- [frontend-handoff.md](frontend-handoff.md) — the FE/IPC side:
+  when this path applies, the per-connection sequence
+  client → transport → handoff → slot dispatch.
 - [backend-wire.md](backend-wire.md) — the layer this slot runner
   drives: wire trait, the v0 pgwire-v3 implementation via the
   `pgwire` (sunng87) crate, TLS, auth, SPI bridge, open questions.
 - [api.md](api.md) — `HandoffHandle::handoff(fd)`, the only thing a
   transport calls.
-- [backend-pool.md](deferred/backend-pool.md) — *deferred* design for
-  the slot-runner-equivalent on the shm_mq general path.
+- [backend-pool.md](deferred/backend-pool.md) — *deferred* design
+  for the slot-runner-equivalent on the shm_mq general path.

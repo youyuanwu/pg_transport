@@ -14,7 +14,7 @@ phases are listed in [../future-transports.md §4](deferred/future-transports.md
 | ----- | ------------------------------------------------------------- | -------------------------------------------------------------------- |
 | **0** | Repo scaffold, ADRs, this design doc set                      | `cargo check -p api -p core` passes                                  |
 | **1** | `core` bgworker boots a tokio current-thread runtime          | Heartbeat task logs every 1 s; clean SIGHUP/SIGTERM via `tokio::signal`; postmaster-death watchdog exits the runtime |
-| **2** | `backend` pool slot runner — pre-spawned bgworkers, per-slot UDS control socket | Pool starts N backend bgworkers; frontend can `sendmsg(SCM_RIGHTS)` a dummy fd to a slot; slot runner reads and closes it; no wire layer yet |
+| **2** | `backend` pool slot runner — demand-driven autoscaling, single FE UDS listener | FE binds one UDS listener; slot bgworkers spawn dynamically via `pool::grow_one`; pool grows on demand and shrinks on idle under `pg_transport.max_backend_pool_size` ceiling; cooperative drain via `b'X'`/`b'A'`. See [pool.md](pool.md). |
 | **3** | `tcp_handoff` transport (`handoff::tcp`) as a `HandoffTransport` + null-wire | `psql` connects to the listener; the null wire closes immediately with a synthetic `FATAL` (no SQL yet). Validates the FE → BE fd-pass path end-to-end. |
 | **4** | `wire::pgwire_v3` first impl — startup, simple-query (`'Q'`), SPI bridge | `psql -c 'SELECT 1'` returns `1`. `trust` auth only (no TLS, no SCRAM yet). Extended-query reports a clear "not supported" error frame. |
 | **5** | `bench/` harness                                              | Reports p50/p95/p99 latency, throughput; produces a CSV per run. If numbers show SPI overhead is material, a follow-up ADR considers a planner+executor direct path (post-v0; see [§2 Q18](#2-open-questions)). |
@@ -107,26 +107,8 @@ transport that the type doesn't enforce. Adding `QueryTransport` +
 forces breaking changes when a transport later wants `BEGIN`/`COMMIT`
 continuity. Revisit when the shm_mq path lands.
 
-**Q15. Live pool resize.** `pg_transport.backend_pool_size` is read
-once at frontend startup; v0 requires `stop()` / `start()` (or a
-postmaster restart) to change it. Should `pg_transport.reload()` be
-able to grow and/or shrink the pool without a frontend restart? Lean
-**yes for grow, no for shrink** at first:
-
-- *Grow* is cheap and safe — call `RegisterDynamicBackgroundWorker`
-  for the additional slots, allocate their Unix control sockets,
-  plumb them into the semaphore. No in-flight work is affected.
-- *Shrink* needs a drain protocol — mark slots "no new handoffs",
-  wait for current handoffs to finish (potentially unbounded), then
-  tell the bgworker to exit cleanly. Avoidable for now; if a real
-  deployment needs it, it's a follow-up ADR.
-
-Deferred from v0: a static pool sized at `_PG_init()` is sufficient
-for the research framework and the phase-5 bench harness (operator
-picks a size, the bench characterises it). Un-defer when a real
-deployment hits a sizing mistake they can't restart away. Strictly a
-v0-feature defer rather than a shm_mq-path defer, but the un-defer
-trigger is the same: real-deployment demand.
+**Q15. ~~Live pool resize.~~** **Resolved** — see
+[§2.3 Q15](#23-resolved).
 
 **Q16. Wire-layer cancel routing.** v0 drops `CancelRequest` fds
 silently; Ctrl-C in `psql` terminates the connection rather than
@@ -205,6 +187,21 @@ from `pg_transport.tls_{cert,key}_file` GUCs. Extension point
 (`cert_id` on `HandoffHints`) pre-allocated but not built; un-defer
 when a real deployment needs distinct certs per listener address.
 
+**Q15. Live pool resize** — implemented as **demand-driven
+autoscaling under a single ceiling GUC** rather than the originally
+sketched grow-via-`reload()` path. `pg_transport.max_backend_pool_size`
+(`SUSET`, default 64) is the only operator-visible knob; the pool
+grows on demand when a handoff arrives with no ready slot, shrinks
+via an idle reaper (`IDLE_REAP_AFTER = 60s`), and reconciles to a
+lower ceiling via the SIGHUP handler (drain idle first, leave
+`in_flight` to finish naturally). Cooperative drain protocol
+(`b'X'` request / `b'A'` ack) with a `DRAIN_ACK_TIMEOUT` (60 s)
+watchdog handles slots stuck in long-running queries by falling
+back to `shutdown(SHUT_WR)`. Full design and race-freedom analysis
+live in [pool.md](pool.md); implementation across
+[crates/core/src/backend/pool.rs](../../crates/core/src/backend/pool.rs)
+and siblings.
+
 **Q17. Extended-query state ownership** — option (a): wire layer owns
 the name maps (`HashMap<String, SpiPlan>` and `HashMap<String,
 BoundPortal>`); SPI owns the underlying plans. See
@@ -245,7 +242,7 @@ reconciles listeners against the catalog; it does not bounce the FE.
 
 **Q23. Phase-1 GUC inventory** — zero new GUCs in phase 1. Heartbeat
 + watchdog intervals are hard-coded constants. GUC surface starts at
-phase 2 (`backend_pool_size`) and grows as each phase adds knobs
+phase 2 (`max_backend_pool_size`) and grows as each phase adds knobs
 without defensible defaults. See
 [configuration.md §1.1](configuration.md#11-gucs-implemented).
 

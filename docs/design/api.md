@@ -91,36 +91,48 @@ Why the name `HandoffTransport` rather than just `Transport`:
 pool implements). The transport-facing surface:
 
 ```rust
+pub type HandoffFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>>;
+
 impl HandoffHandle {
-    pub fn handoff(&self, fd: OwnedFd, hints: HandoffHints) -> anyhow::Result<()>;
+    pub fn handoff(&self, fd: OwnedFd, hints: HandoffHints) -> HandoffFuture<'_>;
 }
 ```
 
-No Payload, no SessionOpts, no FrameStream — the backend wire layer
-reads `StartupMessage` from the fd itself, so the framework doesn't
-need to pass database/user/auth metadata. The handle is cheaply
-cloneable (`Rc` internally) and `!Send` (the sink lives on the
-frontend's current-thread runtime).
+`handoff` is **async** because the pool dispatcher awaits a ready
+slot before `send_fd`'ing (see [pool.md §1.3](pool.md#13-dispatch-path)
+for the demand-driven dispatch model). On the warm-pool fast path,
+the await resolves in microseconds; on cold-grow or saturation it
+blocks up to `HANDOFF_WAIT` (5 s default). The returned `HandoffFuture`
+is boxed-local because the `HandoffSink` trait stays object-safe and
+the pool's implementation is `!Send`.
+
+No `Payload`, no `SessionOpts`, no `FrameStream` — the backend wire
+layer reads `StartupMessage` from the fd itself, so the framework
+doesn't need to pass database/user/auth metadata. The handle is
+cheaply cloneable (`Rc` internally) and `!Send` (the sink lives on
+the frontend's current-thread runtime).
 
 `HandoffHints` is a tiny per-handoff metadata block (currently
 `{ tls_allowed: bool }`); a `cert_id` field for per-listener TLS
 variation is deferred per Q13.
 
-For the implementation of `handoff` (`SCM_RIGHTS`, per-slot control
-socket, slot runner, wire layer), see
+For the implementation of `handoff` (`SCM_RIGHTS`, single FE UDS
+listener, dispatcher's ready-slot pop, slot runner, wire layer), see
+[pool.md](pool.md),
 [frontend-handoff.md](frontend-handoff.md),
 [backend-handoff.md](backend-handoff.md), and
 [backend-wire.md](backend-wire.md).
 
-> **Resolved: simplest contract.** `handoff()` returns `Ok(())` on
-> successful kernel-level handoff ("kernel accepted the fd-pass" —
-> per Q21 this is `Ok(())` even if the backend dies before
-> `recvmsg`; the client connection is then lost via TCP RST and the
-> slot respawns on the next `sendmsg → EPIPE`), or `Err(Cancelled)`
-> if the frontend shuts down while the future is pending. Pool
-> exhaustion blocks on a semaphore until a slot frees; `EAGAIN`/
-> `EINTR` retry transparently; slot death mid-`sendmsg` is invisible
-> to the caller. Full reasoning in
+> **Resolved: simplest contract.** `handoff()` resolves to `Ok(())`
+> on successful kernel-level handoff ("kernel accepted the fd-pass"
+> — per Q21 this is `Ok(())` even if the backend dies before
+> `recv_ctrl`; the client connection is then lost via TCP RST). On
+> pool saturation (no ready slot within `HANDOFF_WAIT`), resolves
+> to `Err(anyhow!("no slot became ready within ..."))`; the
+> transport drops the fd, which the client observes as TCP reset.
+> On frontend shutdown mid-handoff: the future is dropped; the fd
+> is freed by `OwnedFd`'s drop. `EAGAIN`/`EINTR` retry transparently.
+> Full reasoning in
 > [roadmap.md §2 Q20](roadmap.md#2-open-questions) and
 > [Q21](roadmap.md#2-open-questions).
 

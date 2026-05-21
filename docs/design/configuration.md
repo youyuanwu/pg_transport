@@ -15,16 +15,15 @@ the sketch).
 
 Defined in [crates/core/src/guc.rs](../../crates/core/src/guc.rs)
 and registered from `_PG_init()`
-([crates/core/src/lib.rs](../../crates/core/src/lib.rs)). All four
-are `PGC_POSTMASTER` — read once at boot; changing them requires a
-cluster restart.
+([crates/core/src/lib.rs](../../crates/core/src/lib.rs)).
 
-| GUC | Type | Default | Notes |
-| --- | --- | --- | --- |
-| `pg_transport.backend_pool_size` | int (1–64) | `2` | Number of slot bgworkers `_PG_init()` registers. The design's eventual default is `max(4, num_cpus)`; the testing-friendly `2` lets `cargo pgrx test` run inside PG's default `max_worker_processes = 8`. See [backend-handoff.md §1](backend-handoff.md). |
-| `pg_transport.auth_source` | string | **required, no default** | `'pg_hba'` or `'pg_transport'`. Validated at `_PG_init()`; an unset/invalid value FATALs at cluster start so operators see the mistake at boot rather than via mid-flight slot deaths. See [backend-wire.md §4](backend-wire.md). |
-| `pg_transport.tls_cert_file` | string | empty | Path to the server TLS certificate (PEM). Empty disables TLS. See [backend-wire.md §5](backend-wire.md). |
-| `pg_transport.tls_key_file` | string | empty | Path to the server TLS private key (PEM, PKCS#8). Empty disables TLS. Setting only one of `tls_cert_file` / `tls_key_file` FATALs at slot boot. |
+| GUC | Type | Default | Context | Notes |
+| --- | --- | --- | --- | --- |
+| `pg_transport.max_backend_pool_size` | int (1–1024) | `64` | `SUSET` | Hard ceiling on the autoscaling slot pool. Pool grows on demand and shrinks on idle; this is the upper bound. SIGHUP can lower the ceiling live — the pool's reconcile path drains excess `ready` slots, then waits for `in_flight` slots to free naturally. Raising the ceiling lets the next saturation event grow further. Compile-time tunables (`IDLE_REAP_AFTER`, `HANDOFF_WAIT`, `MIN_WARM_SLOTS`, `DRAIN_ACK_TIMEOUT`) are documented in [pool.md §5.1](pool.md#51-the-single-knob). |
+| `pg_transport.auth_source` | string | **required, no default** | `POSTMASTER` | `'pg_hba'` or `'pg_transport'`. Validated at `_PG_init()`; an unset/invalid value FATALs at cluster start. See [backend-wire.md §4](backend-wire.md). |
+| `pg_transport.tls_cert_file` | string | empty | `POSTMASTER` | Path to the server TLS certificate (PEM). Empty disables TLS. See [backend-wire.md §5](backend-wire.md). |
+| `pg_transport.tls_key_file` | string | empty | `POSTMASTER` | Path to the server TLS private key (PEM, PKCS#8). Empty disables TLS. Setting only one of `tls_cert_file` / `tls_key_file` FATALs at slot boot. |
+| `pg_transport.execution_backend` | string | `'spi'` | `USERSET` | Extended-query execution backend (`'spi'` or `'direct'`). Per-session canary capability for the direct planner+executor path; see [deferred/planner-executor-direct-path.md](deferred/planner-executor-direct-path.md). |
 
 GUCs the [original design](#13-planned-catalog-surface) reserved but
 that aren't registered yet — `pg_transport.socket_directory`,
@@ -158,7 +157,9 @@ the spiritual ancestor.
 
 ## See also
 
+- [pool.md](pool.md) — the pool the `max_backend_pool_size`
+  ceiling governs.
 - [workspace.md](workspace.md) — the compile-time registry that backs
   `available()`; v0 has no Cargo features.
 - [deferred/backend-pool.md](deferred/backend-pool.md) —
-  `backend_pool_size` sizing, `metrics_port` exposure.
+  `metrics_port` exposure.

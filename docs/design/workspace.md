@@ -26,7 +26,7 @@ pg_transport/
 │   │       │   ├── pool.rs         # FE-side slot table + sendmsg(SCM_RIGHTS)
 │   │       │   ├── slot.rs         # BE-side per-slot loop (recvmsg + Wire::run)
 │   │       │   ├── fd_pass.rs      # SCM_RIGHTS sendmsg/recvmsg helpers
-│   │       │   ├── paths.rs        # well-known per-slot UDS paths
+│   │       │   ├── paths.rs        # well-known FE UDS path (frontend.sock)
 │   │       │   ├── spi.rs          # safe Rust wrappers around SPI_* (see source)
 │   │       │   ├── spi_bridge.rs   # simple-query handler (Q')
 │   │       │   └── extended.rs     # extended-query handler (P/B/D/E/S)

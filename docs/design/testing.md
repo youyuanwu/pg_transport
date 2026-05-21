@@ -135,7 +135,7 @@ see [workspace.md §1](workspace.md#1-cargo-workspace-layout)):
 | TLS handshake failure       | Mock `WireCtx.tls_acceptor` that returns `Err` on `accept()`; assert wire emits `ErrorResponse` and closes |
 | Auth failure (wrong creds)  | Real SCRAM exchange with wrong password; assert `SQLSTATE 28P01` arrives at client             |
 | SPI runtime error           | Mock SPI bridge returns `Err(SPI_ERROR_*)`; assert wire emits `ErrorResponse` with mapped SQLSTATE |
-| Pool exhausted              | Set `backend_pool_size = 1`, hold one connection open, attempt second `handoff()`; assert it blocks until first releases |
+| Pool exhausted              | Set `max_backend_pool_size = 1`, hold one connection open, attempt second `handoff()`; assert it waits up to `HANDOFF_WAIT` and then resolves to a saturation error (TCP reset to client). |
 | Shutdown mid-handoff        | Fire `ShutdownToken` while a handoff is awaiting slot-acquire; assert `Err(Cancelled)` and fd closed |
 | Frontend SIGKILL            | `kill -KILL <frontend_pid>` while connections active; assert slot bgworkers detect postmaster-death-watchdog and exit cleanly |
 

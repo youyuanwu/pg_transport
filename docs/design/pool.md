@@ -1,34 +1,35 @@
-# Slot readiness signaling — demand-driven fd dispatch
+# Backend pool — autoscaling, demand-driven fd dispatch
 
-> Parent: [README.md](../README.md)
-> Sibling: [frontend-handoff.md](../frontend-handoff.md) · [backend-handoff.md](../backend-handoff.md) · [api.md](../api.md)
+> Parent: [README.md](README.md)
+> Sibling: [frontend-handoff.md](frontend-handoff.md) · [backend-handoff.md](backend-handoff.md) · [api.md](api.md)
 
-> **Status: deferred.** This design extends the static
-> `pg_transport.backend_pool_size` model with bidirectional UDS ready
-> signaling (§1–§4), cooperative drain, and demand-driven autoscaling
-> (§5). Un-defer when (a) head-of-line blocking on a busy slot becomes
-> observable in real workloads, or (b) an operator hits a sizing
-> mistake they cannot restart away. See [roadmap.md §2 Q15](../roadmap.md)
-> for the original deferral rationale.
->
-> **When implemented, this replaces:** the static slot registration
-> in `_PG_init` ([backend-handoff.md §1](../backend-handoff.md)), the
-> `BackendPool::start` flow and round-robin `pick_slot` in
-> [frontend-handoff.md §2](../frontend-handoff.md), and the
-> `backend_pool_size` GUC. Cross-cutting changes are listed in §4.
+> **Status: active.** This is the canonical design for the FE-side
+> pool. Implemented across
+> [crates/core/src/backend/pool.rs](../../crates/core/src/backend/pool.rs),
+> [crates/core/src/backend/slot.rs](../../crates/core/src/backend/slot.rs),
+> [crates/core/src/backend/fd_pass.rs](../../crates/core/src/backend/fd_pass.rs),
+> and [crates/core/src/frontend.rs](../../crates/core/src/frontend.rs).
+> Replaces the earlier static
+> `pg_transport.backend_pool_size` model.
 >
 > **Platform scope:** Linux-only. The design assumes Linux SOCK_STREAM
 > semantics where 1-byte writes are atomic and never short-write (see
 > §2). Portability to other Unixes requires re-verification of UDS
 > atomicity, `MSG_NOSIGNAL`, and `SO_PEERCRED` behaviour.
+>
+> **Companions.** This doc is the pool-level design; the per-handoff
+> lifecycle on the slot side lives in
+> [backend-handoff.md](backend-handoff.md), and the transport-side
+> "what does `handoff(fd)` mean" view lives in
+> [frontend-handoff.md](frontend-handoff.md).
 
-## 0. Problem
+## 0. Problem this design solves
 
-The current pool dispatches fds with **blind round-robin**
-(`BackendPool::pick_slot`). The frontend has no visibility into which
-slots are busy; `send_fd` always succeeds (the kernel buffers the
+An earlier draft dispatched fds with **blind round-robin** against a
+statically-sized pool. The frontend had no visibility into which
+slots were busy; `send_fd` always succeeded (the kernel buffers the
 SCM_RIGHTS message in the receiving socket's buffer) even when the
-target slot is mid-session. Consequences:
+target slot was mid-session. Consequences:
 
 1. **Head-of-line blocking.** A client whose fd lands on a busy slot
    stalls silently until the slot finishes its current session and
@@ -41,6 +42,13 @@ target slot is mid-session. Consequences:
 3. **Uneven load.** A slow query on slot 0 doesn't redirect traffic
    to idle slots 1–N. Round-robin assigns the next fd to slot 1
    regardless of whether slot 0 just freed up.
+4. **Static sizing is hostile to operators.** A size set in
+   `postgresql.conf` requires a cluster restart to change. An
+   operator who under-sized at boot has no in-flight remedy.
+
+This design replaces blind round-robin with **demand-driven pull**
+(ready-byte protocol, §1–§4) and replaces the static GUC with
+**autoscaling under a single ceiling** (§5).
 
 ## 1. Design: ready-byte protocol
 
@@ -287,7 +295,7 @@ async fn send_fd_async(stream: &AsyncFd<UnixStream>, fd: RawFd) -> io::Result<()
 
 The same pattern wraps `send_ready_byte`, `send_drain_request`, and
 `send_drain_ack`. The existing `fd_pass::{send_fd, recv_fd}` helpers
-in [fd_pass.rs](../../../crates/core/src/backend/fd_pass.rs) become
+in [fd_pass.rs](../../crates/core/src/backend/fd_pass.rs) become
 their `_nonblocking` variants \u2014 internally identical to today but
 with `MSG_DONTWAIT` on the syscall (or relying on `O_NONBLOCK`).
 
@@ -399,7 +407,7 @@ SIGHUP, but it's not required for correctness.
 **Cluster discriminator.** Inherited from `paths::slot_dir()`. The
 phase-2 hard-coded `/tmp/pg_transport_sockets/` directory is
 single-cluster-per-host; multi-cluster hosts need the phase-7
-`pg_transport.socket_directory` GUC ([paths.rs](../../../crates/core/src/backend/paths.rs))
+`pg_transport.socket_directory` GUC ([paths.rs](../../crates/core/src/backend/paths.rs))
 to give each cluster its own directory. The filename `frontend.sock`
 stays cluster-agnostic; collision avoidance is the directory's job.
 
@@ -509,9 +517,14 @@ not the EPIPE retry path.
 
 ### 3.4 Frontend restart
 
-On frontend restart, `BackendPool::start` re-accepts connections
-from all slots. Each slot re-sends its initial `b'R'` on the new
-stream. Clean restart, no state leak.
+On frontend restart, the postmaster respawns the FE bgworker; the
+FE rebinds `paths::frontend_socket_path()` (the defensive `unlink`
+clears any leftover socket file) and spawns a fresh `accept_loop`.
+Dynamic slots from the previous FE instance saw EOF on their UDS,
+exited cleanly via `CtrlMsg::Eof`, and were not respawned
+(`BGW_NEVER_RESTART`). The new FE starts with an empty pool; the
+first arriving handoff triggers a fresh `grow_one`. Clean restart,
+no state leak.
 
 ### 3.5 Partial read / short write
 
@@ -519,31 +532,18 @@ Both `b'R'` (1 byte, no ancillary) and `send_fd` (1 byte + SCM_RIGHTS)
 are atomic on `SOCK_STREAM` for these sizes. No partial-message
 concern.
 
-## 4. Changes required
+## 4. Module layout
 
-| File | Change |
-|------|--------|
-| `crates/api/src/lib.rs` | `HandoffSink::handoff` returns `BoxFuture` (or `async fn`). `HandoffHandle::handoff` becomes `async fn`. |
-| `crates/core/src/backend/pool.rs` | Replace `BackendPool` with `Pool { state: Mutex<PoolState>, has_ready: Notify, growing: AtomicBool }`. `PoolState` carries `ready: IndexMap`, `in_flight: HashMap`, `draining: HashMap` (see §5.7). Replace `pick_slot` + sync `send_fd` with `dispatch` that pops from `ready`, moves into `in_flight`, then calls `send_fd`. |
-| `crates/core/src/backend/pool.rs` | Spawn the `accept_loop` task on FE boot. It owns the single `UnixListener` and a per-pool `JoinSet<()>` into which each per-slot reader task is spawned. A sibling **reader supervisor** task drains `JoinSet::join_next()`: on a reader exit while its slot is still in `in_flight` or `ready`, move the slot to `draining` and `shutdown(SHUT_WR)` the stream. The supervisor runs for the lifetime of the FE. |
-| `crates/core/src/backend/fd_pass.rs` | Add `send_ready_byte(stream_fd) -> io::Result<()>`. Replace `recv_fd` with non-blocking `recv_ctrl_nonblocking` returning `enum CtrlMsg { FdHandoff, DrainRequest, Eof }`. Add non-blocking `send_drain_request` (FE) and `send_drain_ack` (BE) helpers. All write/recv use `MSG_DONTWAIT`. |
-| `crates/core/src/backend/fd_pass.rs` (or new `fd_pass/async_io.rs`) | Add `AsyncFd<UnixStream>` wrappers: `recv_ctrl_async`, `send_fd_async`, `send_ready_byte_async`, `send_drain_request_async`, `send_drain_ack_async`. Each loops on `readable()`/`writable()` + `try_io` over the non-blocking libc helpers. See §1.5. |
-| `crates/core/src/backend/slot.rs` | Wrap the entire main loop in `rt.block_on(async { ... })`. Use `tokio::select!` with `shutdown.cancelled()` to interrupt `recv_ctrl_async` on SIGTERM. Handle `DrainRequest`: free per-slot caches, send `b'A'`, return cleanly. Connect to `paths::frontend_socket_path()` (no `bgw_main_arg`). |
-| `crates/core/src/handoff/tcp.rs` | `.await` on `handle.handoff(fd, hints)`. On timeout error, optionally send `ErrorResponse` before closing fd. |
-| tests | Update mock `HandoffSink` impls to return futures. |
-
-Additional changes for autoscaling (§5):
-
-| File | Change |
-|------|--------|
-| `crates/core/src/backend/pool.rs` | Add `grow_one`/`request_drain` (cooperative), monotonic slot-id counter on `PoolState`. Spawn ack-timeout watchdog per drain that falls back to `shutdown(SHUT_WR)` on `DRAIN_ACK_TIMEOUT`. Replace per-slot-listener `start()` with single-listener `accept_loop` that assigns slot ids on accept. |
-| `crates/core/src/backend/pool.rs` | Spawn a per-pool idle-reaper task on an interval timer. |
-| `crates/core/src/backend/paths.rs` | Replace `slot_socket_path(slot_id)` with `frontend_socket_path()` returning `slot_dir().join("frontend.sock")`. Multi-cluster collision is the responsibility of `slot_dir()` (phase-7 `pg_transport.socket_directory` GUC). |
-| `crates/core/src/lib.rs` | Drop static slot registration from `_PG_init`. Only the FE bgworker is registered statically; all slots are created via `load_dynamic()` from the FE with no `bgw_main_arg`. |
-| `crates/core/src/guc.rs` | Replace `pg_transport.backend_pool_size` with `pg_transport.max_backend_pool_size`. |
-| `crates/core/src/backend/pool.rs` (pre-warm) | After `accept_loop` is bound, fire `MIN_WARM_SLOTS` parallel `grow_one()` calls. Fire-and-forget; do not wait for the slots to enter `ready`. If `grow_one` fails (e.g. `max_worker_processes` already exhausted at boot), log WARNING and continue with a partial pre-warm — the first client connections will simply pay cold-grow latency or hit `HANDOFF_WAIT`. |
-| `crates/core/src/backend/pool.rs` (SIGHUP ceiling) | Add a SIGHUP handler that observes `max_backend_pool_size`. If the new value is **lower** than `ready.len() + in_flight.len() + draining.len()`, kick off `(current - new)` extra `request_drain` calls (prefer `ready` slots first, then mark `in_flight` slots for drain-on-next-`b'R'`). The reaper's idle-timeout path does **not** cover this case because over-ceiling slots may be actively serving. |
-| `crates/core/src/backend/slot.rs` | Read no `bgw_main_arg`; connect to `paths::frontend_socket_path()`. Handle `DrainRequest` from `recv_ctrl`: free per-slot caches, send `b'A'`, return cleanly. |
+| File | Role |
+|------|------|
+| [crates/api/src/lib.rs](../../crates/api/src/lib.rs) | `HandoffSink::handoff` returns `HandoffFuture<'_>`; `HandoffHandle::handoff` is async — the dispatcher awaits a ready slot before `send_fd`. |
+| [crates/core/src/backend/pool.rs](../../crates/core/src/backend/pool.rs) | `Pool { state: parking_lot::Mutex<PoolState>, has_ready: Notify, growing: AtomicBool }` with three slot containers (§5.7); `bind_listener`, `accept_loop`, `slot_reader_wrapper`, `idle_reaper`, `grow_one`, `request_drain`, `sighup_reconcile`, `pre_warm`. |
+| [crates/core/src/backend/fd_pass.rs](../../crates/core/src/backend/fd_pass.rs) | 4 opcodes + `CtrlMsg` enum; non-blocking `*_nonblocking` libc helpers; `AsyncFd<UnixStream>` async wrappers; `wrap_for_async` setup. |
+| [crates/core/src/backend/slot.rs](../../crates/core/src/backend/slot.rs) | Slot bgworker entry. Connects to `paths::frontend_socket_path()`; outer sync loop with short `rt.block_on` windows for UDS I/O (the wire's internal `block_on` cannot nest, see §1.5); `DrainRequest` → `cleanup_per_slot_state` + `b'A'` ack. |
+| [crates/core/src/backend/paths.rs](../../crates/core/src/backend/paths.rs) | One well-known path: `frontend_socket_path()` returns `slot_dir().join("frontend.sock")`. |
+| [crates/core/src/lib.rs](../../crates/core/src/lib.rs) | `_PG_init` registers **only** the FE bgworker statically; slots are dynamic (`load_dynamic` from `pool::grow_one`). |
+| [crates/core/src/frontend.rs](../../crates/core/src/frontend.rs) | FE supervisor. Calls `bind_listener`, constructs the `Pool`, optionally `pre_warm`s `MIN_WARM_SLOTS`, spawns `accept_loop` + `idle_reaper`, plumbs SIGHUP to `sighup_reconcile`. |
+| [crates/core/src/handoff/tcp.rs](../../crates/core/src/handoff/tcp.rs) | `.await`s `handle.handoff(fd, hints)`; on saturation error logs WARNING and drops the client fd (client sees TCP reset). |
 
 ## 5. Autoscaling — single GUC, demand-driven
 
@@ -552,8 +552,6 @@ The pool sizes itself. The operator configures **one** knob,
 on demand when a handoff arrives with no ready slot, and shrinks when
 slots have been idle past a threshold. No `set_pool_size` SQL surface,
 no per-resize SIGHUP dance, no manual drain.
-
-This supersedes the static `pg_transport.backend_pool_size` GUC.
 
 ### 5.1 The single knob
 
@@ -903,14 +901,15 @@ The reaper picks provably-idle slots, so in the common case the
 mid-session interruption is possible (see §5.7(f) for the structural
 guarantee).
 
-### 5.4 Removal of static slot registration
+### 5.4 No static slot registration
 
-Today `_PG_init` registers `backend_pool_size` slots statically. With
-autoscaling, the pool starts at `MIN_WARM_SLOTS` (default 0) and
-grows on demand. `_PG_init` registers **only** the FE bgworker:
+`_PG_init` registers **only** the FE bgworker. All slots are
+dynamic, spawned via `load_dynamic` from the FE's dispatcher
+(`pool::grow_one`). The pool starts at `MIN_WARM_SLOTS` (default 0)
+and grows on demand:
 
 ```rust
-// crates/core/src/lib.rs (after change)
+// crates/core/src/lib.rs
 BackgroundWorkerBuilder::new("pg_transport frontend").load();
 // No slot loop here. All slots are dynamic.
 ```
@@ -922,7 +921,7 @@ slot-boot latency. Pre-warm is fire-and-forget: fire all
 block FE startup on the slots actually connecting. Partial pre-warm
 (some `grow_one()` failures) is logged at WARNING but is not fatal
 — missing slots will be created lazily on first demand. See the
-§4 changes-required entry for details.
+[§4 module layout](#4-module-layout) for the live source paths.
 
 Tradeoff: this means there are zero slot bgworkers running in an
 idle cluster, which is the operator-friendly default (no resident

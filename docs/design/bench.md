@@ -33,8 +33,8 @@ Positional arguments (just 1.51 has no kwarg form — see
 | -------- | ------------- | ------------ | --------------------------------------------------------------------------------------------- |
 | 1        | `pg`          | `pg18`       | Postgres major (only `pg18` provisioned in v0).                                               |
 | 2        | `iters`       | `1000`       | **Total** measured iterations per side, split across workers.                                 |
-| 3        | `connections` | `1`          | Concurrent worker connections per side; bound by `pg_transport.backend_pool_size` (see [Q10](roadmap.md#22-still-open--deferred-only)). |
-| 4        | `pool`        | `""`         | Override `pg_transport.backend_pool_size`. Empty ⇒ `pool = connections` (apples-to-apples, no contention). |
+| 3        | `connections` | `1`          | Concurrent worker connections per side; bound by `pg_transport.max_backend_pool_size` (autoscaling ceiling — see [pool.md](pool.md) and [Q10](roadmap.md#22-still-open--deferred-only)). |
+| 4        | `pool`        | `""`         | Override `pg_transport.max_backend_pool_size`. Empty ⇒ `pool = connections` (apples-to-apples, no contention). |
 | 5        | `csv`         | `""`         | Optional per-sample CSV path: `label,iter,latency_ns`.                                        |
 | 6        | `mode`        | `spi`        | pg_transport execution backend mode: `spi` (default) or `direct` (`SET pg_transport.execution_backend`). |
 
@@ -121,8 +121,8 @@ Per row:
 
 | Symptom                                                                | What it means                                                                                                                                                |
 | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `barrier timeout after 30s …`                                          | `connections > pg_transport.backend_pool_size`. v0 pins one TCP connection per slot ([Q10](roadmap.md#22-still-open--deferred-only)); extras queue on the slot's UDS and never finish startup. Either lower `connections` or raise `pool`. |
-| `slot N did not connect within 30s` from `BackendPool::start`          | `max_worker_processes` ceiling hit. The recipe sets it to `pool + 8`; if you bypass the recipe, set it yourself.                                              |
+| `barrier timeout after 30s …`                                          | `connections > pg_transport.max_backend_pool_size`. v0 pins one TCP connection per slot ([Q10](roadmap.md#22-still-open--deferred-only)); extras saturate the pool and get TCP-reset on `HANDOFF_WAIT` timeout (5 s) per [pool.md §5.5](pool.md#55-saturation-behavior). Either lower `connections` or raise `pool`. |
+| `slot did not become ready within 5s` in server log                    | Same root cause as above (pool ceiling hit). See [pool.md §5.5](pool.md#55-saturation-behavior).                                                            |
 | Compare numbers swing wildly between runs                              | Other process on the box. Pin one socket via `taskset`, disable turbo, or just re-run.                                                                       |
 | pg_transport `min` lower than vanilla `min`                            | Likely noise — the structural floor is higher for pg_transport. If reproducible across many runs, suspect a measurement skew.                                |
 
@@ -158,8 +158,8 @@ Positional arguments:
 | 1        | `pg`       | `pg18`  | Postgres major.                                                                                          |
 | 2        | `mode`     | `select`| `select` runs `pgbench -S` (read-only), `nupdate` runs `pgbench -N` (simple update), and `tpcb` / `tpcb-rw` run default TPC-B-like mode. |
 | 3        | `duration` | `10`    | Seconds (`pgbench -T`).                                                                                   |
-| 4        | `clients`  | `4`     | Concurrent clients per side (`pgbench -c -j`); bound by `backend_pool_size` against pg_transport.        |
-| 5        | `pool`     | `""`    | Override `backend_pool_size`. Empty ⇒ `pool = clients`.                                                  |
+| 4        | `clients`  | `4`     | Concurrent clients per side (`pgbench -c -j`); bound by `max_backend_pool_size` against pg_transport.   |
+| 5        | `pool`     | `""`    | Override `max_backend_pool_size`. Empty ⇒ `pool = clients`.                                            |
 | 6        | `backend`  | `spi`   | pg_transport execution backend (`spi` or `direct`) passed via `PGOPTIONS=-c pg_transport.execution_backend=...` on the pg_transport-side run. |
 
 ### 2.1 Initialisation
