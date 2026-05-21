@@ -37,18 +37,25 @@ PGBENCH_SOCKETS := "/tmp/pg_transport_sockets"
 #   3. duration    (default 10)    — seconds; `pgbench -T`.
 #   4. clients     (default 4)     — concurrent clients per side
 #                                    (`pgbench -c -j`); bound by
-#                                    `pg_transport.backend_pool_size`.
-#   5. pool        (default "")    — override `backend_pool_size`.
-#                                    Empty ⇒ defaults to `clients`.
+#                                    `pg_transport.max_backend_pool_size`
+#                                    (default ceiling 64).
+#   5. pool        (default "")    — override the autoscaling
+#                                    *ceiling*
+#                                    (`pg_transport.max_backend_pool_size`).
+#                                    Empty ⇒ ceiling stays at the
+#                                    default (64) and the autoscaler
+#                                    grows on demand up to `clients`.
+#                                    Set lower than `clients` to
+#                                    exercise the saturation path.
 #   6. backend     (default spi)   — pg_transport execution backend:
 #                                    `spi` or `direct`.
 #
 # Examples:
-#   just pgbench                              # 10s select, 4 clients
+#   just pgbench                              # 10s select, 4 clients, default pool
 #   just pgbench pg18 select 30 8             # 30s select, 8 clients
 #   just pgbench pg18 nupdate 30 8            # 30s simple-update, 8 clients
 #   just pgbench pg18 tpcb 30 8               # 30s tpcb-like, 8 clients
-#   just pgbench pg18 select 10 16 16         # 16 clients & 16-slot pool
+#   just pgbench pg18 select 10 16 1          # 16 clients, pool ceiling=1 (saturation)
 #   just pgbench pg18 select 10 4 "" direct   # force direct backend on pg_transport
 pgbench pg=default_pg mode="select" duration="10" clients="4" pool="" backend="spi":
     #!/usr/bin/env bash
@@ -77,11 +84,6 @@ pgbench pg=default_pg mode="select" duration="10" clients="4" pool="" backend="s
     fi
     pg_bin="$(dirname "$pgcfg")"
 
-    pool_size="{{pool}}"
-    if [[ -z "$pool_size" ]]; then
-        pool_size="{{clients}}"
-    fi
-
     # Step 1 — install the extension into PGRX_HOME.
     cargo pgrx install --release --package {{EXT}} --pg-config "$pgcfg" >/dev/null
 
@@ -94,9 +96,26 @@ pgbench pg=default_pg mode="select" duration="10" clients="4" pool="" backend="s
     "$pg_bin/initdb" -D {{PGBENCH_PGDATA}} -U postgres \
         --auth-local=trust --auth-host=trust --no-instructions >/dev/null
 
-    # Same max_worker_processes math as just/bench.just — see the
-    # comment there for why `pool + 8` is right.
-    mwp=$(( pool_size + 8 ))
+    # Same `max_worker_processes` math as just/bench.just — the
+    # autoscaler grows up to `connections` slots under load, and
+    # we want PG's bgworker table to have headroom for that plus
+    # the FE bgworker plus PG-internal bgworkers. The pool's
+    # *ceiling* (`pg_transport.max_backend_pool_size`) is
+    # decoupled from this — see the optional `pool` parameter
+    # below.
+    mwp=$(( {{clients}} + 8 ))
+
+    # The `pool` parameter, when set, overrides the autoscaling
+    # *ceiling*. Useful for bench scenarios that want to exercise
+    # saturation (e.g. `pool=1, clients=8` to verify the
+    # HANDOFF_WAIT-then-TCP-reset path; see pool.md §5.5). When
+    # unset, the default ceiling (64) stands and the autoscaler
+    # grows on demand up to `clients`.
+    if [[ -n "{{pool}}" ]]; then
+        pool_clause="pg_transport.max_backend_pool_size = {{pool}}"
+    else
+        pool_clause="# (pool ceiling left at default; autoscaler grows on demand)"
+    fi
 
     cat >>{{PGBENCH_PGDATA}}/postgresql.conf <<EOF
     shared_preload_libraries = 'pg_transport'
@@ -105,7 +124,7 @@ pgbench pg=default_pg mode="select" duration="10" clients="4" pool="" backend="s
     listen_addresses = '127.0.0.1'
     logging_collector = off
     log_min_messages = warning
-    pg_transport.backend_pool_size = $pool_size
+    $pool_clause
     # auth_source is required by _PG_init() since phase 7.
     pg_transport.auth_source = 'pg_hba'
     max_worker_processes = $mwp
@@ -147,7 +166,7 @@ pgbench pg=default_pg mode="select" duration="10" clients="4" pool="" backend="s
     esac
 
     echo ""
-    echo "pgbench: backend_pool_size=$pool_size clients={{clients}} duration={{duration}}s mode={{mode}} backend={{backend}}"
+    echo "pgbench: clients={{clients}} duration={{duration}}s mode={{mode}} backend={{backend}} pool_ceiling={{pool}}"
 
     # Step 4 — run vanilla first as the baseline.
     echo ""

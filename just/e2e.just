@@ -65,7 +65,7 @@ e2e pg=default_pg:
     # default (num_cpus) because tests within a binary share the
     # cluster via OnceCell and tokio-postgres is happily concurrent
     # (each test gets its own Client). The connection ceiling is
-    # `pg_transport.backend_pool_size` (= 8 in lib.rs); cargo's
+    # `pg_transport.max_backend_pool_size` (= 8 in lib.rs); cargo's
     # default parallelism is well under that on typical dev boxes.
     #
     # `--nocapture` so eprintln! diagnostics from the connection

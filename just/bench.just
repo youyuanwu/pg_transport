@@ -24,14 +24,18 @@ BENCH_SOCKETS := "/tmp/pg_transport_sockets"
 #                                    (split across workers).
 #   3. connections (default 1)     — concurrent worker connections per
 #                                    side.
-#   4. pool        (default "")    — pg_transport.backend_pool_size.
-#                                    Empty string ⇒ defaults to
-#                                    `connections` (apples-to-apples,
-#                                    no contention). Set higher than
-#                                    `connections` to test underutilised
-#                                    pool, or lower to test contention
-#                                    (each connection beyond pool_size
-#                                    queues on slot availability).
+#   4. pool        (default "")    — override the autoscaling
+#                                    *ceiling*
+#                                    (`pg_transport.max_backend_pool_size`).
+#                                    Empty ⇒ ceiling stays at the
+#                                    default (64) and the autoscaler
+#                                    grows on demand up to
+#                                    `connections`. Set lower than
+#                                    `connections` to exercise the
+#                                    saturation path (excess
+#                                    connections hit `HANDOFF_WAIT`
+#                                    and get TCP-reset, see
+#                                    pool.md §5.5).
 #   5. csv         (default "")    — optional per-sample CSV path.
 #   6. mode        (default spi)    — pg_transport execution backend:
 #                                    `spi` (default) or `direct`.
@@ -40,9 +44,9 @@ BENCH_SOCKETS := "/tmp/pg_transport_sockets"
 # explicit value or the default literally — there is no keyword form.
 #
 # Examples:
-#   just bench                                # all defaults: 1 conn, 1 slot
-#   just bench pg18 1000 4                    # 4 conns, 4 slots (no contention)
-#   just bench pg18 1000 16 4                 # 16 conns, pool=4 (contention)
+#   just bench                                # all defaults: 1 conn, default pool
+#   just bench pg18 1000 4                    # 4 conns, default pool ceiling
+#   just bench pg18 1000 16 1                 # 16 conns, pool ceiling=1 (saturation)
 #   just bench pg18 10000 8 "" /tmp/b.csv     # 8 conns, default pool, CSV out
 #   just bench pg18 10000 8 "" "" direct      # direct backend mode
 bench pg=default_pg iters="1000" connections="1" pool="" csv="" mode="spi":
@@ -55,13 +59,6 @@ bench pg=default_pg iters="1000" connections="1" pool="" csv="" mode="spi":
         exit 1
     fi
     pg_bin="$(dirname "$pgcfg")"
-
-    # Pool size: default to == connections (apples-to-apples), else
-    # whatever the caller asked for.
-    pool_size="{{pool}}"
-    if [[ -z "$pool_size" ]]; then
-        pool_size="{{connections}}"
-    fi
 
     # Step 1 — install the extension into PGRX_HOME ($PGRX_HOME's
     # share / lib trees). Also build the bench binary in release —
@@ -81,11 +78,29 @@ bench pg=default_pg iters="1000" connections="1" pool="" csv="" mode="spi":
     # PG's `max_worker_processes` defaults to 8 — that ceiling
     # covers OUR FE bgworker + N slot bgworkers + PG's own
     # bgworker users (logical replication launcher, etc).
-    # `BackgroundWorkerBuilder::load()` silently drops
-    # registrations beyond this limit; symptom is "slot N did not
-    # connect within 30s" from BackendPool::start. Give us pool +
-    # 8 slack: covers FE + PG-internal bgworkers with margin.
-    mwp=$(( pool_size + 8 ))
+    # `BackgroundWorkerBuilder::load_dynamic()` returns Err beyond
+    # this limit; the FE dispatcher logs WARNING and the handoff
+    # falls back to waiting on existing slots up to HANDOFF_WAIT.
+    # Give us `connections + 8` slack: covers FE + PG-internal
+    # bgworkers + the slots the autoscaler will actually grow
+    # under load. The pool's *ceiling* is decoupled from this
+    # — see the optional `pool` parameter below.
+    mwp=$(( {{connections}} + 8 ))
+
+    # The `pool` parameter, when set, overrides the autoscaling
+    # *ceiling* (`pg_transport.max_backend_pool_size`). Useful for
+    # bench scenarios that want to exercise saturation
+    # (e.g. `pool=1, connections=8` to verify the
+    # `HANDOFF_WAIT`-then-TCP-reset path; see pool.md §5.5). When
+    # unset, the default ceiling (64) stands and the autoscaler
+    # grows on demand. We do NOT pin the ceiling to `connections`
+    # — that would mirror the obsolete static-pool semantics where
+    # "size" and "ceiling" were the same number.
+    if [[ -n "{{pool}}" ]]; then
+        pool_clause="pg_transport.max_backend_pool_size = {{pool}}"
+    else
+        pool_clause="# (pool ceiling left at default; autoscaler grows on demand)"
+    fi
 
     cat >>{{BENCH_PGDATA}}/postgresql.conf <<EOF
     shared_preload_libraries = 'pg_transport'
@@ -94,7 +109,7 @@ bench pg=default_pg iters="1000" connections="1" pool="" csv="" mode="spi":
     listen_addresses = '127.0.0.1'
     logging_collector = off
     log_min_messages = warning
-    pg_transport.backend_pool_size = $pool_size
+    $pool_clause
     # auth_source is required by _PG_init() since phase 7.
     pg_transport.auth_source = 'pg_hba'
     max_worker_processes = $mwp
@@ -120,7 +135,7 @@ bench pg=default_pg iters="1000" connections="1" pool="" csv="" mode="spi":
     }
     trap cleanup EXIT
 
-    echo "bench: backend_pool_size=$pool_size connections={{connections}} iters={{iters}} mode={{mode}}"
+    echo "bench: connections={{connections}} iters={{iters}} mode={{mode}} pool_ceiling={{pool}}"
 
     # Step 3 — run the bench. `bench compare` connects to both
     # ports, runs the workload sequentially per side (no contention
