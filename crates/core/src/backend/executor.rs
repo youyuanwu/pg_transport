@@ -256,7 +256,7 @@ impl CachedPlanSource {
     ///
     /// Must be called inside [`with_xact`]. The current process's
     /// `CurrentResourceOwner` is used as the holding owner.
-    pub unsafe fn get_plan(&self, params: &ParamList<'_>) -> CachedPlan {
+    pub unsafe fn get_plan(&self, params: &ParamList<'_>) -> CachedPlan<'_> {
         // SAFETY: GetCachedPlan is the documented entry point;
         // raises ERROR on failure which longjmps out.
         let owner = unsafe { pg_sys::CurrentResourceOwner };
@@ -300,16 +300,20 @@ impl Drop for CachedPlanSource {
 /// Short-lived: created at the start of an Execute via
 /// [`CachedPlanSource::get_plan`], dropped after `PortalRun`
 /// returns (before the parent [`CachedPlanSource`] is dropped).
-pub struct CachedPlan {
+///
+/// The lifetime `'src` ties this plan to the [`CachedPlanSource`]
+/// it came from — the borrow checker prevents dropping the source
+/// while a plan handle is alive.
+pub struct CachedPlan<'src> {
     raw: *mut pg_sys::CachedPlan,
     /// The `ResourceOwner` that was current at `GetCachedPlan` time.
     /// We must release against the same owner — PG records the
     /// refcount-holder identity here.
     owner: pg_sys::ResourceOwner,
-    _phantom: PhantomData<*const ()>,
+    _phantom: PhantomData<&'src CachedPlanSource>,
 }
 
-impl CachedPlan {
+impl CachedPlan<'_> {
     /// Borrow the raw `*mut CachedPlan` (e.g. to feed into
     /// `PortalDefineQuery`'s `cplan` argument).
     pub fn as_ptr(&self) -> *mut pg_sys::CachedPlan {
@@ -330,7 +334,7 @@ impl CachedPlan {
     }
 }
 
-impl Drop for CachedPlan {
+impl Drop for CachedPlan<'_> {
     fn drop(&mut self) {
         if !self.raw.is_null() {
             // SAFETY: matches GetCachedPlan with the same owner.
