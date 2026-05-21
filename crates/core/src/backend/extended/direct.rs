@@ -55,7 +55,7 @@ use pgwire::api::results::{FieldFormat, FieldInfo, QueryResponse, Response, Tag}
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::data::DataRow;
 
-use super::super::executor::{CachedPlanSource, Portal, with_xact};
+use super::super::executor::{CachedPlanSource, ParamList, Portal, with_xact};
 use super::super::spi::{TypeInput, TypeOutput, TypeReceive, TypeSend, generic_error};
 use super::{PreparedPlan, PreparedStatement};
 
@@ -157,13 +157,13 @@ fn execute_impl(
     with_xact(|ctx| -> PgWireResult<Response> {
         let (param_values, param_is_null) =
             decode_parameters(&param_bytes, &backend.param_oids, &param_is_binary)?;
-        // SAFETY: makeParamList allocates a ParamListInfo with
-        // numParams slots in CurrentMemoryContext.
+        // SAFETY: inside with_xact; Datums are palloc'd in this
+        // xact's MemoryContext and live until the closure returns.
         let params =
-            unsafe { build_param_list(&backend.param_oids, &param_values, &param_is_null) };
+            unsafe { ParamList::build(&backend.param_oids, &param_values, &param_is_null) };
 
         // SAFETY: inside with_xact; source is saved/live.
-        let plan = unsafe { backend.source.get_plan(params) };
+        let plan = unsafe { backend.source.get_plan(&params) };
         let portal = unsafe { Portal::create_anonymous(ctx) };
 
         unsafe {
@@ -173,7 +173,7 @@ fn execute_impl(
                 plan.stmt_list(),
                 std::ptr::null_mut(),
             );
-            portal.start(params, 0, pg_sys::GetActiveSnapshot());
+            portal.start(&params, 0, pg_sys::GetActiveSnapshot());
         }
 
         let encoders: Vec<ColumnEncoder> = if ncols > 0 {
@@ -490,37 +490,6 @@ fn decode_parameters(
         }
     }
     Ok((values, nulls))
-}
-
-/// Build a PG `ParamListInfo` from decoded values. Caller keeps
-/// ownership in CurrentMemoryContext; no explicit free is needed.
-///
-/// # Safety
-///
-/// Must run inside an active transaction with a valid
-/// `CurrentMemoryContext`.
-unsafe fn build_param_list(
-    param_oids: &[pg_sys::Oid],
-    values: &[pg_sys::Datum],
-    is_null: &[bool],
-) -> pg_sys::ParamListInfo {
-    let n = param_oids.len();
-    let params = unsafe { pg_sys::makeParamList(n as i32) };
-    if params.is_null() {
-        return std::ptr::null_mut();
-    }
-
-    let base = unsafe { (*params).params.as_mut_ptr() };
-    for i in 0..n {
-        let slot = unsafe { base.add(i) };
-        unsafe {
-            (*slot).value = values[i];
-            (*slot).isnull = is_null[i];
-            (*slot).pflags = pg_sys::PARAM_FLAG_CONST as u16;
-            (*slot).ptype = param_oids[i];
-        }
-    }
-    params
 }
 
 // ---------------------------------------------------------------------------

@@ -12,10 +12,10 @@
 //!     pg_analyze_and_rewrite_varparams → analyzed Query list
 //!     CachedPlanSource::create + complete + save  (parse time)
 //!     CachedPlanSource::get_plan → CachedPlan      (execute time)
+//!     ParamList::build → owned ParamListInfo        (execute time)
 //!     Portal::create_anonymous + define + start + run
-//!         ↓ executor writes into TuplestoreReceiver
-//!     iterate tuplestore → wire-encode → DataRow
-//!     // drop order: Portal first, then CachedPlan
+//!         ↓ executor writes into WireDestReceiver
+//!     // drop order: Portal first, then CachedPlan, then ParamList
 //! })
 //! ```
 //!
@@ -254,14 +254,15 @@ impl CachedPlanSource {
     ///
     /// # Safety
     ///
-    /// Must be called inside [`with_xact`]. `params` may be null
-    /// for parameterless queries. The current process's
+    /// Must be called inside [`with_xact`]. The current process's
     /// `CurrentResourceOwner` is used as the holding owner.
-    pub unsafe fn get_plan(&self, params: pg_sys::ParamListInfo) -> CachedPlan {
+    pub unsafe fn get_plan(&self, params: &ParamList<'_>) -> CachedPlan {
         // SAFETY: GetCachedPlan is the documented entry point;
         // raises ERROR on failure which longjmps out.
         let owner = unsafe { pg_sys::CurrentResourceOwner };
-        let raw = unsafe { pg_sys::GetCachedPlan(self.raw, params, owner, std::ptr::null_mut()) };
+        let raw = unsafe {
+            pg_sys::GetCachedPlan(self.raw, params.as_ptr(), owner, std::ptr::null_mut())
+        };
         CachedPlan {
             raw,
             owner,
@@ -335,6 +336,78 @@ impl Drop for CachedPlan {
             // SAFETY: matches GetCachedPlan with the same owner.
             unsafe { pg_sys::ReleaseCachedPlan(self.raw, self.owner) };
             self.raw = std::ptr::null_mut();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ParamList — owned ParamListInfo
+// ---------------------------------------------------------------------------
+
+/// Owned `pg_sys::ParamListInfo` allocated via `makeParamList`.
+///
+/// Allocated in `CurrentMemoryContext` (which is the xact context
+/// inside [`with_xact`]). PG frees the underlying palloc'd memory
+/// when the xact commits/aborts, so Drop is a no-op — but we zero
+/// the pointer defensively to prevent use-after-free.
+///
+/// The raw pointer is passed to [`CachedPlanSource::get_plan`] and
+/// [`Portal::start`]; both borrow it for the duration of their
+/// call only (PG copies what it needs into its own contexts).
+pub struct ParamList<'a> {
+    raw: pg_sys::ParamListInfo,
+    _lifetime: PhantomData<&'a ()>,
+}
+
+impl<'a> ParamList<'a> {
+    /// Build a `ParamList` from decoded parameter values.
+    ///
+    /// All three slices must have the same length (one entry per
+    /// `$n` bind parameter).
+    ///
+    /// # Safety
+    ///
+    /// Must be called inside [`with_xact`] with a valid
+    /// `CurrentMemoryContext`. The `values` Datums must remain
+    /// valid for the lifetime `'a` (they point into palloc'd
+    /// memory that lives until the xact ends).
+    pub unsafe fn build(
+        param_oids: &[pg_sys::Oid],
+        values: &'a [pg_sys::Datum],
+        is_null: &[bool],
+    ) -> Self {
+        let n = param_oids.len();
+        let raw = unsafe { pg_sys::makeParamList(n as i32) };
+        if !raw.is_null() {
+            let base = unsafe { (*raw).params.as_mut_ptr() };
+            for i in 0..n {
+                unsafe {
+                    let slot = base.add(i);
+                    (*slot).value = values[i];
+                    (*slot).isnull = is_null[i];
+                    (*slot).pflags = pg_sys::PARAM_FLAG_CONST as u16;
+                    (*slot).ptype = param_oids[i];
+                }
+            }
+        }
+        ParamList {
+            raw,
+            _lifetime: PhantomData,
+        }
+    }
+
+    /// Borrow the raw pointer for passing into FFI
+    /// (`GetCachedPlan`, `PortalStart`, etc.).
+    pub fn as_ptr(&self) -> pg_sys::ParamListInfo {
+        self.raw
+    }
+
+    /// Create an empty `ParamList` (null pointer) for
+    /// parameterless queries.
+    pub fn empty() -> Self {
+        ParamList {
+            raw: std::ptr::null_mut(),
+            _lifetime: PhantomData,
         }
     }
 }
@@ -424,14 +497,9 @@ impl Portal {
     /// # Safety
     ///
     /// Caller must have already called [`Self::define`].
-    pub unsafe fn start(
-        &self,
-        params: pg_sys::ParamListInfo,
-        eflags: i32,
-        snapshot: pg_sys::Snapshot,
-    ) {
+    pub unsafe fn start(&self, params: &ParamList<'_>, eflags: i32, snapshot: pg_sys::Snapshot) {
         // SAFETY: PortalStart wires up the QueryDesc + ExecutorStart.
-        unsafe { pg_sys::PortalStart(self.raw, params, eflags, snapshot) };
+        unsafe { pg_sys::PortalStart(self.raw, params.as_ptr(), eflags, snapshot) };
     }
 
     /// Execute the portal, writing results to `dest`.
@@ -572,7 +640,8 @@ mod tests {
             }
 
             // 4. Get a per-execute plan.
-            let plan = unsafe { source.get_plan(std::ptr::null_mut()) };
+            let params = ParamList::empty();
+            let plan = unsafe { source.get_plan(&params) };
             assert!(!plan.as_ptr().is_null(), "GetCachedPlan returned null");
 
             // 5. Portal: create + define + start + run with a
@@ -586,7 +655,7 @@ mod tests {
                     plan.stmt_list(),
                     std::ptr::null_mut(),
                 );
-                portal.start(std::ptr::null_mut(), 0, pg_sys::GetActiveSnapshot());
+                portal.start(&params, 0, pg_sys::GetActiveSnapshot());
             }
             let dest = unsafe { pg_sys::CreateDestReceiver(pg_sys::CommandDest::DestNone) };
             let mut qc: pg_sys::QueryCompletion = unsafe { std::mem::zeroed() };
