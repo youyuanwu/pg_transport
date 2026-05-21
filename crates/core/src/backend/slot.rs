@@ -182,6 +182,17 @@ fn run_slot() -> io::Result<()> {
                 if let Err(e) = PgwireV3::run(fd, ctx) {
                     pgrx::warning!("pg_transport slot: wire run failed: {e}");
                 }
+                // Per-handoff reset: scrub any session-level state
+                // the previous client left behind on this PG
+                // backend process. Without this, a `SET
+                // pg_transport.execution_backend = 'direct'` (or
+                // any other USERSET GUC) issued by one client
+                // leaks to subsequent clients on the same slot —
+                // vanilla PG hides this because the backend
+                // process exits between sessions; our slots
+                // survive across many handoffs. See backend-handoff.md
+                // §5.
+                reset_per_handoff_state();
                 // Wire done — announce readiness for the next
                 // handoff.
                 rt.block_on(fd_pass::send_ready_byte_async(&async_stream))
@@ -224,6 +235,45 @@ fn cleanup_per_slot_state() {
     // Intentionally empty for phase ≥ 4 baseline. Hook is here so
     // future per-slot state (plan cache, TLS session resumption,
     // wire-level pools) lands in one obvious place.
+}
+
+/// Reset session-scoped PG state between handoffs.
+///
+/// Vanilla PG processes one client per backend and `proc_exit`s
+/// between sessions; the GUC stack, prepared statements, temp
+/// tables, etc. are gone implicitly. Our slot bgworker survives
+/// across many handoffs, so we must scrub session state
+/// explicitly or it leaks between unrelated client connections.
+///
+/// Current scope:
+///
+/// * **GUCs** — `pg_sys::ResetAllOptions()` walks the GUC variable
+///   list and reverts every `SET` (USERSET / SUSET / SIGHUP) to
+///   its boot-time default. This is the immediate cross-handoff
+///   isolation gate; without it a client's `SET
+///   pg_transport.execution_backend = 'direct'` leaks to the next
+///   handoff on the same slot, which historically reproduced as
+///   `ERROR: unrecognized node type: 0x7F7F7F7F` (a use-after-free
+///   in the direct backend's plan cache) under e2e parallelism.
+///
+/// Future scope (phase ≥ 9.5):
+/// * SQL-level prepared statements (`DropAllPreparedStatements`).
+/// * Temp namespace cleanup.
+/// * Cursors / portals not already torn down by pgwire's drop.
+/// * Reset transaction state if dirty.
+///
+/// SAFETY: `ResetAllOptions` is callable from any backend with
+/// GUC machinery initialised (we are — `connect_worker_to_spi`
+/// ran at slot boot). It may `ereport(ERROR)` if a check_hook
+/// fails on a default value, which pgrx surfaces as a Rust panic
+/// the slot's `#[pg_guard]` boundary catches; the panic propagates
+/// out of `run_slot`, the bgworker exits, and the FE's reader
+/// observes EOF and removes the slot. No state corruption.
+fn reset_per_handoff_state() {
+    // SAFETY: see fn doc.
+    unsafe {
+        pg_sys::ResetAllOptions();
+    }
 }
 
 fn connect_with_retry(path: &std::path::Path) -> io::Result<UnixStream> {
