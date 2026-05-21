@@ -275,6 +275,21 @@ impl CachedPlanSource {
     pub fn as_ptr(&self) -> *mut pg_sys::CachedPlanSource {
         self.raw
     }
+
+    /// Borrow the result-row descriptor (`resultDesc`).
+    ///
+    /// Returns `None` for utility statements and DML without
+    /// `RETURNING`. The returned [`TupleDescRef`] borrows from
+    /// `self` — it cannot outlive the source.
+    ///
+    /// # Safety
+    ///
+    /// [`Self::complete`] must have been called with
+    /// `fixed_result = true` so that `resultDesc` is populated.
+    pub unsafe fn result_desc(&self) -> Option<TupleDescRef<'_>> {
+        let tupdesc = unsafe { (*self.raw).resultDesc };
+        unsafe { TupleDescRef::from_raw(tupdesc) }
+    }
 }
 
 impl Drop for CachedPlanSource {
@@ -413,6 +428,95 @@ impl<'a> ParamList<'a> {
             raw: std::ptr::null_mut(),
             _lifetime: PhantomData,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TupleDescRef — borrowed TupleDesc accessor
+// ---------------------------------------------------------------------------
+
+/// Borrowed view of a `pg_sys::TupleDesc` owned by another PG
+/// object (`CachedPlanSource.resultDesc`, `SPITupleTable.tupdesc`,
+/// etc.).
+///
+/// Non-owning: no Drop, no refcount management. The lifetime `'a`
+/// ties this reference to the owner, preventing use-after-free at
+/// compile time.
+///
+/// Provides safe iteration over column attributes without
+/// repeating the `TupleDescAttr` + null-check boilerplate at
+/// every call site.
+pub struct TupleDescRef<'a> {
+    raw: pg_sys::TupleDesc,
+    _lifetime: PhantomData<&'a ()>,
+}
+
+impl<'a> TupleDescRef<'a> {
+    /// Wrap a non-null `pg_sys::TupleDesc` borrowed from `owner`.
+    ///
+    /// Returns `None` if `raw` is null (utility statements, DML
+    /// without `RETURNING`, etc.).
+    ///
+    /// # Safety
+    ///
+    /// `raw` must be a valid `TupleDesc` that remains live for
+    /// `'a`. The caller must not free or modify the underlying
+    /// `TupleDescData` while this reference exists.
+    pub unsafe fn from_raw(raw: pg_sys::TupleDesc) -> Option<Self> {
+        if raw.is_null() {
+            None
+        } else {
+            Some(TupleDescRef {
+                raw,
+                _lifetime: PhantomData,
+            })
+        }
+    }
+
+    /// Number of user attributes.
+    pub fn len(&self) -> usize {
+        // SAFETY: raw is non-null by construction.
+        unsafe { (*self.raw).natts as usize }
+    }
+
+    /// Is this a zero-column descriptor?
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Get attribute `i` (0-based). Returns `None` if out of range.
+    pub fn get(&self, i: usize) -> Option<&pg_sys::FormData_pg_attribute> {
+        if i >= self.len() {
+            None
+        } else {
+            // SAFETY: i in 0..natts; TupleDescAttr is the
+            // canonical PG accessor macro.
+            Some(unsafe { &*pg_sys::TupleDescAttr(self.raw, i as i32) })
+        }
+    }
+
+    /// Column name for attribute `i` (0-based).
+    pub fn col_name(&self, i: usize) -> Option<String> {
+        self.get(i).map(|attr| {
+            unsafe { CStr::from_ptr(attr.attname.data.as_ptr()) }
+                .to_string_lossy()
+                .into_owned()
+        })
+    }
+
+    /// Column type OID for attribute `i` (0-based).
+    pub fn col_type_oid(&self, i: usize) -> Option<pg_sys::Oid> {
+        self.get(i).map(|attr| attr.atttypid)
+    }
+
+    /// Iterate over all attributes.
+    pub fn iter(&self) -> impl Iterator<Item = &pg_sys::FormData_pg_attribute> {
+        (0..self.len()).map(move |i| self.get(i).unwrap())
+    }
+
+    /// Borrow the raw pointer for FFI pass-through.
+    pub fn as_ptr(&self) -> pg_sys::TupleDesc {
+        self.raw
     }
 }
 

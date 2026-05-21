@@ -432,34 +432,24 @@ pub fn prepare(sql: &str, param_hints: &[Option<u32>]) -> PgWireResult<PreparedS
 /// `source` must be live (i.e. not yet dropped) and `complete`
 /// must have been called with `fixed_result=true`.
 unsafe fn result_schema_from_source(source: &CachedPlanSource) -> Vec<FieldInfo> {
-    let src = source.as_ptr();
-    if src.is_null() {
+    let Some(tupdesc) = (unsafe { source.result_desc() }) else {
         return Vec::new();
-    }
-    // SAFETY: resultDesc field is a stable TupleDesc across PG 12+;
-    // null when the statement produces no rows.
-    let tupdesc = unsafe { (*src).resultDesc };
-    if tupdesc.is_null() {
-        return Vec::new();
-    }
-    // SAFETY: natts is the canonical attribute count.
-    let ncols = unsafe { (*tupdesc).natts } as usize;
-    let mut out = Vec::with_capacity(ncols);
-    for i in 0..ncols {
-        // SAFETY: i in 0..natts.
-        let attr = unsafe { &*pg_sys::TupleDescAttr(tupdesc, i as i32) };
-        let name = unsafe { CStr::from_ptr(attr.attname.data.as_ptr()) }
-            .to_string_lossy()
-            .into_owned();
-        out.push(FieldInfo::new(
-            name,
-            None,
-            None,
-            Type::from_oid(attr.atttypid.to_u32()).unwrap_or(Type::TEXT),
-            FieldFormat::Text,
-        ));
-    }
-    out
+    };
+    tupdesc
+        .iter()
+        .map(|attr| {
+            let name = unsafe { CStr::from_ptr(attr.attname.data.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            FieldInfo::new(
+                name,
+                None,
+                None,
+                Type::from_oid(attr.atttypid.to_u32()).unwrap_or(Type::TEXT),
+                FieldFormat::Text,
+            )
+        })
+        .collect()
 }
 
 /// Decode pgwire's `Vec<Option<Bytes>>` into direct-executor

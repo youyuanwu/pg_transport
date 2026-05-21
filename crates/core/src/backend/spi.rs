@@ -391,6 +391,7 @@ pub struct PlanColumn {
 /// SAFETY: caller must hold a valid kept-plan pointer (i.e. came
 /// from [`SpiCtx::keep_plan`] or `SPI_prepare*` + kept).
 pub fn plan_result_columns(plan: pg_sys::SPIPlanPtr) -> Option<Vec<PlanColumn>> {
+    use super::executor::TupleDescRef;
     // SAFETY: SPI_plan_get_plan_sources is the documented accessor;
     // returns a List* of CachedPlanSource* owned by the plan.
     let list = unsafe { pg_sys::SPI_plan_get_plan_sources(plan) };
@@ -406,23 +407,19 @@ pub fn plan_result_columns(plan: pg_sys::SPIPlanPtr) -> Option<Vec<PlanColumn>> 
     if first.is_null() {
         return None;
     }
-    let tupdesc = unsafe { (*first).resultDesc };
-    if tupdesc.is_null() {
-        return None;
-    }
-    let ncols = unsafe { (*tupdesc).natts } as usize;
-    let mut out = Vec::with_capacity(ncols);
-    for i in 0..ncols {
-        // SAFETY: i in 0..natts.
-        let attr = unsafe { &*pg_sys::TupleDescAttr(tupdesc, i as i32) };
-        let name = unsafe { CStr::from_ptr(attr.attname.data.as_ptr()) }
-            .to_string_lossy()
-            .into_owned();
-        out.push(PlanColumn {
-            name,
-            type_oid: attr.atttypid,
-        });
-    }
+    let tupdesc = unsafe { TupleDescRef::from_raw((*first).resultDesc) }?;
+    let out = tupdesc
+        .iter()
+        .map(|attr| {
+            let name = unsafe { CStr::from_ptr(attr.attname.data.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            PlanColumn {
+                name,
+                type_oid: attr.atttypid,
+            }
+        })
+        .collect();
     Some(out)
 }
 
