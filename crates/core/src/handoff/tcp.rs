@@ -106,7 +106,17 @@ async fn run_inner(
                             }
                         };
                         let fd: OwnedFd = std_stream.into();
-                        if let Err(e) = handle.handoff(fd, HandoffHints::no_tls()) {
+                        if let Err(e) = handle.handoff(fd, HandoffHints::no_tls()).await {
+                            // Saturation or send error. The error
+                            // string is the operator-visible signal;
+                            // we don't translate to ErrorResponse
+                            // here because the client fd has already
+                            // been dropped (consumed by handoff()).
+                            // A future enhancement could split
+                            // handoff() into "reserve slot" + "send"
+                            // so we can write ErrorResponse on the
+                            // client fd before dropping it. For now,
+                            // saturated clients see a TCP reset.
                             pgrx::warning!(
                                 "pg_transport tcp_handoff: handoff for {peer} failed: {e}"
                             );

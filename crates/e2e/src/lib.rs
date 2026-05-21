@@ -88,9 +88,12 @@ pub const PT_PORT: u16 = 5454;
 /// with e2e on the *admin* port (the wire port collision is unavoidable).
 pub const PG_PORT: u16 = 54330;
 
-/// `pg_transport.backend_pool_size`. Picked larger than the v0 default
-/// (2) to give parallel `#[tokio::test]`s connection headroom before
-/// they queue on slot availability.
+/// `pg_transport.max_backend_pool_size`. Picked larger than the v0
+/// default (64 is the design default, also fine here) so the
+/// dispatcher never saturates during parallel `#[tokio::test]`s.
+/// The pool grows on demand up to this ceiling and shrinks back
+/// on idle (see
+/// `docs/design/deferred/slot-readiness.md` §5).
 const POOL_SIZE: u32 = 8;
 
 /// Wall time we'll wait for the pg_transport listener to come up after
@@ -249,7 +252,7 @@ impl Cluster {
              # Comfortably above 1 FE + POOL_SIZE slots + PG internal\n\
              # bgworkers (logical-rep launcher, autovac, etc.).\n\
              max_worker_processes = 32\n\
-             pg_transport.backend_pool_size = {POOL_SIZE}\n\
+             pg_transport.max_backend_pool_size = {POOL_SIZE}\n\
              # auth_source is required by _PG_init() since phase 7.\n\
              pg_transport.auth_source = 'pg_hba'\n\
              # Phase 8: TLS termination. Self-signed test cert lives\n\

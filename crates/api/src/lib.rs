@@ -31,6 +31,17 @@ pub use tokio_util::sync::CancellationToken;
 /// awaits (`Rc<…>`, raw fds via `OwnedFd`, etc.).
 pub type RunFuture = Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'static>>;
 
+/// Future returned by [`HandoffSink::handoff`] (and therefore by
+/// [`HandoffHandle::handoff`]).
+///
+/// Boxed-local because `HandoffSink` is held behind
+/// `Rc<dyn HandoffSink>` and must stay object-safe. The pool's
+/// implementation awaits a slot to enter the `ready` container
+/// before returning (see
+/// [`docs/design/deferred/slot-readiness.md`](../../../docs/design/deferred/slot-readiness.md)
+/// §1.3), so the future is no longer a fire-and-forget syscall.
+pub type HandoffFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>>;
+
 /// Plugin surface for transports that hand kernel sockets to the
 /// backend pool. The handle they get exposes only `handoff(fd)` —
 /// no payload, no session, no FE/BE message types.
@@ -88,13 +99,23 @@ impl HandoffHandle {
     /// slot process); the caller's `OwnedFd` is dropped here either
     /// way.
     ///
-    /// Returns once the kernel has accepted the `SCM_RIGHTS`
-    /// `sendmsg` — *not* once the backend has confirmed receipt
-    /// (Q20 in [roadmap.md §2.3](../../../docs/design/roadmap.md)).
-    /// In-flight `Ok(())` handoffs may still be lost if the slot
-    /// dies between `sendmsg` and `recvmsg`; the client sees a TCP
-    /// reset (Q21 option (b), accepted).
-    pub fn handoff(&self, fd: OwnedFd, hints: HandoffHints) -> anyhow::Result<()> {
+    /// Awaits a slot to enter the pool's `ready` container before
+    /// `sendmsg`'ing the fd (see
+    /// [`docs/design/deferred/slot-readiness.md`](../../../docs/design/deferred/slot-readiness.md)
+    /// §1.3 — demand-driven dispatch). Returns once the kernel has
+    /// accepted the `SCM_RIGHTS` `sendmsg` — *not* once the backend
+    /// has confirmed receipt (Q20 in
+    /// [roadmap.md §2.3](../../../docs/design/roadmap.md)). In-flight
+    /// `Ok(())` handoffs may still be lost if the slot dies between
+    /// `sendmsg` and `recvmsg`; the client sees a TCP reset
+    /// (Q21 option (b), accepted).
+    ///
+    /// On saturation (all slots busy, pool at `max_backend_pool_size`,
+    /// no ready slot within `HANDOFF_WAIT`) the future resolves to
+    /// `Err(...)`; the caller (typically `tcp_handoff::run_inner`)
+    /// turns this into a `ErrorResponse("too many connections")` for
+    /// the client.
+    pub fn handoff(&self, fd: OwnedFd, hints: HandoffHints) -> HandoffFuture<'_> {
         self.sink.handoff(fd, hints)
     }
 }
@@ -106,7 +127,7 @@ impl HandoffHandle {
 /// [`HandoffHandle`] is held in `Rc`, which forces single-thread
 /// usage).
 pub trait HandoffSink {
-    fn handoff(&self, fd: OwnedFd, hints: HandoffHints) -> anyhow::Result<()>;
+    fn handoff(&self, fd: OwnedFd, hints: HandoffHints) -> HandoffFuture<'_>;
 }
 
 // ---------------------------------------------------------------------------

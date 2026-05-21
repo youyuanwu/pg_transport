@@ -85,7 +85,7 @@ struct Workload {
     /// Concurrent worker connections. Each worker runs
     /// `iterations / connections` (rounded as needed) measured
     /// round-trips on its own connection. With v0's one-conn-per-
-    /// slot model, must be ≤ `pg_transport.backend_pool_size`
+    /// slot model, must be ≤ `pg_transport.max_backend_pool_size`
     /// (else bench fails after BARRIER_TIMEOUT — see Q10 in
     /// docs/design/roadmap.md).
     #[arg(long, default_value_t = 1)]
@@ -277,11 +277,12 @@ fn libpq_conn_str(target: &str, user: &str, db: &str) -> String {
 ///
 /// Barrier timeout: with v0's one-connection-per-slot model
 /// ([Q10 in roadmap.md](../../docs/design/roadmap.md) deferred),
-/// `connections > backend_pool_size` will deadlock — extra
-/// connections queue on a busy slot's UDS and can't even
-/// complete their TCP startup, so they never reach the barrier.
-/// We time the barrier wait out at 30 s and surface the misconfig
-/// as a readable error rather than hanging.
+/// `connections > max_backend_pool_size` saturates the pool — with the
+/// autoscaler the dispatcher returns `Err("no slot became ready within
+/// HANDOFF_WAIT")` after 5s and the transport closes the client fd
+/// (TCP reset). We time the barrier wait out at 30 s and surface the
+/// misconfig as a readable error rather than letting the workers
+/// silently fail their warmup.
 const BARRIER_TIMEOUT: Duration = Duration::from_secs(30);
 
 async fn run_workload(
@@ -314,10 +315,10 @@ async fn run_workload(
         Err(_) => {
             bail!(
                 "barrier timeout after {:?}: only some workers finished warmup. \
-                 If `--connections` ({}) > pg_transport.backend_pool_size, the \
-                 extra connections queue on a busy slot's UDS and can never \
-                 complete startup (v0 limitation; see Q10 in \
-                 docs/design/roadmap.md).",
+                 If `--connections` ({}) > pg_transport.max_backend_pool_size, the \
+                 extra connections saturate the pool and get TCP-reset on \
+                 handoff timeout (autoscaler ceiling; see \
+                 docs/design/deferred/slot-readiness.md §5).",
                 BARRIER_TIMEOUT,
                 connections,
             );

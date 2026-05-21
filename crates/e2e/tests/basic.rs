@@ -388,7 +388,10 @@ async fn server_log_records_bgworker_boot_chain() -> Result<()> {
     let log = std::fs::read_to_string(c.log_path())?;
     for needle in [
         "frontend: tokio runtime ready",
-        "pg_transport pool: all ",
+        // Autoscaling pool: FE binds the single UDS listener at
+        // boot; slots connect on demand (see
+        // docs/design/deferred/slot-readiness.md §2.0).
+        "pg_transport pool: bound frontend listener at",
         "tcp_handoff: listening on 127.0.0.1:5454",
         "wire=pgwire-v3",
         "pgwire-v3 startup: peer=",

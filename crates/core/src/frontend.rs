@@ -7,10 +7,17 @@
 //!
 //! Phase 3 scope (adds to phases 1 + 2): on boot, also spawn the
 //! single v0 transport (`tcp_handoff`) on the LocalSet, with a
-//! [`HandoffHandle`] backed by the [`BackendPool`]. Every accepted
-//! TCP client is fd-passed to a slot via SCM_RIGHTS, where the
-//! phase-3 null wire writes a synthetic v3 ErrorResponse and closes.
-//! No SQL handler yet (phase 4).
+//! [`HandoffHandle`] backed by the [`Pool`]. Every accepted TCP
+//! client is fd-passed to a slot via SCM_RIGHTS, where the phase-3
+//! null wire writes a synthetic v3 ErrorResponse and closes.
+//!
+//! Pool topology per
+//! [`docs/design/deferred/slot-readiness.md`](../../../docs/design/deferred/slot-readiness.md):
+//! the FE binds a single UDS listener, spawns an `accept_loop` task
+//! that assigns `slot_id`s on accept, and an `idle_reaper` task
+//! that drains slots idle past `IDLE_REAP_AFTER`. Slots are
+//! created dynamically by the dispatcher's `grow_one()` whenever a
+//! handoff arrives with no ready slot.
 
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -22,17 +29,8 @@ use pgrx::pg_sys;
 use pgrx::prelude::*;
 use tokio::signal::unix::{SignalKind, signal};
 
-use crate::backend::pool::BackendPool;
-use crate::guc;
+use crate::backend::pool::{self, Pool};
 use crate::handoff::tcp::{TcpHandoff, TcpHandoffCfg};
-
-/// How long we wait for any single slot bgworker to connect to its
-/// listener before giving up. Static registration spawns slots
-/// concurrently with the FE, but the postmaster can serialise
-/// large bgworker batches over a few hundred ms. 30 s comfortably
-/// covers pool sizes through `pg_transport.backend_pool_size`'s
-/// upper bound (currently 64; see guc.rs).
-const SLOT_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Phase-3 hard-coded bind address for the single `tcp_handoff`
 /// transport. Phase ≥ 7 reads this from `pg_transport.transports`.
@@ -87,36 +85,57 @@ async fn frontend_main() {
     let mut sighup = signal(SignalKind::hangup()).expect("tokio sighup handler");
     let mut sigterm = signal(SignalKind::terminate()).expect("tokio sigterm handler");
 
-    // Bring up the backend pool — bind per-slot listeners, wait for
-    // each slot bgworker to connect. The pool is held alive for the
-    // lifetime of the FE supervisor; dropping it on shutdown closes
-    // every per-slot UnixStream, which the slot side observes as
-    // clean EOF on its blocking recvmsg.
-    let pool_size = guc::backend_pool_size();
-    let pool = match BackendPool::start(pool_size, SLOT_ACCEPT_TIMEOUT).await {
-        Ok(p) => p,
+    // Bind the single UDS listener. Failure here (e.g. permissions
+    // on the socket directory) is a hard config error; exit cleanly
+    // and let the postmaster respawn us so the operator sees the
+    // error repeatedly until they fix it.
+    let listener = match pool::bind_listener() {
+        Ok(l) => l,
         Err(e) => {
-            // WARNING + clean exit lets the postmaster respawn us;
-            // if the pool just never comes up we'll loop on this
-            // error, which is the right operator signal that
-            // something is wrong (e.g. permissions on
-            // the socket directory).
             pgrx::warning!(
-                "pg_transport frontend: BackendPool::start failed: {e}; exiting (will be respawned)"
+                "pg_transport frontend: bind_listener failed: {e}; exiting (will be respawned)"
             );
             return;
         }
     };
 
+    // The pool itself. `Rc` for cheap sharing across the
+    // dispatcher (via HandoffHandle), the accept_loop task, the
+    // idle_reaper task, and the SIGHUP handler.
+    let pool: Rc<Pool> = Rc::new(Pool::new());
+
+    // Optional pre-warm. Fire MIN_WARM_SLOTS `grow_one()` calls
+    // before any client arrives. Compile-time MIN_WARM_SLOTS = 0
+    // by default — no pre-warm; first connection pays cold-grow.
+    pool::pre_warm();
+
     // HandoffHandle wraps the pool behind a Rc<dyn HandoffSink>.
     // The transport's `run` future is spawn_local'd, so !Send is
     // fine (LocalSet semantics).
-    let pool_rc: Rc<BackendPool> = Rc::new(pool);
-    let handle = HandoffHandle::new(pool_rc.clone());
+    let handle = HandoffHandle::new(pool.clone());
 
-    // Shared shutdown token; one source, every transport's `run`
+    // Shared shutdown token; one source, every long-lived task
     // gets a clone. Cancelled below before we drop the pool.
     let shutdown = ShutdownToken::new();
+
+    // Pool lifecycle tasks: accept_loop owns the listener and
+    // assigns slot ids on accept; idle_reaper drains slots that
+    // have been ready longer than IDLE_REAP_AFTER. Both run for
+    // the lifetime of the FE.
+    let accept_task = {
+        let pool = pool.clone();
+        let shutdown = shutdown.clone();
+        tokio::task::spawn_local(async move {
+            if let Err(e) = pool::accept_loop(listener, pool, shutdown).await {
+                pgrx::warning!("pg_transport pool: accept_loop returned error: {e}");
+            }
+        })
+    };
+    let reaper_task = {
+        let pool = pool.clone();
+        let shutdown = shutdown.clone();
+        tokio::task::spawn_local(pool::idle_reaper(pool, shutdown))
+    };
 
     // Spawn the single v0 transport. Phase ≥ 4 will drive this from
     // a catalog read (`pg_transport.transports`); phase 3 hard-codes
@@ -129,7 +148,8 @@ async fn frontend_main() {
                     "pg_transport frontend: invalid bind addr {PHASE_3_TCP_BIND:?}: {e}"
                 );
                 shutdown.cancel();
-                // pool_rc dropped at fn exit
+                accept_task.abort();
+                reaper_task.abort();
                 return;
             }
         };
@@ -166,10 +186,15 @@ async fn frontend_main() {
                 break;
             }
             _ = sighup.recv() => {
-                // Phase 3: nothing to reload yet. Phase ≥ 4 will
-                // reconcile the live listener set against
-                // pg_transport.transports here.
-                pgrx::log!("pg_transport frontend: SIGHUP received (no-op in phase 3)");
+                // SIGHUP reconciles the pool against the (possibly
+                // changed) `pg_transport.max_backend_pool_size`
+                // GUC. If the new ceiling is lower than current
+                // total, drain excess idle slots; in-flight slots
+                // are left to finish their session naturally (the
+                // dispatcher's grow gate will refuse to add new
+                // ones while at the new lower ceiling).
+                pgrx::log!("pg_transport frontend: SIGHUP received");
+                pool::sighup_reconcile(&pool);
             }
             _ = watchdog.tick() => {
                 if postmaster_died() {
@@ -184,15 +209,18 @@ async fn frontend_main() {
     }
 
     // Cancel the shared shutdown token; the transport's accept loop
-    // observes `shutdown.cancelled()` and returns from `run` of its
-    // own accord. We `.await` its join handle so the listener is
-    // gone before we drop the pool (which would close the per-slot
-    // UnixStreams and trigger slot-side EOF).
+    // and the pool's accept_loop/idle_reaper all observe
+    // `shutdown.cancelled()` and return from their own accord. We
+    // `.await` the join handles so the listener is gone before we
+    // drop the pool.
     shutdown.cancel();
     let _ = transport_handle.await;
-    // pool_rc dropped at fn exit — closes every per-slot UnixStream,
-    // slots observe recvmsg → 0, exit cleanly.
-    drop(pool_rc);
+    let _ = accept_task.await;
+    let _ = reaper_task.await;
+    // pool dropped at fn exit — drops the slot streams; slot
+    // bgworkers observe EOF on their recv_ctrl_async and exit
+    // cleanly via the CtrlMsg::Eof branch.
+    drop(pool);
 }
 
 /// Non-blocking check: is the postmaster still alive?

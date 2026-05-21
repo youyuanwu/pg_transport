@@ -11,16 +11,25 @@ use std::ffi::CString;
 use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 use pgrx::prelude::PgSqlErrorCode;
 
-/// `pg_transport.backend_pool_size` — how many slot bgworkers
-/// `_PG_init()` registers at postmaster start.
+/// `pg_transport.max_backend_pool_size` — hard ceiling on the slot
+/// bgworker pool.
 ///
-/// Read once at postmaster start; changes require restart (`PGC_POSTMASTER`).
-/// Live pool resize is [Q15](../../docs/design/roadmap.md) — deferred.
+/// The pool sizes itself (demand-driven grow + idle-reap shrink); the
+/// operator only configures the ceiling. See
+/// [`docs/design/deferred/slot-readiness.md`](../../docs/design/deferred/slot-readiness.md)
+/// §5 for the autoscaling design.
 ///
-/// Default `2` is a phase-2 testing convenience; the design's eventual
-/// default is `max(4, num_cpus)` (see
-/// [backend-handoff.md §1](../../docs/design/backend-handoff.md)).
-pub static BACKEND_POOL_SIZE: GucSetting<i32> = GucSetting::<i32>::new(2);
+/// Read at FE boot when binding the UDS listener (backlog snapshot)
+/// and every dispatcher tick to gate `grow_one`. SUSET so a
+/// `SIGHUP` lowering the ceiling kicks the SIGHUP handler to drain
+/// excess slots; raising it lets the next saturation event spawn
+/// more.
+///
+/// Default `64` matches the design's documented operator-friendly
+/// ceiling (room for a moderate workload without restart).
+/// Validation rejects `< 1` — a 0-size pool can't serve traffic
+/// and would yield a 0 listen-backlog.
+pub static MAX_BACKEND_POOL_SIZE: GucSetting<i32> = GucSetting::<i32>::new(64);
 
 /// `pg_transport.auth_source` — selects whether wire-layer auth
 /// resolves methods via PG's `pg_hba.conf` helpers (`'pg_hba'`) or
@@ -95,13 +104,17 @@ pub enum ExecutionBackend {
 
 pub fn register() {
     GucRegistry::define_int_guc(
-        c"pg_transport.backend_pool_size",
-        c"Number of slot bgworkers in the backend pool.",
-        c"Read once at postmaster start; changes require a restart.",
-        &BACKEND_POOL_SIZE,
+        c"pg_transport.max_backend_pool_size",
+        c"Hard ceiling on the slot bgworker pool (autoscaler max).",
+        c"The pool grows on demand and shrinks on idle; this is the upper bound.",
+        &MAX_BACKEND_POOL_SIZE,
         1,
-        64,
-        GucContext::Postmaster,
+        1024,
+        // SUSET (not Postmaster) so SIGHUP can adjust the ceiling
+        // live. The pool's SIGHUP handler drains excess slots when
+        // the new value is lower than `ready + in_flight + draining`;
+        // raising it lets the next saturation event grow further.
+        GucContext::Suset,
         GucFlags::default(),
     );
 
@@ -203,8 +216,8 @@ fn decode_auth_source() -> Result<AuthSource, String> {
 }
 
 #[inline]
-pub fn backend_pool_size() -> u32 {
-    BACKEND_POOL_SIZE.get() as u32
+pub fn max_backend_pool_size() -> u32 {
+    MAX_BACKEND_POOL_SIZE.get() as u32
 }
 
 /// Read both TLS-file GUCs and return the typed pair
