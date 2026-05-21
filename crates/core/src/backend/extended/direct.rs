@@ -43,6 +43,7 @@
 //! commit 5 will wire that in.
 
 use std::ffi::{CStr, CString};
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -503,8 +504,12 @@ fn decode_parameters(
 /// `*mut DestReceiver` to `*mut WireDestReceiver` is sound —
 /// standard C "inheritance" pattern used by PG's own
 /// `DR_transientrel`, `DR_copy`, etc.
+///
+/// The lifetime `'a` ties this receiver to the borrowed encoder
+/// slice and output `Vec<DataRow>` — the borrow checker prevents
+/// either from being dropped while the receiver exists.
 #[repr(C)]
-struct WireDestReceiver {
+struct WireDestReceiver<'a> {
     /// Must be at offset 0. PG calls through this vtable.
     base: pg_sys::DestReceiver,
     /// Per-column encoders (borrowed from the caller's Vec).
@@ -513,13 +518,15 @@ struct WireDestReceiver {
     rows: *mut Vec<DataRow>,
     /// Number of result columns.
     ncols: i16,
+    /// Ties lifetime to the borrowed encoders + rows.
+    _lifetime: PhantomData<&'a ()>,
 }
 
-impl WireDestReceiver {
+impl<'a> WireDestReceiver<'a> {
     /// Build a `WireDestReceiver` on the stack. The returned
     /// struct borrows `encoders` and `rows` — caller must keep
     /// both alive for the duration of `PortalRun`.
-    fn new(encoders: &[ColumnEncoder], rows: &mut Vec<DataRow>, ncols: i16) -> Self {
+    fn new(encoders: &'a [ColumnEncoder], rows: &'a mut Vec<DataRow>, ncols: i16) -> Self {
         WireDestReceiver {
             base: pg_sys::DestReceiver {
                 receiveSlot: Some(wire_receive_slot),
@@ -531,6 +538,7 @@ impl WireDestReceiver {
             encoders: encoders.as_ptr(),
             rows: rows as *mut _,
             ncols,
+            _lifetime: PhantomData,
         }
     }
 
