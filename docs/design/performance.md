@@ -11,22 +11,32 @@ mean and where the headroom is*.
 
 ## 1. Where we are
 
-Most recent bench run (`just bench pg18 5000 2`, post-§3.2 port):
+Most recent stable custom-bench sweep (`just bench pg18 20000 8 "" "" {spi|direct}`):
 
-| Stat | Vanilla PG | pg_transport | Ratio |
-| --- | --- | --- | --- |
-| p50  | 175.5 µs | 157.7 µs | 0.90x |
-| p95  | 289.0 µs | 275.8 µs | 0.95x |
-| p99  | 363.9 µs | 348.7 µs | 0.96x |
-| mean | 194.4 µs | 174.7 µs | 0.90x |
-| **qps** | 10259.7 | 11424.3 | **1.11x** |
+| Mode | Stat | Vanilla PG | pg_transport | Ratio |
+| --- | --- | --- | --- | --- |
+| `spi` | p50  | 425.2 µs | 376.7 µs | 0.89x |
+| `spi` | p95  | 559.9 µs | 493.2 µs | 0.88x |
+| `spi` | p99  | 623.4 µs | 550.7 µs | 0.88x |
+| `spi` | mean | 430.4 µs | 383.1 µs | 0.89x |
+| `spi` | **qps** | 18496.7 | 20794.0 | **1.12x** |
+| `direct` | p50  | 417.3 µs | 403.0 µs | 0.97x |
+| `direct` | p95  | 551.7 µs | 513.0 µs | 0.93x |
+| `direct` | p99  | 616.4 µs | 569.5 µs | 0.92x |
+| `direct` | mean | 422.1 µs | 406.4 µs | 0.96x |
+| `direct` | **qps** | 18853.0 | 19629.7 | **1.04x** |
 
-`just pgbench pg18 select 5 4`: vanilla PG 17890 tps, pg_transport
-17448 tps (0.975x — within noise; the 1-column pgbench `-S` workload
-doesn't exercise the per-cell allocation path that the custom
-bench above does).
+Most recent stable pgbench select (`just pgbench pg18 select 30 8 "" {spi|direct}`):
 
-`just pgbench pg18 tpcb 30 8` (TPC-B-like, 4 UPDATEs + SELECT + INSERT
+- `backend=spi`: vanilla 27069.7 tps / 0.296 ms, pg_transport 25138.7 tps / 0.318 ms (0.93x tps).
+- `backend=direct`: vanilla 26641.6 tps / 0.300 ms, pg_transport 25111.4 tps / 0.319 ms (0.94x tps).
+
+Most recent stable pgbench nupdate (`just pgbench pg18 nupdate 30 8 "" {spi|direct}`):
+
+- `backend=spi`: vanilla 6756.2 tps / 1.184 ms, pg_transport 6310.0 tps / 1.268 ms (0.93x tps).
+- `backend=direct`: vanilla 6332.8 tps / 1.263 ms, pg_transport 6346.8 tps / 1.260 ms (1.00x tps, parity).
+
+Latest recorded `just pgbench pg18 tpcb 30 8` (TPC-B-like, 4 UPDATEs + SELECT + INSERT
 per multi-statement `'Q'`): vanilla PG 1884 tps / 4.25 ms avg latency,
 pg_transport 2060 tps / 3.88 ms (**1.09x qps**, 0.91x latency). This
 is the workload [§3.3](#33-per-query-xact-bracket-overhead) targets;
@@ -48,9 +58,9 @@ simple-query path) is responsible for a **~20 percentage point qps
 swing** on the custom harness — we now run faster than vanilla PG
 on this workload. p50/mean win by ~10% each.
 
-Range across phases 4 → 9 + 9.5: **0.90x – 1.20x qps**. Tail
-latencies (p95 / p99 / max) consistently land at or *better than*
-vanilla PG — the bgworker pool reuse pays off there (no
+Range across recent stable sweeps: **0.93x – 1.12x qps**. On the
+custom harness, tail latencies (p95 / p99 / max) tend to land at or
+better than vanilla PG — the bgworker pool reuse pays off there (no
 per-connection fork tax).
 
 
@@ -61,7 +71,7 @@ per-connection fork tax).
 | pgbouncer (transaction mode) | 0.7x – 0.85x | libpq parse/encode round-trip on every message |
 | pgcat | 0.75x – 0.90x | same shape as pgbouncer, Rust-based |
 | pgpool-II | 0.6x – 0.8x | proxy + query rewriting overhead |
-| **pg_transport** | **0.84x – 1.04x** | bgworker reuse + SPI delegates execution to PG's own planner+executor |
+| **pg_transport** | **0.93x – 1.12x** | bgworker reuse + in-process execution path (SPI/default and direct-mode comparison) |
 
 The reason we land in the same range as direct PG (rather than the
 0.7–0.85x range typical of pooling) is structural: **we don't proxy

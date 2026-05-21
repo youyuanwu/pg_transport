@@ -23,7 +23,7 @@ the cluster down.
 ## 1. `just bench` — custom harness
 
 ```sh
-just bench [pg] [iters] [connections] [pool] [csv]
+just bench [pg] [iters] [connections] [pool] [csv] [mode]
 ```
 
 Positional arguments (just 1.51 has no kwarg form — see
@@ -36,23 +36,24 @@ Positional arguments (just 1.51 has no kwarg form — see
 | 3        | `connections` | `1`          | Concurrent worker connections per side; bound by `pg_transport.backend_pool_size` (see [Q10](roadmap.md#22-still-open--deferred-only)). |
 | 4        | `pool`        | `""`         | Override `pg_transport.backend_pool_size`. Empty ⇒ `pool = connections` (apples-to-apples, no contention). |
 | 5        | `csv`         | `""`         | Optional per-sample CSV path: `label,iter,latency_ns`.                                        |
+| 6        | `mode`        | `spi`        | pg_transport execution backend mode: `spi` (default) or `direct` (`SET pg_transport.execution_backend`). |
 
 ### 1.1 Workload shape
 
 Per [`run_one_worker`](../../crates/bench/src/main.rs):
 
 1. Open a `tokio_postgres` connection.
-2. Run `warmup` (default 100) `SELECT 1` round-trips — primes the
+2. `SET pg_transport.execution_backend` for the connection based on
+  selected mode (`spi` or `direct`).
+3. Run `warmup` (default 100) `SELECT 1` round-trips (extended-query) — primes the
    slot, primes the plan cache, warms libc allocators.
-3. Hit a barrier shared with all other workers (timeout: 30 s; see
+4. Hit a barrier shared with all other workers (timeout: 30 s; see
    §1.4 below).
-4. Run `iterations / connections` measured `SELECT 1` round-trips,
+5. Run `iterations / connections` measured `SELECT 1` round-trips,
    recording per-query latency.
 
-Round-trip uses `simple_query("SELECT 1")` — same wire path psql
-`-c` uses (`'Q'` message in pgwire v3). Extended-query path
-(`Parse`/`Bind`/`Execute`) is **not** exercised; that lands in
-phase 9.
+Round-trips always use extended-query (`query_opt("SELECT 1", &[])`) so
+the selected backend mode is actually exercised.
 
 ### 1.2 Output
 
@@ -147,7 +148,7 @@ captured runs.
 ## 2. `just pgbench` — TPC-B-like workload via pgbench
 
 ```sh
-just pgbench [pg] [mode] [duration] [clients] [pool]
+just pgbench [pg] [mode] [duration] [clients] [pool] [backend]
 ```
 
 Positional arguments:
@@ -155,10 +156,11 @@ Positional arguments:
 | Position | Name       | Default | Meaning                                                                                                  |
 | -------- | ---------- | ------- | -------------------------------------------------------------------------------------------------------- |
 | 1        | `pg`       | `pg18`  | Postgres major.                                                                                          |
-| 2        | `mode`     | `select`| `select` runs `pgbench -S` (read-only). `tpcb` / `tpcb-rw` are **rejected by v0** — see §2.5.            |
+| 2        | `mode`     | `select`| `select` runs `pgbench -S` (read-only), `nupdate` runs `pgbench -N` (simple update), and `tpcb` / `tpcb-rw` run default TPC-B-like mode. |
 | 3        | `duration` | `10`    | Seconds (`pgbench -T`).                                                                                   |
 | 4        | `clients`  | `4`     | Concurrent clients per side (`pgbench -c -j`); bound by `backend_pool_size` against pg_transport.        |
 | 5        | `pool`     | `""`    | Override `backend_pool_size`. Empty ⇒ `pool = clients`.                                                  |
+| 6        | `backend`  | `spi`   | pg_transport execution backend (`spi` or `direct`) passed via `PGOPTIONS=-c pg_transport.execution_backend=...` on the pg_transport-side run. |
 
 ### 2.1 Initialisation
 
@@ -174,6 +176,7 @@ a deterministic baseline.
 | `mode`    | pgbench script             | What it exercises that `just bench` does not                                                       |
 | --------- | -------------------------- | --------------------------------------------------------------------------------------------------- |
 | `select`  | `<builtin: select only>`   | Real index lookup on `pgbench_accounts` instead of `SELECT 1` — moves the cost from "framework hop only" toward "framework hop + real query work".                |
+| `nupdate` | `<builtin: simple update>` | Write-heavy transaction without branch/teller updates. Good midpoint between `-S` and full TPC-B. |
 | `tpcb`    | `<builtin: TPC-B (sort of)>` | Adds writes (`UPDATE`, `INSERT`), explicit transaction blocks (`BEGIN` / `END`), and 4 statements per transaction. Tests the SPI bridge's read-write path, the xact-control sniff that routes `BEGIN` / `COMMIT` around SPI's atomic mode (see [`spi_bridge.rs`](../../crates/core/src/backend/spi_bridge.rs) `parse_xact_control`), and per-transaction latency under realistic workload shape. |
 
 ### 2.3 Output
@@ -207,8 +210,8 @@ investigate, do not paper over.
 
 Limitations the recipe surfaces today. These are the next things to fix if you want pgbench coverage beyond the current scope.
 
-- **`pgbench -i` runs against the vanilla port, not pg_transport.** pgbench's `-i` uses the extended-query protocol for its `regclass` lookup (`SELECT relkind FROM pg_catalog.pg_class WHERE oid=$1::regclass`); the v0 wire layer only handles simple-query messages — phase 9 territory. The recipe always initialises via the vanilla port; both listeners share the same data files. The actual benchmark phase (`-S` or `tpcb`) runs against pg_transport via simple-query.
-- **`-M simple` only.** `-M extended` and `-M prepared` need phase 9 for the same reason as `-i`.
+- **`pgbench -i` runs against the vanilla port, not pg_transport.** pgbench's `-i` uses the extended-query protocol for its `regclass` lookup (`SELECT relkind FROM pg_catalog.pg_class WHERE oid=$1::regclass`); the v0 wire layer only handles simple-query messages — phase 9 territory. The recipe always initialises via the vanilla port; both listeners share the same data files. The actual benchmark phase (`-S`, `-N`, or `tpcb`) runs against pg_transport via simple-query.
+- **`-M simple` only.** `-M extended` and `-M prepared` need phase 9 for the same reason as `-i`. The recipe exposes a `backend` arg (`spi|direct`) for pg_transport, but with `-M simple` its practical effect is limited until extended/prepared modes are supported end-to-end.
 - **Error inside an explicit `BEGIN` block collapses to `TBLOCK_DEFAULT`, not `TBLOCK_ABORT`.** Real PG marks the transaction as aborted and rejects every subsequent statement until `ROLLBACK`; we auto-abort to `DEFAULT` so subsequent statements run as if in a fresh auto-commit context. Harmless for pgbench (which has no expected error paths); phase ≥ 9 fixes when a real client cares.
 - **No auth.** All connections use `-U postgres -d postgres` with trust. Phase 7 plumbs real auth.
 - **No TLS.** Phase 8.
@@ -216,21 +219,30 @@ Limitations the recipe surfaces today. These are the next things to fix if you w
 
 ### 2.6 What current numbers look like
 
-`pgbench -T 10 -c 4 -j 4` against a fresh cluster, post-Q25 (`raw_parser`):
+Recent stable runs (`-T 30 -c 8 -j 8`, `pool=8`) show:
 
 ```
-mode=select (pgbench -S)
-  vanilla PG       :  ~16500 tps   latency_avg ~0.24 ms
-  pg_transport     :  ~16500 tps   latency_avg ~0.24 ms     (~100% of vanilla)
+mode=select (pgbench -S), backend=spi
+  vanilla PG       : 27069.7 tps   latency_avg 0.296 ms
+  pg_transport     : 25138.7 tps   latency_avg 0.318 ms   (~92.9% of vanilla TPS)
 
-mode=tpcb
-  vanilla PG       :   ~2200 tps   latency_avg ~1.80 ms
-  pg_transport     :   ~2280 tps   latency_avg ~1.75 ms     (~104% of vanilla)
+mode=select (pgbench -S), backend=direct
+  vanilla PG       : 26641.6 tps   latency_avg 0.300 ms
+  pg_transport     : 25111.4 tps   latency_avg 0.319 ms   (~94.3% of vanilla TPS)
+
+mode=nupdate (pgbench -N), backend=spi
+  vanilla PG       :  6756.2 tps   latency_avg 1.184 ms
+  pg_transport     :  6310.0 tps   latency_avg 1.268 ms   (~93.4% of vanilla TPS)
+
+mode=nupdate (pgbench -N), backend=direct
+  vanilla PG       :  6332.8 tps   latency_avg 1.263 ms
+  pg_transport     :  6346.8 tps   latency_avg 1.260 ms   (~100.2% of vanilla TPS)
 ```
 
 Mechanism:
 
 - `-S` is a real single-row index lookup; vanilla does the work and replies, pg_transport does the same work plus the extra hop AND a per-query parse via PG's `raw_parser` (resolves Q25 — needed to split multi-statement strings and classify xact-control). The parse cost is ~5 µs/query; hop dominates the remaining delta.
+- `-N` (`simple update`) is write-heavier and narrows the relative framework tax because each transaction does more useful server work than `-S`.
 - `tpcb` per transaction does ~4 statements + `BEGIN` + `END`. The 6 round-trips amortise the per-message framework cost, including the per-query parse; pg_transport's pre-warmed bgworker pool absorbs jitter that vanilla eats fresh per connection.
 - **Q25 resolution path**: an earlier attempt at sqlparser-rs cost ~15 µs/query (~5% throughput regression). Replaced with PG's in-process `raw_parser` (3-5× faster, perfect grammar fidelity, zero new deps); see [roadmap.md §2.3 Q25](roadmap.md). We still parse twice (once in our classifier, once inside SPI) but both are PG's own ~5 µs parser. Getting to "parse once" requires bypassing SPI with a direct `Portal`/`pg_analyze_and_rewrite_fixedparams`/`pg_plan_queries` path; deferred to phase 9.
 

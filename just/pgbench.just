@@ -27,31 +27,45 @@ PGBENCH_SOCKETS := "/tmp/pg_transport_sockets"
 # just/bench.just for the same restriction):
 #   1. pg          (default pg18)  — Postgres major.
 #   2. mode        (default select) — `select` runs `pgbench -S`
-#                                    (read-only). `tpcb` (alias
-#                                    `tpcb-rw`) runs the default
-#                                    TPC-B-like workload (BEGIN +
-#                                    3 UPDATEs + SELECT + INSERT +
-#                                    END per transaction).
+#                                    (read-only). `nupdate` runs
+#                                    `pgbench -N` (simple update,
+#                                    skips branch/teller updates).
+#                                    `tpcb` (alias `tpcb-rw`) runs
+#                                    the default TPC-B-like workload
+#                                    (BEGIN + 3 UPDATEs + SELECT +
+#                                    INSERT + END per transaction).
 #   3. duration    (default 10)    — seconds; `pgbench -T`.
 #   4. clients     (default 4)     — concurrent clients per side
 #                                    (`pgbench -c -j`); bound by
 #                                    `pg_transport.backend_pool_size`.
 #   5. pool        (default "")    — override `backend_pool_size`.
 #                                    Empty ⇒ defaults to `clients`.
+#   6. backend     (default spi)   — pg_transport execution backend:
+#                                    `spi` or `direct`.
 #
 # Examples:
 #   just pgbench                              # 10s select, 4 clients
 #   just pgbench pg18 select 30 8             # 30s select, 8 clients
+#   just pgbench pg18 nupdate 30 8            # 30s simple-update, 8 clients
 #   just pgbench pg18 tpcb 30 8               # 30s tpcb-like, 8 clients
 #   just pgbench pg18 select 10 16 16         # 16 clients & 16-slot pool
-pgbench pg=default_pg mode="select" duration="10" clients="4" pool="":
+#   just pgbench pg18 select 10 4 "" direct   # force direct backend on pg_transport
+pgbench pg=default_pg mode="select" duration="10" clients="4" pool="" backend="spi":
     #!/usr/bin/env bash
     set -euo pipefail
 
     case "{{mode}}" in
-        select|tpcb|tpcb-rw) ;;
+        select|nupdate|tpcb|tpcb-rw) ;;
         *)
-            echo "pgbench: unknown mode '{{mode}}' (expected: select|tpcb|tpcb-rw)" >&2
+            echo "pgbench: unknown mode '{{mode}}' (expected: select|nupdate|tpcb|tpcb-rw)" >&2
+            exit 2
+            ;;
+    esac
+
+    case "{{backend}}" in
+        spi|direct) ;;
+        *)
+            echo "pgbench: unknown backend '{{backend}}' (expected: spi|direct)" >&2
             exit 2
             ;;
     esac
@@ -128,11 +142,12 @@ pgbench pg=default_pg mode="select" duration="10" clients="4" pool="":
     common_args=(-T {{duration}} -c {{clients}} -j {{clients}} --no-vacuum -M simple)
     case "{{mode}}" in
         select) common_args+=(-S) ;;
+        nupdate) common_args+=(-N) ;;
         tpcb|tpcb-rw) ;;
     esac
 
     echo ""
-    echo "pgbench: backend_pool_size=$pool_size clients={{clients}} duration={{duration}}s mode={{mode}}"
+    echo "pgbench: backend_pool_size=$pool_size clients={{clients}} duration={{duration}}s mode={{mode}} backend={{backend}}"
 
     # Step 4 — run vanilla first as the baseline.
     echo ""
@@ -146,4 +161,8 @@ pgbench pg=default_pg mode="select" duration="10" clients="4" pool="":
     echo "=================================================="
     echo "  pg_transport (127.0.0.1:5454)"
     echo "=================================================="
-    "$pg_bin/pgbench" "${common_args[@]}" -h 127.0.0.1 -p 5454 -U postgres -d postgres
+    # Note: pgbench currently runs in `-M simple` mode for pg_transport,
+    # so execution_backend primarily future-proofs this recipe until
+    # extended/prepared query modes are supported end-to-end.
+    PGOPTIONS="-c pg_transport.execution_backend={{backend}}" \
+        "$pg_bin/pgbench" "${common_args[@]}" -h 127.0.0.1 -p 5454 -U postgres -d postgres

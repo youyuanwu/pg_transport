@@ -33,6 +33,8 @@ BENCH_SOCKETS := "/tmp/pg_transport_sockets"
 #                                    (each connection beyond pool_size
 #                                    queues on slot availability).
 #   5. csv         (default "")    — optional per-sample CSV path.
+#   6. mode        (default spi)    — pg_transport execution backend:
+#                                    `spi` (default) or `direct`.
 #
 # To skip a middle parameter while setting a later one, pass an
 # explicit value or the default literally — there is no keyword form.
@@ -42,7 +44,8 @@ BENCH_SOCKETS := "/tmp/pg_transport_sockets"
 #   just bench pg18 1000 4                    # 4 conns, 4 slots (no contention)
 #   just bench pg18 1000 16 4                 # 16 conns, pool=4 (contention)
 #   just bench pg18 10000 8 "" /tmp/b.csv     # 8 conns, default pool, CSV out
-bench pg=default_pg iters="1000" connections="1" pool="" csv="":
+#   just bench pg18 10000 8 "" "" direct      # direct backend mode
+bench pg=default_pg iters="1000" connections="1" pool="" csv="" mode="spi":
     #!/usr/bin/env bash
     set -euo pipefail
 
@@ -117,13 +120,13 @@ bench pg=default_pg iters="1000" connections="1" pool="" csv="":
     }
     trap cleanup EXIT
 
-    echo "bench: backend_pool_size=$pool_size connections={{connections}} iters={{iters}}"
+    echo "bench: backend_pool_size=$pool_size connections={{connections}} iters={{iters}} mode={{mode}}"
 
     # Step 3 — run the bench. `bench compare` connects to both
     # ports, runs the workload sequentially per side (no contention
     # between vanilla and pg_transport), prints the comparison
     # table to stderr.
-    args=(compare --iterations {{iters}} --connections {{connections}})
+    args=(compare --iterations {{iters}} --connections {{connections}} --mode {{mode}})
     if [[ -n "{{csv}}" ]]; then
         args+=(--csv "{{csv}}")
     fi

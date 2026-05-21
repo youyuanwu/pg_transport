@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use tokio::sync::Barrier;
-use tokio_postgres::NoTls;
+use tokio_postgres::{Client, NoTls};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -102,6 +102,18 @@ struct Workload {
     /// Optional per-sample CSV output: `label,iter,latency_ns`.
     #[arg(long)]
     csv: Option<String>,
+
+    /// Execution backend mode for pg_transport's extended path:
+    /// - `spi`    => SPI bridge backend (default)
+    /// - `direct` => planner+executor direct backend
+    #[arg(long, value_enum, default_value_t = BackendMode::Spi)]
+    mode: BackendMode,
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy)]
+enum BackendMode {
+    Spi,
+    Direct,
 }
 
 #[derive(Args, Debug)]
@@ -153,11 +165,12 @@ async fn run_single(args: RunArgs) -> Result<()> {
 
     let conn_str = libpq_conn_str(&args.target, &w.user, &w.db);
     eprintln!(
-        "bench: target={} iterations={} warmup={} connections={}",
-        args.target, w.iterations, w.warmup, w.connections,
+        "bench: target={} iterations={} warmup={} connections={} mode={:?}",
+        args.target, w.iterations, w.warmup, w.connections, w.mode,
     );
 
-    let (samples, wall) = run_workload(&conn_str, w.iterations, w.warmup, w.connections).await?;
+    let (samples, wall) =
+        run_workload(&conn_str, w.iterations, w.warmup, w.connections, w.mode).await?;
     let summary = summarize(&samples, wall);
     let label = args.label.clone().unwrap_or_else(|| args.target.clone());
     print_summary(&label, w.connections, &summary);
@@ -179,8 +192,8 @@ async fn run_compare(args: CompareArgs) -> Result<()> {
     validate_workload(w)?;
 
     eprintln!(
-        "bench compare: pt=127.0.0.1:{} pg=127.0.0.1:{} iterations={} warmup={} connections={}",
-        args.pt_port, args.pg_port, w.iterations, w.warmup, w.connections,
+        "bench compare: pt=127.0.0.1:{} pg=127.0.0.1:{} iterations={} warmup={} connections={} mode={:?}",
+        args.pt_port, args.pg_port, w.iterations, w.warmup, w.connections, w.mode,
     );
 
     let pt_conn = libpq_conn_str(&format!("127.0.0.1:{}", args.pt_port), &w.user, &w.db);
@@ -189,12 +202,14 @@ async fn run_compare(args: CompareArgs) -> Result<()> {
     // Run vanilla first as the baseline reference, then pg_transport.
     // Sequential (not parallel) so the two share no contention; the
     // numbers should be a clean delta.
-    let (pg_samples, pg_wall) = run_workload(&pg_conn, w.iterations, w.warmup, w.connections)
-        .await
-        .context("vanilla PG bench")?;
-    let (pt_samples, pt_wall) = run_workload(&pt_conn, w.iterations, w.warmup, w.connections)
-        .await
-        .context("pg_transport bench")?;
+    let (pg_samples, pg_wall) =
+        run_workload(&pg_conn, w.iterations, w.warmup, w.connections, w.mode)
+            .await
+            .context("vanilla PG bench")?;
+    let (pt_samples, pt_wall) =
+        run_workload(&pt_conn, w.iterations, w.warmup, w.connections, w.mode)
+            .await
+            .context("pg_transport bench")?;
 
     let pg_sum = summarize(&pg_samples, pg_wall);
     let pt_sum = summarize(&pt_samples, pt_wall);
@@ -274,6 +289,7 @@ async fn run_workload(
     iterations: usize,
     warmup: usize,
     connections: usize,
+    mode: BackendMode,
 ) -> Result<(Vec<Duration>, Duration)> {
     let per_worker_base = iterations / connections;
     let extra = iterations % connections;
@@ -287,7 +303,7 @@ async fn run_workload(
         let conn_str = conn_str.to_string();
         let barrier = barrier.clone();
         handles.push(tokio::spawn(async move {
-            run_one_worker(&conn_str, iters, warmup, barrier).await
+            run_one_worker(&conn_str, iters, warmup, barrier, mode).await
         }));
     }
 
@@ -339,6 +355,7 @@ async fn run_one_worker(
     iterations: usize,
     warmup: usize,
     barrier: Arc<Barrier>,
+    mode: BackendMode,
 ) -> Result<Vec<Duration>> {
     let (client, conn) = tokio_postgres::connect(conn_str, NoTls)
         .await
@@ -349,13 +366,13 @@ async fn run_one_worker(
         }
     });
 
-    // Warmup uses `simple_query` (text protocol — same path psql
-    // -c uses, same path our SimpleQueryHandler handles).
+    set_execution_backend(&client, mode)
+        .await
+        .context("set pg_transport.execution_backend")?;
+
+    // Warmup uses the same backend mode as measured samples.
     for _ in 0..warmup {
-        let _ = client
-            .simple_query("SELECT 1")
-            .await
-            .context("warmup query")?;
+        run_round_trip(&client).await.context("warmup query")?;
     }
 
     barrier.wait().await;
@@ -363,16 +380,31 @@ async fn run_one_worker(
     let mut samples = Vec::with_capacity(iterations);
     for _ in 0..iterations {
         let t = Instant::now();
-        let _ = client
-            .simple_query("SELECT 1")
-            .await
-            .context("measured query")?;
+        run_round_trip(&client).await.context("measured query")?;
         samples.push(t.elapsed());
     }
 
     drop(client);
     let _ = conn_handle.await;
     Ok(samples)
+}
+
+async fn run_round_trip(client: &Client) -> Result<()> {
+    // Always use the extended-query path so execution backend mode
+    // (SPI vs direct) is actually exercised.
+    let _ = client.query_opt("SELECT 1", &[]).await?;
+    Ok(())
+}
+
+async fn set_execution_backend(client: &Client, mode: BackendMode) -> Result<()> {
+    let backend = match mode {
+        BackendMode::Spi => "spi",
+        BackendMode::Direct => "direct",
+    };
+    client
+        .batch_execute(&format!("SET pg_transport.execution_backend = '{backend}'"))
+        .await?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
