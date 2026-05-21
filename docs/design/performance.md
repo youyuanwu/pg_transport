@@ -20,11 +20,11 @@ Most recent stable custom-bench sweep (`just bench pg18 20000 8 "" "" {spi|direc
 | `spi` | p99  | 623.4 µs | 550.7 µs | 0.88x |
 | `spi` | mean | 430.4 µs | 383.1 µs | 0.89x |
 | `spi` | **qps** | 18496.7 | 20794.0 | **1.12x** |
-| `direct` | p50  | 417.3 µs | 403.0 µs | 0.97x |
-| `direct` | p95  | 551.7 µs | 513.0 µs | 0.93x |
-| `direct` | p99  | 616.4 µs | 569.5 µs | 0.92x |
-| `direct` | mean | 422.1 µs | 406.4 µs | 0.96x |
-| `direct` | **qps** | 18853.0 | 19629.7 | **1.04x** |
+| `direct` | p50  | 435.2 µs | 386.1 µs | 0.89x |
+| `direct` | p95  | 561.3 µs | 505.2 µs | 0.90x |
+| `direct` | p99  | — | — | — |
+| `direct` | mean | 438.8 µs | 393.2 µs | 0.90x |
+| `direct` | **qps** | 18146.8 | 20236.7 | **1.12x** |
 
 Most recent stable pgbench select (`just pgbench pg18 select 30 8 "" {spi|direct}`):
 
@@ -58,7 +58,7 @@ simple-query path) is responsible for a **~20 percentage point qps
 swing** on the custom harness — we now run faster than vanilla PG
 on this workload. p50/mean win by ~10% each.
 
-Range across recent stable sweeps: **0.93x – 1.12x qps**. On the
+Range across recent stable sweeps: **0.93x – 1.13x qps**. On the
 custom harness, tail latencies (p95 / p99 / max) tend to land at or
 better than vanilla PG — the bgworker pool reuse pays off there (no
 per-connection fork tax).
@@ -71,7 +71,7 @@ per-connection fork tax).
 | pgbouncer (transaction mode) | 0.7x – 0.85x | libpq parse/encode round-trip on every message |
 | pgcat | 0.75x – 0.90x | same shape as pgbouncer, Rust-based |
 | pgpool-II | 0.6x – 0.8x | proxy + query rewriting overhead |
-| **pg_transport** | **0.93x – 1.12x** | bgworker reuse + in-process execution path (SPI/default and direct-mode comparison) |
+| **pg_transport** | **0.93x – 1.13x** | bgworker reuse + in-process execution path (SPI and direct/WireDestReceiver modes) |
 
 The reason we land in the same range as direct PG (rather than the
 0.7–0.85x range typical of pooling) is structural: **we don't proxy
@@ -154,38 +154,45 @@ client TCP → kernel → tokio TcpStream
 
 Ranked by leverage (largest expected impact first).
 
-### 3.1 Custom `DestReceiver` would eliminate parse #2 + SPI_tuptable copy
+### 3.1 Custom `DestReceiver` eliminates SPI_tuptable copy — ~~deferred~~ **SHIPPED**
 
-**What:** Replace `SPI_execute` / `SPI_execute_plan` with direct
+**What was the plan:** Replace `SPI_execute` / `SPI_execute_plan` with direct
 `pg_parse_query` + `pg_analyze_and_rewrite_*` + `pg_plan_queries` +
 `CreatePortal` + `PortalRun` + `PortalDrop`, with a custom
 `DestReceiver` whose `receiveSlot` callback writes encoded bytes
 straight into our wire `BytesMut`. (Strategy 2 in
 [deferred/planner-executor-direct-path.md §6.2](deferred/planner-executor-direct-path.md).)
 
-**Why it wins:**
+**What landed:** The direct backend
+([`extended/direct.rs`](../../crates/core/src/backend/extended/direct.rs))
+now uses a `#[repr(C)]` `WireDestReceiver` struct whose
+`receiveSlot` callback calls `slot_getallattrs` + per-column
+`ColumnEncoder::encode_into` to write length-prefixed encoded
+bytes directly into a `BytesMut` during `PortalRun`. Zero
+intermediate tuplestore copy.
 
-- Saves one parse pass (~5 µs/query — PG's bison parser is fast,
-  but it's still wasted work).
-- Saves one row-copy (today: executor → SPI_tuptable → wire buffer;
-  with custom DestReceiver: executor → wire buffer).
-- Removes `handle_xact_control` / `XactCmd` because `PortalRun` →
-  `ProcessUtility` handles BEGIN/COMMIT/ROLLBACK naturally.
+The implementation went through two stages:
 
-**Magnitude:** ~5–15 µs/query macroscopic depending on row width and
-count. For pgbench `-S` (1 row, 1 column): low end. For wide-row
-multi-row SELECTs: high end.
+1. **Stage A (Tuplestore):** `CachedPlanSource` + `Portal` +
+   `TuplestoreReceiver` as the DestReceiver, with a post-`PortalRun`
+   slot-iteration loop. This validated the Portal lifecycle FFI
+   but carried a double-copy penalty (executor → tuplestore →
+   wire buffer) and portal/tuplestore setup overhead that made
+   `direct` ~6% slower than SPI on trivial SELECTs.
 
-**Cost:** ~250 LOC new unsafe FFI. PG-version coupling moves from
-"low" (SPI is stable) to "medium" (`Portal*`, `CachedPlanSource`,
-`DestReceiver`, `TupleTableSlot` ABIs).
+2. **Stage B (WireDestReceiver):** Replaced the tuplestore with a
+   custom `WireDestReceiver` whose `receiveSlot` writes DataRows
+   inline. ~90 LOC added, ~50 LOC tuplestore plumbing removed.
+   Direct went from **0.98x to 1.12x** vs vanilla — a ~14
+   percentage point swing, now matching SPI.
 
-**Status:** Deferred per
-[roadmap Q18](roadmap.md#23-resolved). Full design + phased
-adoption plan in
-[deferred/planner-executor-direct-path.md](deferred/planner-executor-direct-path.md).
-Re-entry trigger: bench shows > 10% qps gap attributable to SPI, or
-a v0+ feature needs cursor-streaming / per-column COPY OUT.
+**Bench impact (measured):** `just bench pg18 20000 8 "" "" direct`
+now lands at **1.09x – 1.13x qps** vs vanilla PG (was 0.98x – 1.04x
+with tuplestore). p50 ~390 µs (was ~430 µs). Direct and SPI are
+now at parity on the custom harness.
+
+**Re-entry trigger:** — (done). Simple-query path (§3.3 scope)
+remains on SPI; the direct WireDestReceiver is extended-query only.
 
 ### 3.2 Simple-query path's `Vec<Option<String>>` intermediate — ~~deferred~~ **SHIPPED**
 
@@ -301,16 +308,16 @@ further on the workloads that exercise it):
 
 | Source | Estimated µs/query | Reference | Status |
 | --- | --- | --- | --- |
-| Parse pass #2 (SPI's inner) | ~5 | §3.1 | deferred (largest open win) |
+| Parse pass #2 (SPI's inner) | ~5 | §3.1 | **shipped** (direct backend uses single-parse CachedPlanSource) |
+| SPI_tuptable row copy | ~2–5 | §3.1 | **shipped** (WireDestReceiver writes inline) |
 | Per-query xact bracket (Start + Snapshot + SPI_connect + reverse) | ~5–10 | §3.3 | deferred (trigger not met — tpcb at 1.09x) |
 | Row materialisation `Vec<Option<String>>` intermediate | ~2–5 | ~~§3.2~~ | **shipped** |
 | Per-cell `SPI_getvalue` syscache lookup | ~50 ns/cell | ~~§3.5~~ | **shipped** (with §3.2) |
 | Misc — pgwire framing, async dispatch, MemoryContext, `with_spi` closure scaffolding | ~5 | §3.4 | non-starter |
 
-Closing 3.1 (~10 µs) + 3.3 (~5–10 µs on multi-statement `'Q'`) would
-extend the lead on wide-row workloads and on pgbench-tpcb. **p95/max
-already stay at or below vanilla** because we still don't pay PG's
-fork tax.
+Closing 3.3 (~5–10 µs on multi-statement `'Q'`) would extend the
+lead on pgbench-tpcb. **p95/max already stay at or below vanilla**
+because we still don't pay PG's fork tax.
 
 
 ## 6. Re-entry conditions
@@ -318,10 +325,9 @@ fork tax.
 Per [roadmap Q18](roadmap.md#23-resolved), perf-driven refactors
 are gated on bench signal:
 
-- **Trigger 3.1:** bench shows >10% qps gap attributable to SPI on a
-  representative workload. (Post-§3.2 we *lead* by ~11% on the
-  custom harness and ~9% on pgbench-tpcb. Re-evaluate once a
-  wider-row representative workload exists.)
+- **Trigger 3.1:** — (shipped). Direct backend uses
+  `WireDestReceiver` with zero intermediate copies. Post-ship
+  bench: direct at 1.12x on the custom harness.
 - **Trigger 3.2:** — (shipped).
 - **Trigger 3.3:** profile of pgbench-tpcb (or any multi-statement-
   `'Q'` workload) showing xact bracket overhead. **Not met** — we

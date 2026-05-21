@@ -1,18 +1,18 @@
 //! Direct-path extended-query backend — `CreateCachedPlan` +
-//! `Portal*` + Tuplestore destination.
+//! `Portal*` + custom `DestReceiver` that encodes DataRows
+//! inline during `PortalRun`.
 //!
-//! Stage A of the §3.1 direct-path migration (see
+//! §3.1 direct-path migration (see
 //! [deferred/planner-executor-direct-path.md §7](../../../../../docs/design/deferred/planner-executor-direct-path.md)).
 //!
 //! ## Status
 //!
-//! **Stage A WIP — Parse + Describe land here; Execute is still
-//! stubbed (commit 5 wires Bind+Execute).** Selecting
-//! `pg_transport.execution_backend = 'direct'` lets clients
-//! Parse + Describe their queries through the planner directly,
-//! but any attempt to Execute the resulting portal returns
-//! SQLSTATE `0A000` (feature_not_supported). SPI (default) is
-//! unaffected.
+//! **Stage B — Parse, Describe, Bind, Execute all land here.**
+//! Selecting `pg_transport.execution_backend = 'direct'` routes
+//! extended-query traffic through `CachedPlanSource` + `Portal`
+//! with a [`WireDestReceiver`] whose `receiveSlot` callback
+//! encodes each row directly into a `BytesMut` — zero
+//! intermediate tuplestore copy.
 //!
 //! ## Parse pipeline
 //!
@@ -57,7 +57,6 @@ use pgwire::messages::data::DataRow;
 
 use super::super::executor::{CachedPlanSource, Portal, with_xact};
 use super::super::spi::{TypeInput, TypeOutput, TypeReceive, TypeSend, generic_error};
-use super::super::tuplestore::{Tuplestore, TuplestoreReceiver};
 use super::{PreparedPlan, PreparedStatement};
 
 // ---------------------------------------------------------------------------
@@ -94,7 +93,7 @@ pub(crate) struct DirectBackendPlan {
 
 impl PreparedPlan for DirectBackendPlan {
     /// Execute the direct-path prepared statement via
-    /// `GetCachedPlan` + `PortalRun(..., DestTuplestore, ...)`.
+    /// `GetCachedPlan` + `PortalRun(..., WireDestReceiver, ...)`.
     ///
     /// Parameter format is taken from the portal's
     /// `parameter_format`; per-parameter format can vary if the
@@ -177,19 +176,20 @@ fn execute_impl(
             portal.start(params, 0, pg_sys::GetActiveSnapshot());
         }
 
-        // Capture rows into a tuplestore so we can encode them
-        // after PortalRun returns. random_access=false — we only
-        // need a single forward pass.
-        let store = unsafe { Tuplestore::begin_heap(false, false, pg_sys::work_mem) };
-        let target_tupdesc = unsafe { (*backend.source.as_ptr()).resultDesc };
-        let receiver = unsafe {
-            TuplestoreReceiver::for_tuplestore(
-                &store,
-                pg_sys::CurrentMemoryContext,
-                false,
-                target_tupdesc,
-            )
+        let encoders: Vec<ColumnEncoder> = if ncols > 0 {
+            (0..ncols)
+                .map(|c| {
+                    ColumnEncoder::for_column(backend.column_oids[c], result_format_per_col[c])
+                })
+                .collect()
+        } else {
+            Vec::new()
         };
+
+        // WireDestReceiver encodes DataRows inline during
+        // PortalRun — no tuplestore intermediate.
+        let mut data_rows: Vec<DataRow> = Vec::new();
+        let mut wire_recv = WireDestReceiver::new(&encoders, &mut data_rows, ncols as i16);
 
         let mut qc: pg_sys::QueryCompletion = Default::default();
         unsafe {
@@ -200,8 +200,15 @@ fn execute_impl(
         } else {
             max_rows as i64
         };
-        let _done =
-            unsafe { portal.run(count, true, receiver.as_ptr(), receiver.as_ptr(), &mut qc) };
+        let _done = unsafe {
+            portal.run(
+                count,
+                true,
+                wire_recv.as_dest_receiver(),
+                wire_recv.as_dest_receiver(),
+                &mut qc,
+            )
+        };
 
         if ncols == 0 {
             let tag_name = command_tag_name(qc.commandTag);
@@ -210,33 +217,6 @@ fn execute_impl(
                 tag = tag.with_rows(qc.nprocessed as usize);
             }
             return Ok(Response::Execution(tag));
-        }
-
-        let encoders: Vec<ColumnEncoder> = (0..ncols)
-            .map(|c| ColumnEncoder::for_column(backend.column_oids[c], result_format_per_col[c]))
-            .collect();
-
-        let mut data_rows: Vec<DataRow> = Vec::new();
-        unsafe {
-            let tupdesc = (*backend.source.as_ptr()).resultDesc;
-            let slot = pg_sys::MakeSingleTupleTableSlot(tupdesc, &pg_sys::TTSOpsMinimalTuple);
-            let slot_guard = SlotGuard { raw: slot };
-            while pg_sys::tuplestore_gettupleslot(store.as_ptr(), true, true, slot_guard.raw) {
-                pg_sys::slot_getallattrs(slot_guard.raw);
-
-                let mut buf = BytesMut::with_capacity(64);
-                for (c, encoder) in encoders.iter().enumerate() {
-                    let is_null = *(*slot_guard.raw).tts_isnull.add(c);
-                    if is_null {
-                        buf.put_i32(-1);
-                    } else {
-                        let datum = *(*slot_guard.raw).tts_values.add(c);
-                        encoder.encode_into(datum, &mut buf);
-                    }
-                }
-                data_rows.push(DataRow::new(buf, ncols as i16));
-                pg_sys::ExecClearTuple(slot_guard.raw);
-            }
         }
 
         let tag_name = command_tag_name(qc.commandTag);
@@ -543,9 +523,109 @@ unsafe fn build_param_list(
     params
 }
 
+// ---------------------------------------------------------------------------
+// WireDestReceiver — custom DestReceiver that encodes DataRows
+// inline during PortalRun.
+// ---------------------------------------------------------------------------
+
+/// State passed through the `DestReceiver` vtable callbacks.
+///
+/// `#[repr(C)]` with `base` at offset 0 so the cast from
+/// `*mut DestReceiver` to `*mut WireDestReceiver` is sound —
+/// standard C "inheritance" pattern used by PG's own
+/// `DR_transientrel`, `DR_copy`, etc.
+#[repr(C)]
+struct WireDestReceiver {
+    /// Must be at offset 0. PG calls through this vtable.
+    base: pg_sys::DestReceiver,
+    /// Per-column encoders (borrowed from the caller's Vec).
+    encoders: *const ColumnEncoder,
+    /// Output rows pushed here by `receiveSlot`.
+    rows: *mut Vec<DataRow>,
+    /// Number of result columns.
+    ncols: i16,
+}
+
+impl WireDestReceiver {
+    /// Build a `WireDestReceiver` on the stack. The returned
+    /// struct borrows `encoders` and `rows` — caller must keep
+    /// both alive for the duration of `PortalRun`.
+    fn new(encoders: &[ColumnEncoder], rows: &mut Vec<DataRow>, ncols: i16) -> Self {
+        WireDestReceiver {
+            base: pg_sys::DestReceiver {
+                receiveSlot: Some(wire_receive_slot),
+                rStartup: Some(wire_startup),
+                rShutdown: Some(wire_shutdown),
+                rDestroy: Some(wire_destroy),
+                mydest: pg_sys::CommandDest::DestNone,
+            },
+            encoders: encoders.as_ptr(),
+            rows: rows as *mut _,
+            ncols,
+        }
+    }
+
+    /// Return a `*mut DestReceiver` suitable for `Portal::run`.
+    fn as_dest_receiver(&mut self) -> *mut pg_sys::DestReceiver {
+        &mut self.base as *mut pg_sys::DestReceiver
+    }
+}
+
+/// `receiveSlot` callback — encodes one row directly into a
+/// `DataRow` and pushes it onto the output Vec.
+///
+/// # Safety
+///
+/// Called by the executor inside `PortalRun`. `slot` is a valid
+/// `TupleTableSlot` owned by the executor. `self_` points to the
+/// `base` field of our `WireDestReceiver` (offset 0).
+unsafe extern "C-unwind" fn wire_receive_slot(
+    slot: *mut pg_sys::TupleTableSlot,
+    self_: *mut pg_sys::DestReceiver,
+) -> bool {
+    let recv = self_ as *mut WireDestReceiver;
+    let ncols = unsafe { (*recv).ncols } as usize;
+
+    // Deform all columns so tts_values / tts_isnull are populated.
+    unsafe { pg_sys::slot_getallattrs(slot) };
+
+    let mut buf = BytesMut::with_capacity(64);
+    for c in 0..ncols {
+        let is_null = unsafe { *(*slot).tts_isnull.add(c) };
+        if is_null {
+            buf.put_i32(-1);
+        } else {
+            let datum = unsafe { *(*slot).tts_values.add(c) };
+            let encoder = unsafe { &*(*recv).encoders.add(c) };
+            encoder.encode_into(datum, &mut buf);
+        }
+    }
+    unsafe { (*(*recv).rows).push(DataRow::new(buf, (*recv).ncols)) };
+    true
+}
+
+/// `rStartup` callback — no-op (encoders are pre-built at Bind time).
+unsafe extern "C-unwind" fn wire_startup(
+    _self: *mut pg_sys::DestReceiver,
+    _operation: std::ffi::c_int,
+    _typeinfo: pg_sys::TupleDesc,
+) {
+}
+
+/// `rShutdown` callback — no-op (BytesMut is Rust-owned).
+unsafe extern "C-unwind" fn wire_shutdown(_self: *mut pg_sys::DestReceiver) {}
+
+/// `rDestroy` callback — no-op (struct is stack-allocated in Rust,
+/// not palloc'd — Rust Drop handles cleanup).
+unsafe extern "C-unwind" fn wire_destroy(_self: *mut pg_sys::DestReceiver) {}
+
+// ---------------------------------------------------------------------------
+// ColumnEncoder — per-column type I/O cache
+// ---------------------------------------------------------------------------
+
 /// Per-column result encoder. Holds the cached
 /// (typoutput | typsend) lookup so the row loop just calls
-/// `encoder.encode(datum)` per cell.
+/// `encoder.encode_into(datum, buf)` per cell.
 enum ColumnEncoder {
     Text(TypeOutput),
     Binary(TypeSend),
@@ -585,21 +665,6 @@ impl ColumnEncoder {
                     pg_sys::pfree(ptr as *mut _);
                 }
             }
-        }
-    }
-}
-
-/// Small RAII guard for a single tuple table slot created by
-/// `MakeSingleTupleTableSlot`.
-struct SlotGuard {
-    raw: *mut pg_sys::TupleTableSlot,
-}
-
-impl Drop for SlotGuard {
-    fn drop(&mut self) {
-        if !self.raw.is_null() {
-            unsafe { pg_sys::ExecDropSingleTupleTableSlot(self.raw) };
-            self.raw = std::ptr::null_mut();
         }
     }
 }

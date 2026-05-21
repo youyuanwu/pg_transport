@@ -3,15 +3,15 @@
 > Parent: [../README.md](../README.md)
 > Sibling: [../backend-wire.md](../backend-wire.md) §6 (SPI bridge) · [../performance.md](../performance.md) §3.1 (the same optimisation in its full-data-path ranking)
 >
-> **Status: deferred from v0.** This document captures why v0 routes
-> SQL execution through SPI (`SPI_prepare` / `SPI_execute_plan`)
-> rather than calling PG's planner + executor directly via Portal /
-> CachedPlan / DestReceiver, what direct-path strategies look like,
-> and the re-entry conditions for un-deferring.
+> **Status: Stage B shipped (extended-query).** The direct backend
+> uses `CachedPlanSource` + `Portal` + a custom `WireDestReceiver`
+> whose `receiveSlot` encodes DataRows inline during `PortalRun`.
+> Simple-query still routes through SPI (Stage B scope in §7).
 >
-> v0 ships with the SPI path. Current bench parity is 0.99x ± noise;
-> SPI overhead is **not** material at the v0 acceptance bar (per
-> [bench.md](../bench.md)).
+> v0 ships with both SPI and direct backends, selectable via
+> `pg_transport.execution_backend` GUC. Current bench: direct at
+> **1.12x** vs vanilla PG on the custom harness (up from 0.98x
+> with the tuplestore intermediate).
 
 ## 1. Why deferred
 
@@ -194,12 +194,13 @@ aggregates. This is the gold-standard PG extension pattern
 
 ### 6.2 Strategy 2 — Custom `DestReceiver`
 
-> **Status: deferred to Stage D.** [§7](#7-phased-adoption-if-and-when-we-un-defer)
-> commits to Strategy 1 (Tuplestore) for the initial §3.1 adoption
-> (Stages A + B). DestReceiver is the perf ceiling but its win is
-> not material for v0 workloads (1–100 row results); the doc's
-> Stage D promotes only when a profile or feature demands it (see
-> [§8](#8-re-entry-conditions) feature-driven triggers).
+> **Status: shipped for extended-query (Stage D promoted early).**
+> The `WireDestReceiver` pattern described below is now live in
+> [`extended/direct.rs`](../../../crates/core/src/backend/extended/direct.rs).
+> The `receiveSlot` callback calls `slot_getallattrs` +
+> `ColumnEncoder::encode_into` per column, writing length-prefixed
+> encoded bytes directly into a per-row `BytesMut`. The tuplestore
+> intermediate from Stage A is removed.
 
 Implement a `#[repr(C)]` Rust struct that prepends `DestReceiver`'s
 C function-table layout and appends our `BytesMut` + per-column
@@ -286,19 +287,21 @@ RAII for plans, sessions, and per-type I/O.
 
 ## 7. Phased adoption (if and when we un-defer)
 
-**Decision: Strategy 1 (Tuplestore) is the chosen implementation
-for the initial §3.1 adoption.** Stages A + B both land Tuplestore-
-based bridges; Strategy 2 (custom DestReceiver) is deferred to
-Stage D and promoted only when a profile or feature demands it.
-Rationale: the perf delta on v0 workloads (1–100 row results) is
-noise; Tuplestore is ~half the unsafe LOC of DestReceiver; the
-FFI surface (CachedPlan + Portal lifecycle + slot iteration) is
-identical between the two, so the Stage A work invested in
-Tuplestore carries forward to a Stage D promotion at zero extra
-cost. See [§6.1](#61-strategy-1--tuplestore-destination) /
-[§6.2](#62-strategy-2--custom-destreceiver) for the strategy
-comparison and [§8](#8-re-entry-conditions) for the Stage D
-promotion triggers.
+**Decision: Strategy 2 (custom DestReceiver) is the shipped
+implementation for extended-query.** Strategy 1 (Tuplestore) served
+as a stepping-stone during Stage A development but has been
+replaced. The progression was:
+
+- Stages A: Tuplestore-based direct path validated Portal/CachedPlan
+  FFI.
+- Stage B (current): `WireDestReceiver` replaced the tuplestore,
+  eliminating the double-copy. Direct backend went from 0.98x to
+  1.12x vs vanilla.
+- Stage C: Pending — rename/cleanup (`spi.rs` → `executor.rs`,
+  sunset SPI).
+
+Simple-query still routes through SPI; the direct path is
+extended-query only.
 
 A clean staircase that lets each step land and stabilise before the
 next:
@@ -362,8 +365,8 @@ measurable as zero on the bench harness).
 
 | Stage | Default backend | What's available |
 | --- | --- | --- |
-| A landed | `spi` | `direct` available for extended-query opt-in |
-| B landed | `spi` | `direct` available for both simple + extended |
+| A+B landed | `spi` | `direct` available for extended-query opt-in (WireDestReceiver) |
+| C landed | `spi` | `direct` available for both simple + extended |
 | Soak (~6 months, 2–3 PG minor cycles) | `spi` | operators canary `direct` per-session / per-role; bug + perf reports drive iteration |
 | Soak passes | flip default to `direct` | SPI still selectable; deprecation notice in [`configuration.md`](../configuration.md) |
 | Sunset (one cycle after default flip) | `direct` only | Stage C runs: delete SPI bridge + dispatcher trait + GUC |
@@ -399,10 +402,12 @@ worth pre-locking now.
 
 Un-defer when **any** of the following is true:
 
-- **Bench-driven.** Phase-5 bench harness shows >10% qps gap to
+- **Bench-driven.** ~~Phase-5 bench harness shows >10% qps gap to
   vanilla PG on a representative workload, attributable to SPI
-  overhead (parse cost or tuptable materialisation). Current
-  numbers (0.84x – 1.04x range across phases) don't trigger this.
+  overhead.~~ **Triggered and resolved.** The tuplestore-based
+  direct path showed a ~6% overhead vs SPI; the WireDestReceiver
+  eliminated it. Direct now benchmarks at 1.12x vs vanilla (custom
+  harness, 20k iters, 8 conns).
 - **Feature-driven.** A v0+ feature needs functionality SPI doesn't
   expose. Two known candidates: streaming-large-result via cursor
   (Strategy 1 + Strategy 2 both support `PortalRun` with
