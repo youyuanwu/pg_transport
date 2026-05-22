@@ -71,10 +71,16 @@ async fn run_inner(
     // * `shutdown.cancelled()` — supervisor asked us to stop. Drop
     //   the listener, return cleanly.
     // * `listener.accept()` — got a client fd. Convert to OwnedFd
-    //   and hand off to the pool. If the pool's sendmsg fails
-    //   (e.g. all slots dead), log a WARNING and continue —
-    //   tearing down the listener on one bad client would be
-    //   wrong. (Q21 slot-death respawn lands in a later phase.)
+    //   and `spawn_local` a per-accept handoff task. Spawning
+    //   decouples accept throughput from handoff latency: under
+    //   bursts (esp. cold-grow ~30 ms) we keep draining the TCP
+    //   backlog while pool-side waiters race for ready slots.
+    //   `HandoffHandle` is `Clone` + `Rc`-backed precisely so we
+    //   can do this (api.md §2). The pool's `HANDOFF_WAIT` (5 s)
+    //   bounds each task's lifetime; downstream the pool caps
+    //   total slots at `max_backend_pool_size`. A future hardening
+    //   pass may add a per-listener `Semaphore` to bound in-flight
+    //   handoffs under SYN flood.
     //
     // Accept errors are split: `ConnectionAborted` / `Interrupted`
     // are transient and we just continue; anything else is logged
@@ -91,36 +97,40 @@ async fn run_inner(
             r = listener.accept() => {
                 match r {
                     Ok((stream, peer)) => {
-                        // Convert TcpStream into OwnedFd. into_std()
-                        // moves us out of tokio's reactor (which is
-                        // what we want — the slot will own this fd
-                        // from here). The std TcpStream's IntoRawFd
-                        // gives us the raw int; OwnedFd wraps it.
-                        let std_stream = match stream.into_std() {
-                            Ok(s) => s,
-                            Err(e) => {
+                        let handle = handle.clone();
+                        tokio::task::spawn_local(async move {
+                            // Convert TcpStream into OwnedFd.
+                            // into_std() moves us out of tokio's
+                            // reactor (which is what we want — the
+                            // slot will own this fd from here).
+                            let std_stream = match stream.into_std() {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    pgrx::warning!(
+                                        "pg_transport tcp_handoff: into_std failed for {peer}: {e}"
+                                    );
+                                    return;
+                                }
+                            };
+                            let fd: OwnedFd = std_stream.into();
+                            if let Err(e) = handle.handoff(fd, HandoffHints::no_tls()).await {
+                                // Saturation or send error. The
+                                // error string is the operator-visible
+                                // signal; we don't translate to
+                                // ErrorResponse here because the
+                                // client fd has already been dropped
+                                // (consumed by handoff()). A future
+                                // enhancement could split handoff()
+                                // into "reserve slot" + "send" so we
+                                // can write ErrorResponse on the
+                                // client fd before dropping it. For
+                                // now, saturated clients see a TCP
+                                // reset.
                                 pgrx::warning!(
-                                    "pg_transport tcp_handoff: into_std failed for {peer}: {e}"
+                                    "pg_transport tcp_handoff: handoff for {peer} failed: {e}"
                                 );
-                                continue;
                             }
-                        };
-                        let fd: OwnedFd = std_stream.into();
-                        if let Err(e) = handle.handoff(fd, HandoffHints::no_tls()).await {
-                            // Saturation or send error. The error
-                            // string is the operator-visible signal;
-                            // we don't translate to ErrorResponse
-                            // here because the client fd has already
-                            // been dropped (consumed by handoff()).
-                            // A future enhancement could split
-                            // handoff() into "reserve slot" + "send"
-                            // so we can write ErrorResponse on the
-                            // client fd before dropping it. For now,
-                            // saturated clients see a TCP reset.
-                            pgrx::warning!(
-                                "pg_transport tcp_handoff: handoff for {peer} failed: {e}"
-                            );
-                        }
+                        });
                     }
                     Err(e) if matches!(
                         e.kind(),
