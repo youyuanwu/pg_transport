@@ -42,18 +42,12 @@ tokio-util = { workspace = true }
 futures    = { workspace = true }
 anyhow     = { workspace = true }
 
-# Pool internals (see docs/design/deferred/slot-readiness.md):
+# Pool internals (see docs/design/pool.md):
 # indexmap   — FIFO `ready` container with O(1) pop-front.
-# scopeguard — RAII guard for the `growing` AtomicBool reset on
-#              unwind out of grow_one().
-# parking_lot — `Mutex<PoolState>` with a cheaper uncontended
-#              path than std::sync::Mutex. All access is from the
-#              single-threaded FE LocalSet, so contention is zero
-#              in practice; parking_lot's `.lock()` returns a
-#              guard directly (no `LockResult` boilerplate).
+# All other pool state is a plain `RefCell<PoolState>` — the FE
+# pool is held in `Rc<dyn HandoffSink>` on the single-threaded
+# LocalSet, so no cross-thread sync primitives are needed.
 indexmap    = { workspace = true }
-scopeguard  = { workspace = true }
-parking_lot = { workspace = true }
 
 # Phase 4: pgwire FE/BE v3 server. `server-api` feature only — TLS
 # (aws-lc-rs / ring) lands phase 8 via tokio-openssl.

@@ -537,7 +537,7 @@ concern.
 | File | Role |
 |------|------|
 | [crates/api/src/lib.rs](../../crates/api/src/lib.rs) | `HandoffSink::handoff` returns `HandoffFuture<'_>`; `HandoffHandle::handoff` is async — the dispatcher awaits a ready slot before `send_fd`. |
-| [crates/core/src/backend/pool.rs](../../crates/core/src/backend/pool.rs) | `Pool { state: parking_lot::Mutex<PoolState>, has_ready: Notify, growing: AtomicBool }` with three slot containers (§5.7); `bind_listener`, `accept_loop`, `slot_reader_wrapper`, `idle_reaper`, `grow_one`, `request_drain`, `sighup_reconcile`, `pre_warm`. |
+| [crates/core/src/backend/pool.rs](../../crates/core/src/backend/pool.rs) | `Pool { state: RefCell<PoolState>, has_ready: Notify }` where `PoolState` holds the three slot containers (§5.7) plus a `growing: bool` flag; `bind_listener`, `accept_loop`, `slot_reader_wrapper`, `idle_reaper`, `grow_one`, `request_drain`, `sighup_reconcile`, `pre_warm`. Single-threaded by construction (held in `Rc<dyn HandoffSink>` on the FE LocalSet), so no cross-thread sync primitives. |
 | [crates/core/src/backend/fd_pass.rs](../../crates/core/src/backend/fd_pass.rs) | 4 opcodes + `CtrlMsg` enum; non-blocking `*_nonblocking` libc helpers; `AsyncFd<UnixStream>` async wrappers; `wrap_for_async` setup. |
 | [crates/core/src/backend/slot.rs](../../crates/core/src/backend/slot.rs) | Slot bgworker entry. Connects to `paths::frontend_socket_path()`; outer sync loop with short `rt.block_on` windows for UDS I/O (the wire's internal `block_on` cannot nest, see §1.5); `DrainRequest` → `cleanup_per_slot_state` + `b'A'` ack. |
 | [crates/core/src/backend/paths.rs](../../crates/core/src/backend/paths.rs) | One well-known path: `frontend_socket_path()` returns `slot_dir().join("frontend.sock")`. |
@@ -1045,6 +1045,7 @@ struct PoolState {
     in_flight:       HashMap<u64, SlotPeer>,
     draining:        HashMap<u64, SlotPeer>,
     slot_id_counter: u64,                        // u64 so wraparound is practically impossible
+    growing:         bool,                       // "a grow_one is in flight"; cleared by GrowGuard
 }
 
 struct SlotPeer {
@@ -1055,13 +1056,18 @@ struct SlotPeer {
 }
 
 struct Pool {
-    state:     Mutex<PoolState>,
+    state:     RefCell<PoolState>,               // single-threaded; held in Rc<dyn HandoffSink>
     has_ready: Notify,                           // edge-triggered: fires when something enters `ready`
-    growing:   AtomicBool,                       // "a grow_one is in flight"; outside the Mutex
-                                                 //   so the §5.2 CAS path can check it without
-                                                 //   acquiring the pool lock
 }
 ```
+
+> The implementation lives entirely on the FE's current-thread
+> tokio runtime (`LocalSet`), so a `RefCell` plus a plain `bool`
+> are sufficient — no `Mutex`, no `AtomicBool`. Earlier revisions
+> of this doc described the same structure using `Mutex<PoolState>`
+> + `AtomicBool growing`; the two are interchangeable for the
+> single-thread case and the prose below uses `lock()` loosely to
+> mean "take the borrow".
 
 **`in_flight` semantics.** The name is slightly overloaded: it
 covers both "actively serving a session" *and* "freshly accepted,
@@ -1098,15 +1104,18 @@ secondary `!draining` check. For a research framework where
 clarity matters more than per-dispatch microseconds, the three
 containers win.
 
-#### Lock discipline
+#### Borrow discipline
 
-A single `Mutex<PoolState>` (or `parking_lot::Mutex` for a cheaper
-uncontended path) protects all container mutations. Critical
-sections are tiny (IndexMap/HashMap operations); syscalls held
-under the lock are `send_drain_request` in `request_drain` and the
-fallback `shutdown(SHUT_WR)` in the ack-timeout watchdog, both
-non-blocking and microseconds. `send_fd` is released **outside** the
-lock to keep dispatch concurrent.
+A single `RefCell<PoolState>` protects all container mutations.
+The FE pool lives in `Rc<dyn HandoffSink>` on the single-threaded
+LocalSet, so no `Mutex` is needed — runtime borrow-checking is the
+only safeguard against accidental re-entrant access (and would
+panic loudly if violated, which is preferable to silently
+deadlocking). Critical sections are tiny (IndexMap/HashMap
+operations); syscalls held under the borrow are `send_drain_request`
+in `request_drain` and the fallback `shutdown(SHUT_WR)` in the
+ack-timeout watchdog, both non-blocking and microseconds. `send_fd`
+is released **outside** the borrow to keep dispatch concurrent.
 
 #### Walkthrough: the interesting interleavings
 

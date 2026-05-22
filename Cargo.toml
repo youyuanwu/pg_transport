@@ -56,7 +56,6 @@ rustls-pki-types = "1"
 
 # Misc.
 thiserror   = "2"
-parking_lot = "0.12"
 anyhow      = "1"
 async-trait = "0.1"
 bytes       = "1"
@@ -64,9 +63,6 @@ bytes       = "1"
 # fairness with O(1) pop-front). See
 # docs/design/deferred/slot-readiness.md §5.7.
 indexmap    = "2"
-# RAII guard for resetting the pool's `growing` AtomicBool on the
-# panic-unwind path through grow_one(). 5 KB crate, no deps.
-scopeguard  = "1"
 # CancellationToken for the ShutdownToken plumbing in api/. Tokio
 # core has watch / Notify but neither is quite the right shape;
 # tokio-util's CancellationToken is the idiomatic choice and a

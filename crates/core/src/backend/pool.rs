@@ -19,6 +19,7 @@
 //!   `b'A'`; an ack-timeout watchdog falls back to `SHUT_WR` if the
 //!   slot is stuck mid-session (§5.3).
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -27,14 +28,11 @@ use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use api::{HandoffFuture, HandoffHints, HandoffSink};
 use futures::FutureExt;
 use indexmap::IndexMap;
-use parking_lot::Mutex;
 use pgrx::bgworkers::{BackgroundWorkerBuilder, BgWorkerStartTime};
 use tokio::io::unix::AsyncFd;
 use tokio::net::UnixListener;
@@ -80,15 +78,18 @@ const DRAIN_ACK_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// One connected slot bgworker — its FE-internal id and the
 /// `AsyncFd` we use for both `sendmsg(SCM_RIGHTS)` and EPIPE
-/// detection. The stream is `Arc`-shared with the per-slot reader
+/// detection. The stream is `Rc`-shared with the per-slot reader
 /// task; whichever owner drops last closes our end of the UDS.
+/// `Rc` (not `Arc`) is sufficient because the entire pool lives
+/// on the FE's single-threaded `LocalSet` and every consumer
+/// (reader, watchdog, dispatcher) is spawned via `spawn_local`.
 struct SlotPeer {
     /// Redundant with the container key, but kept on the struct
     /// for forward-compat (panic-handling code paths, future
     /// per-slot metrics, etc.).
     #[allow(dead_code)]
     slot_id: u64,
-    stream: Arc<AsyncFd<StdUnixStream>>,
+    stream: Rc<AsyncFd<StdUnixStream>>,
     last_ready_at: Instant,
 }
 
@@ -102,6 +103,10 @@ struct PoolState {
     in_flight: HashMap<u64, SlotPeer>,
     draining: HashMap<u64, SlotPeer>,
     slot_id_counter: u64,
+    /// At-most-one-concurrent-grow gate. The dispatcher sets this
+    /// before issuing `grow_one()` and resets it via `GrowGuard`
+    /// on every exit path (including panic). See pool.md §5.2.
+    growing: bool,
 }
 
 impl PoolState {
@@ -111,6 +116,7 @@ impl PoolState {
             in_flight: HashMap::new(),
             draining: HashMap::new(),
             slot_id_counter: 0,
+            growing: false,
         }
     }
 
@@ -129,27 +135,34 @@ impl PoolState {
 
 /// The pool.
 ///
-/// `!Send`: held inside `Rc<dyn HandoffSink>` on the FE LocalSet.
-/// `Notify` is `Send + Sync`, `parking_lot::Mutex<PoolState>` is
-/// `Send + Sync`, but the `Arc<AsyncFd<UnixStream>>`s registered
-/// with the current-thread reactor make the whole graph `!Send`
-/// in practice (and our usage assumes it).
+/// `!Send` / `!Sync`: held inside `Rc<dyn HandoffSink>` on the FE
+/// LocalSet and accessed only from that single OS thread. The
+/// inner `RefCell<PoolState>` enforces the single-thread invariant
+/// at the type level (and runtime-borrow-checks against accidental
+/// re-entrant access); `Notify` is the cross-task signalling
+/// primitive only, not cross-thread.
 pub struct Pool {
-    state: Mutex<PoolState>,
+    state: RefCell<PoolState>,
     has_ready: Notify,
-    /// At-most-one-concurrent-grow gate. Outside `PoolState` so the
-    /// dispatcher can CAS without acquiring the pool lock. See
-    /// slot-readiness.md §5.2.
-    growing: AtomicBool,
 }
 
 impl Pool {
     pub fn new() -> Self {
         Self {
-            state: Mutex::new(PoolState::new()),
+            state: RefCell::new(PoolState::new()),
             has_ready: Notify::new(),
-            growing: AtomicBool::new(false),
         }
+    }
+}
+
+/// RAII guard that clears `PoolState::growing` on drop, including
+/// on panic out of `grow_one()`. The dispatcher constructs one of
+/// these after CAS-ing `growing` from false→true.
+struct GrowGuard<'a>(&'a RefCell<PoolState>);
+
+impl Drop for GrowGuard<'_> {
+    fn drop(&mut self) {
+        self.0.borrow_mut().growing = false;
     }
 }
 
@@ -276,7 +289,7 @@ pub async fn accept_loop(
                     }
                 };
                 let async_stream = match fd_pass::wrap_for_async(std_stream) {
-                    Ok(a) => Arc::new(a),
+                    Ok(a) => Rc::new(a),
                     Err(e) => {
                         pgrx::warning!("pg_transport pool: wrap_for_async failed: {e}");
                         continue;
@@ -287,11 +300,11 @@ pub async fn accept_loop(
                 // `b'R'` from this BE will move it to `ready`; same
                 // code path as a post-session `b'R'`.
                 let slot_id = {
-                    let mut st = pool.state.lock();
+                    let mut st = pool.state.borrow_mut();
                     let id = st.next_slot_id();
                     st.in_flight.insert(id, SlotPeer {
                         slot_id: id,
-                        stream: Arc::clone(&async_stream),
+                        stream: Rc::clone(&async_stream),
                         last_ready_at: Instant::now(),
                     });
                     id
@@ -321,8 +334,8 @@ pub async fn accept_loop(
 /// JoinSet-supervisor pattern with per-task panic-handling — same
 /// invariant: a dead reader never leaves a slot stuck in
 /// `in_flight` or `ready` (slot-readiness.md §1.2 "Reader lifecycle").
-async fn slot_reader_wrapper(slot_id: u64, stream: Arc<AsyncFd<StdUnixStream>>, pool: Rc<Pool>) {
-    let body = slot_reader(slot_id, Arc::clone(&stream), pool.clone());
+async fn slot_reader_wrapper(slot_id: u64, stream: Rc<AsyncFd<StdUnixStream>>, pool: Rc<Pool>) {
+    let body = slot_reader(slot_id, Rc::clone(&stream), pool.clone());
     if let Err(panic) = AssertUnwindSafe(body).catch_unwind().await {
         pgrx::warning!("pg_transport pool: slot {slot_id} reader panicked: {panic:?}");
     }
@@ -336,7 +349,7 @@ async fn slot_reader_wrapper(slot_id: u64, stream: Arc<AsyncFd<StdUnixStream>>, 
 /// (`b'R'` / `b'A'` vs `b'\0'` / `b'X'`), and the FE never receives
 /// SCM_RIGHTS from a slot, so this is a thin direct `recv(MSG_DONTWAIT)`
 /// rather than going through `fd_pass::recv_ctrl_async`.
-async fn slot_reader(slot_id: u64, stream: Arc<AsyncFd<StdUnixStream>>, pool: Rc<Pool>) {
+async fn slot_reader(slot_id: u64, stream: Rc<AsyncFd<StdUnixStream>>, pool: Rc<Pool>) {
     loop {
         match read_one_be_opcode(&stream).await {
             Ok(fd_pass::OP_READY) => {
@@ -401,7 +414,7 @@ impl Pool {
     /// `b'R'` from a BE: in_flight → ready, stamp `last_ready_at`,
     /// wake one pending dispatcher.
     fn on_ready(self: &Rc<Self>, slot_id: u64) {
-        let mut st = self.state.lock();
+        let mut st = self.state.borrow_mut();
         let Some(mut peer) = st.in_flight.remove(&slot_id) else {
             // Either the slot was concurrently moved to `draining`
             // (b'X' beat the b'R' to the lock) or the slot is
@@ -417,7 +430,7 @@ impl Pool {
 
     /// `b'A'` from a BE: draining → gone.
     fn on_drain_ack(&self, slot_id: u64) {
-        let mut st = self.state.lock();
+        let mut st = self.state.borrow_mut();
         if let Some(peer) = st.draining.remove(&slot_id) {
             let elapsed = peer.last_ready_at.elapsed();
             pgrx::log!(
@@ -433,8 +446,8 @@ impl Pool {
     /// the recovery path for a crashed BE; the dispatcher's next
     /// `send_fd_async` on this stream would fail with EPIPE
     /// anyway.
-    fn cleanup_orphaned(&self, slot_id: u64, stream: &Arc<AsyncFd<StdUnixStream>>) {
-        let mut st = self.state.lock();
+    fn cleanup_orphaned(&self, slot_id: u64, stream: &Rc<AsyncFd<StdUnixStream>>) {
+        let mut st = self.state.borrow_mut();
         let was = if st.ready.shift_remove(&slot_id).is_some() {
             Some("ready")
         } else if st.in_flight.remove(&slot_id).is_some() {
@@ -449,9 +462,9 @@ impl Pool {
             pgrx::log!("pg_transport pool: slot {slot_id} reader exit (was {c}); cleaned up");
         }
         // Force-close our end so any pending send_fd_async on a
-        // peer Arc gets EPIPE rather than hanging. SHUT_WR on the
+        // peer Rc gets EPIPE rather than hanging. SHUT_WR on the
         // FE side; the kernel's other side teardown is automatic
-        // once both Arc refs drop.
+        // once both Rc refs drop.
         let fd = stream.get_ref().as_raw_fd();
         // SAFETY: shutdown() on a valid socket fd is well-defined.
         unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
@@ -471,32 +484,30 @@ impl HandoffSink for Pool {
             }
 
             // No slot ready. Kick off a grow if we're under the
-            // ceiling and not already growing. AtomicBool gate;
-            // RAII guard resets it on every exit path of the spawn.
+            // ceiling and not already growing. Single-threaded, so
+            // a `RefCell` borrow is enough — no atomics needed.
             // The grow itself is fire-and-forget — the new slot's
             // first `b'R'` lands in `ready` and fires
             // `has_ready.notify_one()` just like any other slot.
             let max = guc::max_backend_pool_size();
-            let under_ceiling = self.state.lock().total() < max as usize;
-            if under_ceiling
-                && self
-                    .growing
-                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                    .is_ok()
-            {
-                // load_dynamic is a microsecond syscall; doing it
-                // inline (no spawn) keeps the AtomicBool window
-                // tight and avoids spawning a task purely to do one
-                // syscall. RAII guard so a panic still resets the
-                // flag.
-                let _guard = scopeguard::guard((), |_| {
-                    self.growing.store(false, Ordering::Release);
-                });
+            let should_grow = {
+                let mut st = self.state.borrow_mut();
+                if st.total() < max as usize && !st.growing {
+                    st.growing = true;
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_grow {
+                // GrowGuard resets `growing` on every exit path of
+                // this block (including a panic out of grow_one).
+                let _guard = GrowGuard(&self.state);
                 match grow_one() {
                     Ok(()) => pgrx::log!("pg_transport pool: grow_one issued"),
                     Err(e) => pgrx::warning!("pg_transport pool: grow_one failed: {e}"),
                 }
-                // _guard drops here, resets `growing`.
+                // _guard drops here, clears `growing`.
             }
 
             // Wait for any slot to enter `ready` — could be a busy
@@ -528,18 +539,18 @@ impl HandoffSink for Pool {
 
 impl Pool {
     /// Atomic ready→in_flight move under the lock; returns the
-    /// stream `Arc` for the dispatcher to `send_fd_async` to.
-    fn try_pop_ready(&self) -> Option<Arc<AsyncFd<StdUnixStream>>> {
-        let mut st = self.state.lock();
+    /// stream `Rc` for the dispatcher to `send_fd_async` to.
+    fn try_pop_ready(&self) -> Option<Rc<AsyncFd<StdUnixStream>>> {
+        let mut st = self.state.borrow_mut();
         let (slot_id, peer) = st.ready.shift_remove_index(0)?;
-        let stream = Arc::clone(&peer.stream);
+        let stream = Rc::clone(&peer.stream);
         st.in_flight.insert(slot_id, peer);
         Some(stream)
     }
 }
 
 async fn send_fd_to(
-    stream: Arc<AsyncFd<StdUnixStream>>,
+    stream: Rc<AsyncFd<StdUnixStream>>,
     fd: OwnedFd,
     path_label: &'static str,
 ) -> anyhow::Result<()> {
@@ -609,7 +620,7 @@ pub async fn idle_reaper(pool: Rc<Pool>, shutdown: CancellationToken) {
 fn reap_once(pool: &Rc<Pool>) {
     let mut to_drain: Vec<u64> = Vec::new();
     {
-        let st = pool.state.lock();
+        let st = pool.state.borrow();
         // Snapshot `now` after acquiring the lock so that any
         // starvation on lock acquisition doesn't yield a stale
         // timestamp that would reap recently-active slots.
@@ -652,11 +663,11 @@ fn reap_once(pool: &Rc<Pool>) {
 /// `on_drain_ack`. See slot-readiness.md §5.3.
 fn request_drain(pool: &Rc<Pool>, slot_id: u64) {
     let stream = {
-        let mut st = pool.state.lock();
+        let mut st = pool.state.borrow_mut();
         let Some(peer) = st.ready.shift_remove(&slot_id) else {
             return; // raced with another path
         };
-        let stream = Arc::clone(&peer.stream);
+        let stream = Rc::clone(&peer.stream);
         st.draining.insert(slot_id, peer);
         stream
     };
@@ -677,10 +688,10 @@ fn request_drain(pool: &Rc<Pool>, slot_id: u64) {
     // DRAIN_ACK_TIMEOUT, on_drain_ack already removed the slot;
     // the watchdog sees `draining.remove() == None` and no-ops.
     let pool_clone = pool.clone();
-    let stream_clone = Arc::clone(&stream);
+    let stream_clone = Rc::clone(&stream);
     tokio::task::spawn_local(async move {
         sleep(DRAIN_ACK_TIMEOUT).await;
-        let mut st = pool_clone.state.lock();
+        let mut st = pool_clone.state.borrow_mut();
         if st.draining.remove(&slot_id).is_some() {
             // Ack never arrived. Force-close so the BE's next
             // `recv_ctrl_async` sees EOF and exits via the Eof
@@ -710,7 +721,7 @@ fn request_drain(pool: &Rc<Pool>, slot_id: u64) {
 pub fn sighup_reconcile(pool: &Rc<Pool>) {
     let max = guc::max_backend_pool_size() as usize;
     let to_drain: Vec<u64> = {
-        let st = pool.state.lock();
+        let st = pool.state.borrow();
         let total = st.total();
         if total <= max {
             return;
