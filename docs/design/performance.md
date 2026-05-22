@@ -1,7 +1,7 @@
 # Performance — measured numbers and data-path trace
 
 > Parent: [README.md](README.md)
-> Siblings: [bench.md](bench.md) (harness mechanics) · [pool.md](pool.md) (the pool whose `MIN_WARM_SLOTS = 0` default explains the only `pgbench` regression below)
+> Siblings: [bench.md](bench.md) (harness mechanics) · [pool.md](pool.md) (the autoscaling pool referenced in §2's cold-grow analysis)
 
 This document records the most recent benchmark numbers and the
 per-query data path they measure. It is **descriptive**, not an
@@ -78,60 +78,56 @@ sit inside this host's run-to-run variance band (±3–5 pp on a
 
 ### pgbench, 15 s, 8 clients
 
-`dev` (autoscaling):
+`dev` (autoscaling, post-spawn handoff):
 
-| Mode | Backend | Vanilla tps | pg_transport tps | tps ratio | Vanilla initial-conn | pg_transport initial-conn |
-|---|---|---|---|---|---|---|
-| `select` | `spi` | 25 510 | 24 875 | **0.975x** | 7.9 ms | 30.3 ms |
-| `select` | `direct` | 26 161† | 25 105† | **0.96x** | 7.8 ms | 31.8 ms |
-| `nupdate` | `spi` | 6 226‡ | 6 261 | **1.006x** | 8.5 ms | 31.0 ms |
-| `nupdate` | `direct` | 6 281 | 6 250 | **0.995x** | 7.9 ms | 29.8 ms |
-| `tpcb` | `spi` | 1 921 | 2 066 | **1.076x** | 7.1 ms | 30.4 ms |
-| `tpcb` | `direct` | 1 933 | 2 094 | **1.083x** | 7.7 ms | 30.8 ms |
+| Mode | Backend | Vanilla tps | pg_transport tps | tps ratio | Vanilla initial-conn | pg_transport initial-conn | init-conn ratio |
+|---|---|---|---|---|---|---|---|
+| `select` | `spi` | 27 189 | 25 440 | **0.94x** | 7.8 ms | 9.2 ms | **1.18x** |
+| `select` | `direct` | 26 244 | 25 270 | **0.96x** | 8.2 ms | 9.6 ms | **1.17x** |
+| `nupdate` | `spi` | 6 366 | 6 309 | **0.99x** | 7.3 ms | 8.3 ms | **1.15x** |
+| `nupdate` | `direct` | 6 343 | 6 331 | **1.00x** | 7.6 ms | 8.8 ms | **1.16x** |
+| `tpcb` | `spi` | 1 986 | 2 115 | **1.07x** | 7.7 ms | 8.7 ms | **1.12x** |
+| `tpcb` | `direct` | 1 983 | 2 124 | **1.07x** | 8.5 ms | 9.4 ms | **1.11x** |
 
-† `select direct` run 3 saw a host-side stall on *both* vanilla
-(19 439 tps) and pg_transport (21 497 tps); ratio is unaffected
-because the comparison takes the same hit on both halves. The
-numbers above exclude that run; the all-3-runs raw ratio is
-**1.00x**.
+Steady-state `tps` lands at 0.94–1.07× vanilla, inside this host's
+run-to-run variance band (±3–5 pp on a 15 s pgbench sample). The
+write-heavy `tpcb` rows land slightly above vanilla because the
+direct/SPI execution paths skip a libpq-side round-trip per inner
+statement (3 UPDATEs + SELECT + INSERT per transaction).
 
-‡ `nupdate spi` vanilla run 1 stalled at 5 457 tps vs ~6 226 in
-runs 2–3; excluded above. Raw-all-3 ratio with the stall is
-**1.05x**.
+### Initial connection time
 
-`main` (static pre-warmed) measured tps ratios in the same range
-on the same host (0.976x / 0.984x / 1.00x / 1.009x / 1.10x /
-1.083x across the six rows). The autoscaling refactor preserved
-steady-state throughput within ±3 pp of `main` on every workload.
+`pgbench`'s `initial connection time` metric covers TCP connect →
+auth → first ready-for-query for all clients. On `dev` with
+`MIN_WARM_SLOTS = 0` the pool starts empty, so the first handoff
+triggers a cold-grow (postmaster fork + slot tokio runtime build +
+TLS acceptor + first `b'R'`, ~25–30 ms wall-clock). The
+remaining clients wait for that one warmed slot to turn over and
+serve them in microseconds each.
 
-### Known regression: `pgbench` initial connection time
+The TCP accept loop in
+[`tcp.rs`](../../crates/core/src/handoff/tcp.rs)
+runs each accept's handoff in a per-accept `spawn_local` task, so
+the accept rate is decoupled from handoff latency — the 8 clients'
+TCP backlog drains at accept speed while the pool grows once and
+recycles. The measured 1.1–1.2× gap above is the single cold-grow
+amortized across 8 clients, not 8× cold-grow.
 
-On `dev`, pgbench's `initial connection time` metric jumped 7–9×
-because the autoscaling pool starts at zero slots and the 8
-pgbench clients race into an empty pool; each pays the cold-grow
-cost (postmaster fork + slot tokio runtime build + TLS acceptor
-+ first `b'R'`) once.
+If first-connection latency matters operationally, the documented
+lever is `MIN_WARM_SLOTS` (currently a compile-time constant in
+[pool.md §5.1](pool.md#51-the-single-knob)). Setting it ≥ peak
+expected `clients` keeps that many bgworkers resident on idle
+clusters and collapses `initial connection time` to vanilla-PG
+levels.
 
-| Workload / Backend | main (pre-warmed) | dev (cold-grow) | Δ |
-|---|---|---|---|
-| `select` `spi` | 4.4 ms | 30.3 ms | +26 ms (6.9x) |
-| `select` `direct` | 3.7 ms | 31.8 ms | +28 ms (8.6x) |
-| `nupdate` `spi` | 3.4 ms | 31.0 ms | +28 ms (9.1x) |
-| `nupdate` `direct` | 3.9 ms | 29.8 ms | +26 ms (7.6x) |
-| `tpcb` `spi` | 3.6 ms | 30.4 ms | +27 ms (8.4x) |
-| `tpcb` `direct` | 3.5 ms | 30.8 ms | +27 ms (8.8x) |
-
-This is a one-shot startup cost paid once per pgbench run, not a
-per-query cost, so it doesn't show up in the `tps` numbers (which
-are post-connection). It also doesn't show up in the custom bench
-because the bench's warmup phase covers cold-grow before the
-measurement window opens.
-
-The documented lever is `MIN_WARM_SLOTS` (currently a compile-time
-constant defaulting to 0 in [pool.md §5.1](pool.md#51-the-single-knob)).
-Promoting it to a GUC and setting it ≥ `clients` recovers the
-`main` numbers, at the cost of holding that many bgworkers
-resident even on an idle cluster.
+A second lever, not yet implemented: relax the pool's
+single-in-flight grow gate to allow `min(pending_waiters,
+ceiling - total)` concurrent grows. `load_dynamic` is a ~10 µs
+syscall on the FE main thread; firing N of them in serial lets N
+new BEs cold-boot in parallel in postmaster-managed processes,
+collapsing the burst case from "one cold-boot + N×turnover" to
+"one cold-boot, all served in parallel". See
+[pool.md §5.2](pool.md#52-grow-on-demand).
 
 ## 3. Where we sit vs. other pooling solutions
 
@@ -235,7 +231,7 @@ fall out of the dispatch model.
 | Component | Why it's fast |
 |---|---|
 | **Connection acquisition (warm)** | SCM_RIGHTS handoff is ~10 µs vs. PG's `fork()` at ~1 ms+. ~100× faster on warm-pool connection establishment than vanilla PG. |
-| **Connection acquisition (cold)** | The autoscaling pool's first connection per slot pays ~25–30 ms cold-grow (postmaster fork + tokio runtime + TLS acceptor + first `b'R'`); see [pool.md §5.2](pool.md#52-grow-on-demand) and §2's `initial connection time` regression. Subsequent connections are warm-path. |
+| **Connection acquisition (cold)** | First connection per pool pays one cold-grow (~25–30 ms: postmaster fork + tokio runtime + TLS acceptor + first `b'R'`). The per-accept `spawn_local` in [tcp.rs](../../crates/core/src/handoff/tcp.rs) decouples accept rate from handoff latency, so a burst of N TCP clients pays *one* cold-grow plus N microsecond-scale slot turnovers, not N × cold-grow. See [pool.md §5.2](pool.md#52-grow-on-demand) and §2's initial-connection-time analysis. |
 | **Backend reuse** | One bgworker serves N sequential connections without process teardown. Saves PG's per-connection cleanup tax entirely. |
 | **Per-handoff state isolation** | `ResetAllOptions()` between handoffs scrubs USERSET/SUSET GUCs (since vanilla PG would have `proc_exit`'d). Cost: walks the GUC array; not on the per-query hot path. |
 | **Tokio runtime** | Built once per slot (`Rc<Runtime>`), reused across handoffs. Not rebuilt per query. |
@@ -250,8 +246,7 @@ fall out of the dispatch model.
 
 - [bench.md](bench.md) — how to run the benchmarks.
 - [pool.md](pool.md) — the autoscaling pool whose `MIN_WARM_SLOTS = 0`
-  default explains the `pgbench` initial-connection regression
-  in §2.
+  default sets the cold-grow baseline analyzed in §2.
 - [architecture.md §2](architecture.md#2-why-pg_transport-owns-the-wire-layer)
   — why the data path looks the way it does (delegate-vs-build
   table).
