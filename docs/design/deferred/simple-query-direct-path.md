@@ -1,755 +1,282 @@
-# Simple-query direct path — deferred design
+# Simple-query direct path
 
-> Parent: [../README.md](../README.md) · Strategic parent: [planner-executor-direct-path.md](planner-executor-direct-path.md)
+> Parent: [../README.md](../README.md) · Strategic context: [planner-executor-direct-path.md](planner-executor-direct-path.md)
 > Siblings: [../backend-wire.md](../backend-wire.md) §6 (SPI bridge) · [../performance.md](../performance.md) §2
 >
-> **Status: not yet implemented; most building blocks already in
-> tree.** Today every `'Q'` message routes through
-> [`spi_bridge.rs`](../../../crates/core/src/backend/spi_bridge.rs)
-> → `with_spi` → `SPI_execute` → `SPI_tuptable` materialisation →
-> `Vec<DataRow>` copy. This document scopes the work to bring the
-> same `Portal*` + `WireDestReceiver` pattern that
-> [`extended/direct.rs`](../../../crates/core/src/backend/extended/direct.rs)
-> uses for `'P'`/`'B'`/`'E'` to the simple-query side.
+> **Status: shipped.** Selecting
+> `pg_transport.execution_backend = 'direct'` routes simple-query
+> `'Q'` messages through `pg_analyze_and_rewrite_fixedparams` +
+> `pg_plan_queries` + `PortalRun` with a custom `DestReceiver`
+> that encodes wire `DataRow` frames inline. Default backend
+> remains `spi`; both ship side-by-side indefinitely.
 >
-> Most of the executor-side plumbing the parent doc described as
-> "Stage C work" (rename `spi.rs` → `executor.rs`, `with_spi` →
-> `with_xact`, `SpiPlan` → `CachedPlan`) already shipped: see
+> Code: [`crates/core/src/backend/simple_direct.rs`](../../../crates/core/src/backend/simple_direct.rs)
+> (top-level entry + per-statement worker),
+> [`crates/core/src/backend/dest_receiver.rs`](../../../crates/core/src/backend/dest_receiver.rs)
+> (the `WireDestReceiver`, shared with the extended-query direct
+> backend),
 > [`crates/core/src/backend/executor.rs`](../../../crates/core/src/backend/executor.rs)
-> for the live `with_xact`, `XactCtx`, `Portal` (`create_anonymous`
-> /`define`/`start`/`run`/Drop), `CachedPlanSource`, `CachedPlan`,
-> `ParamList`, `TupleDescRef`. The remaining work is a small new
-> module plus three private items lifted from `extended/direct.rs`
-> to a shared location (see §7).
->
-> This is the concrete Stage-B work from
-> [planner-executor-direct-path.md §7](planner-executor-direct-path.md#7-phased-adoption-if-and-when-we-un-defer);
-> the parent doc's Stage B sketch was written before
-> `WireDestReceiver` landed for extended-query and before
-> `executor.rs` factored out the xact/portal wrappers. The shipped
-> design will use the custom `DestReceiver` from day one and
-> reuse `executor.rs` end-to-end.
+> (`with_xact`, `Portal`, `ScopedMemoryContext`).
 
-## 1. Why now / why not
+## 1. Summary
 
-**Why now.** Latest pgbench numbers
-([performance.md §2](../performance.md#2-latest-stable-numbers-2026-05-21))
-show pg_transport at **0.94×–0.96×** of vanilla PG on `pgbench
-select` and `pgbench nupdate`. The custom extended-query bench
-shows **1.11×–1.14×**. The gap is entirely the simple-query
-path's extra cost over PG's `exec_simple_query`:
+`execute_simple_query_direct(query)` is the entry point invoked
+by [`SimpleQueryHandler::do_query`](../../../crates/core/src/wire/pgwire_v3.rs)
+when the session GUC is set to `direct`. It mirrors PG's
+`exec_simple_query` shape (one raw parse, then a per-statement
+analyze + plan + Portal + `PortalRun` loop) and skips the three
+overheads the SPI backend pays:
 
-1. **Double parse** — `parse_and_classify` calls `raw_parser`; then
-   `SPI_execute` re-parses the same string inside SPI. ~5 µs per
-   query (Q25 measurement).
-2. **`SPI_tuptable` materialisation** — every tuple is heap-tuple-
-   copied into `SPI_tuptable` before we walk it. Vanilla PG's
-   `printtup` writes wire bytes directly during the executor scan.
-3. **`Vec<DataRow>` materialisation** — we then copy `SPI_tuptable`
-   into a Rust-side `Vec<DataRow>` because pgwire's
-   `Response::Query(QueryResponse::new(schema, row_stream))`
-   consumes rows *after* the handler returns, and `SPI_finish`
-   would have torn down the tuples by then.
+1. **Second parse** — `SPI_execute` re-parses the string inside
+   SPI. The direct backend keeps the `raw_parser` output alive
+   in a per-call MemoryContext and feeds it straight to
+   `pg_analyze_and_rewrite_fixedparams`.
+2. **`SPI_tuptable` materialisation** — every SPI tuple is
+   heap-tuple-copied into the SPI table. The direct backend
+   uses `WireDestReceiver::receiveSlot` to encode each row as
+   wire bytes during the executor scan.
+3. **Xact-control intercept** — SPI in atomic mode rejects
+   `BEGIN`/`COMMIT`/`ROLLBACK`, so the SPI bridge hand-routes
+   them via the xact-block API. `PortalRun` routes
+   `TransactionStmt` through `ProcessUtility` natively, same as
+   vanilla PG. The intercept does not exist on the direct path.
 
-Items 1+2 are pure overhead vs vanilla PG; item 3 is forced by the
-pgwire `Response` API (this doc retains it; see §6.2).
+One pgwire-side copy remains and is intrinsic to the
+`SimpleQueryHandler` API; see §5.6.
 
-**Why not until now.** The parent doc's Q18 deferred this until
-"bench shows SPI overhead is material". Phase-5 bench numbers were
-within ±5 pp of vanilla so the trigger never fired. Phase-9
-extended-query work added the direct backend for `Parse`/`Bind`/
-`Execute`; pgbench (`-M simple`) doesn't exercise that path, so the
-simple-query gap stayed visible. With the per-accept handoff spawn
-landed (commits `aca1df3`/`9abd857`/`5d11292`), startup overhead is
-no longer dominating, and the per-query 4–6 pp gap is the only
-remaining sub-vanilla measurement.
-
-## 2. Current simple-query data path
-
-[`spi_bridge.rs::execute_simple_query`](../../../crates/core/src/backend/spi_bridge.rs):
+## 2. Data path
 
 ```text
-'Q' message → SimpleQueryHandler (pgwire) → execute_simple_query(query_string)
-                                              │
-                                              ▼ parse_and_classify(query)
-                              ┌──────────────────────────────────────┐
-                              │ raw_parser → List *RawStmt           │ (parse pass #1)
-                              │ extract (slice, classification)      │
-                              │ delete scratch MemoryContext         │
-                              └──────────────────────────────────────┘
-                                              │ Vec<(&str, Option<XactCmd>)>
-                                              ▼
-                              ┌──────────────────────────────────────┐
-                              │ for each statement:                  │
-                              │   xact?  → handle_xact_control(cmd)  │
-                              │   else  → run_spi_statement(text)    │
-                              │            └→ with_spi(...):         │
-                              │               SPI_execute(text)      │ (parse pass #2 + plan + exec)
-                              │               iterate SPI_tuptable   │
-                              │               copy → Vec<DataRow>    │
-                              │               SPI_finish             │
-                              └──────────────────────────────────────┘
-                                              │
-                                              ▼ Vec<Response>
-                                  pgwire encodes Response → wire bytes
-```
-
-The xact-control intercept exists because SPI in atomic mode rejects
-`BEGIN`/`COMMIT`/`ROLLBACK` with `SPI_ERROR_TRANSACTION`. PG's own
-`exec_simple_query` doesn't need an intercept — `PortalRun` routes
-`TransactionStmt` through `ProcessUtility` → `BeginTransactionBlock`
-naturally. **The direct path inherits PG's behaviour for free**:
-once we use `Portal*` directly, the intercept goes away. See §4.3.
-
-## 3. Target simple-query data path (direct)
-
-```text
-'Q' message → SimpleQueryHandler → execute_simple_query_direct(query)
+'Q' message → SimpleQueryHandler::do_query → execute_simple_query_direct(query)
                                               │
                                               ▼ parse_and_keep(query)
                               ┌──────────────────────────────────────┐
-                              │ raw_parser → List *RawStmt           │ (parse pass #1)
-                              │ keep parsetree alive in a            │
-                              │ per-call MemoryContext               │
-                              │ no classification needed             │
+                              │ raw_parser → List *RawStmt           │ (the only parse pass)
+                              │ kept alive in ScopedMemoryContext    │
+                              │  (parse_ctx, dropped on return)      │
                               └──────────────────────────────────────┘
-                                              │ Vec<(&str, *mut RawStmt)>
+                                              │ ParsedQuery { statements, parse_ctx }
                                               ▼
                               ┌──────────────────────────────────────┐
-                              │ for each statement:                  │
-                              │   with_xact(|| run_one_direct(...))  │
-                              │    └→ pg_analyze_and_rewrite_fixed   │ (no second parse)
-                              │       pg_plan_queries                │
-                              │       CreatePortal                   │
-                              │       PortalDefineQuery              │
-                              │       PortalStart                    │
-                              │       PortalRun(WireDestReceiver)    │ ← rows encoded inline
-                              │       PortalDrop                     │
-                              │       extract schema + cmd tag       │
+                              │ for each (text, *mut RawStmt):       │
+                              │   with_xact(|ctx|                    │
+                              │     run_one_direct(ctx, &parse_ctx,  │
+                              │                    raw_stmt,         │
+                              │                    text, &sql_cstr)) │
+                              │      ├─ CreateCommandTag             │
+                              │      ├─ child stmt_ctx               │
+                              │      ├─ pg_analyze_and_rewrite_fixed │
+                              │      ├─ pg_plan_queries              │
+                              │      ├─ Portal::create_anonymous     │
+                              │      ├─ Portal::define               │
+                              │      ├─ Portal::start                │
+                              │      ├─ read portal->tupDesc         │
+                              │      │   → schema + ColumnEncoder[]  │
+                              │      ├─ Portal::run(WireDestReceiver,│
+                              │      │              count=FETCH_ALL) │
+                              │      └─ Drop: Portal, stmt_ctx       │
                               └──────────────────────────────────────┘
                                               │ Vec<Response>
-                                              ▼
-                                  pgwire encodes Response → wire bytes
+                                              ▼ pgwire encodes Response → wire bytes
 ```
 
-Key differences from §2:
+The `Portal::run` call drives `WireDestReceiver::receiveSlot`
+once per row. Each invocation walks the tuple's columns and
+appends one length-prefixed `DataRow` frame to a Rust-side
+`Vec<DataRow>`. After `PortalDrop`, the response wrapper hands
+that vec to pgwire as a `stream::iter`.
 
-1. **One parse pass.** The `raw_parser` output is *kept* in a
-   per-call MemoryContext and fed to `pg_analyze_and_rewrite_fixedparams`
-   directly. No second parse.
-2. **No SPI_tuptable.** `WireDestReceiver::receiveSlot` writes each
-   tuple's encoded bytes into a per-row `BytesMut` during executor
-   scan. Tuples never enter SPI's tuptable buffer.
-3. **No xact intercept.** `PortalRun` handles `TransactionStmt`
-   via `ProcessUtility` → PG's xact-block API. The same is true
-   for all utility statements (`SET`, `CREATE`, `VACUUM`, etc.),
-   which today go through SPI but should go through `Portal*` for
-   semantic parity with vanilla PG.
-4. **Xact wrapper trims.** `with_spi` becomes `with_xact`: just
-   `StartTransactionCommand` + `PushActiveSnapshot` (+ matching
-   teardown), no `SPI_connect`/`SPI_finish` bracket.
+## 3. Module layout
 
-## 4. Function shapes
+| Symbol | Location | Visibility |
+|---|---|---|
+| `execute_simple_query_direct` | [`backend/simple_direct.rs`](../../../crates/core/src/backend/simple_direct.rs) | `pub` |
+| `ParsedQuery` / `parse_and_keep` | [`backend/simple_direct.rs`](../../../crates/core/src/backend/simple_direct.rs) | `pub(crate)` |
+| `run_one_direct` | [`backend/simple_direct.rs`](../../../crates/core/src/backend/simple_direct.rs) | private |
+| `extract_raw_stmt_spans` | [`backend/simple_direct.rs`](../../../crates/core/src/backend/simple_direct.rs) | private |
+| `WireDestReceiver`, `ColumnEncoder`, `wire_receive_slot`, `as_dest_receiver`, `command_tag_name`, `schema_and_encoders_text` | [`backend/dest_receiver.rs`](../../../crates/core/src/backend/dest_receiver.rs) | `pub(crate)` |
+| `with_xact`, `XactCtx`, `Portal`, `ParamList`, `TupleDescRef`, `ScopedMemoryContext`, `MemoryContextGuard` | [`backend/executor.rs`](../../../crates/core/src/backend/executor.rs) | `pub` |
+| `caught_error_to_pgwire`, `generic_error`, `TypeOutput`, `TypeSend` | [`backend/spi.rs`](../../../crates/core/src/backend/spi.rs) | `pub` (carried forward; SPI backend still uses these) |
+| `pg_transport.execution_backend` GUC dispatch | [`wire/pgwire_v3.rs`](../../../crates/core/src/wire/pgwire_v3.rs) `SimpleQueryHandler::do_query` | — |
 
-### 4.1 `parse_and_keep`
+`WireDestReceiver` + `ColumnEncoder` originally lived in
+[`extended/direct.rs`](../../../crates/core/src/backend/extended/direct.rs);
+they were lifted into a shared `dest_receiver` module so both
+the extended-query and simple-query direct backends share one
+`DestReceiver` implementation and one type-I/O cache. Behaviour
+was preserved byte-for-byte; only visibility changed.
 
-Replaces [`parse_and_classify`](../../../crates/core/src/backend/spi_bridge.rs)
-for the direct path. Returns owned parsetree pointers and the
-context they live in — caller is responsible for deleting the
-context once all statements have run.
+## 4. Memory-context discipline
 
-```rust
-struct ParsedQuery<'q> {
-    /// Per-statement (text-slice, raw RawStmt pointer) pairs in
-    /// source order.
-    statements: Vec<(&'q str, *mut pg_sys::RawStmt)>,
-    /// MemoryContext that owns every RawStmt in `statements`.
-    /// Drop the parsed query to delete it.
-    parse_ctx: ScopedMemoryContext,
-}
+Three contexts, three lifetimes:
 
-fn parse_and_keep(query: &str) -> PgWireResult<ParsedQuery<'_>>;
-```
+- **Parse context** (`ParsedQuery.parse_ctx`, named
+  `pg_transport_parse_ctx`) owns the parsetree list returned by
+  `raw_parser`. Created by `parse_and_keep`; deleted when
+  `ParsedQuery` drops at the end of
+  `execute_simple_query_direct`. Spans the whole `'Q'` body.
+- **Per-statement working context** (`stmt_ctx`, named
+  `pg_transport_stmt_ctx`) is a child of `parse_ctx`. Created
+  inside `run_one_direct`; everything
+  `pg_analyze_and_rewrite_fixedparams` and `pg_plan_queries`
+  `palloc`s during that call lands here. Deleted at function
+  exit (after `PortalDrop` has copied what it needs onto the
+  portal's own context). Matches what `exec_simple_query` does
+  via `MessageContext` + per-statement reset.
+- **Portal context** (`portal->portalContext`) is owned by PG;
+  `PortalDrop` releases it on `Portal::drop`.
 
-Implementation: same `PgTryBuilder`-wrapped `raw_parser` call as
-[`parse_and_classify`](../../../crates/core/src/backend/spi_bridge.rs#L153),
-but the scratch `MemoryContext` is moved into an RAII wrapper
-(`ScopedMemoryContext`, dropping calls `MemoryContextDelete`) and
-the classification step is dropped. The `(&str, *mut RawStmt)`
-pairs are taken from each `RawStmt.stmt_location/stmt_len` after
-the parse, same as today.
+The pointer-lifetime invariant: each `*mut pg_sys::RawStmt` in
+`ParsedQuery.statements` is valid for the lifetime of
+`parse_ctx`. Dropping `ParsedQuery` invalidates every pointer
+the slice held. The lifetime parameter `'q` on `ParsedQuery`
+ties only the text slices to the input string; the raw pointers
+are not protected by the type system. The `for` loop in
+`execute_simple_query_direct` dereferences each pointer while
+`parsed` is in scope, which is the only correct usage pattern.
 
-`ScopedMemoryContext` doesn't exist yet — it's the only new RAII
-helper this work needs (~20 LoC; trivial Drop impl around
-`AllocSetContextCreateInternal` / `MemoryContextDelete`). Lives in
-[`executor.rs`](../../../crates/core/src/backend/executor.rs)
-alongside `with_xact`.
-
-**Memory-context invariant.** `ParsedQuery.parse_ctx` is the
-*parent* context of the per-statement analyze/plan working
-contexts — those are children created during `run_one_direct` and
-deleted when each statement's `PortalDrop` runs. The parsetree
-itself stays alive in `parse_ctx` until `ParsedQuery` drops.
-
-### 4.2 `with_xact` (already shipped)
-
-Already in tree at
-[`crates/core/src/backend/executor.rs::with_xact`](../../../crates/core/src/backend/executor.rs)
-and used by `extended/direct.rs`. Body signature:
-
-```rust
-pub fn with_xact<T, F>(body: F) -> PgWireResult<T>
-where F: FnOnce(&XactCtx) -> PgWireResult<T>;
-```
-
-Opens `StartTransactionCommand` + `PushActiveSnapshot`, runs the
-closure, closes on success or aborts on PG ERROR caught via
-`PgTryBuilder`. The `XactCtx` token gates downstream calls
-(`Portal::create_anonymous`, etc.) that require an open xact.
-Reused as-is; no changes needed.
-
-### 4.3 `run_one_direct`
-
-The new per-statement worker. Mirrors what `exec_simple_query`
-does in vanilla PG (analyze → plan → portal define/start/run/drop)
-and reuses the existing
-[`Portal`](../../../crates/core/src/backend/executor.rs)
-wrapper. Note: we deliberately **don't** go through
-`CachedPlanSource` — simple-query plans are one-shot, so a direct
-`pg_plan_queries` matches `exec_simple_query` and avoids the cache
-bookkeeping. The `Portal::define` wrapper accepts a NULL
-`cached_plan`, which is exactly what PG's `exec_simple_query`
-passes.
-
-```rust
-fn run_one_direct(
-    ctx: &XactCtx,
-    parse_ctx: &ScopedMemoryContext,   // owns raw_stmt; analyze/plan ctx is its child
-    raw_stmt: *mut pg_sys::RawStmt,
-    _sql: &str,
-    sql_cstr: &CStr,
-) -> PgWireResult<Response> {
-    // 1. Command tag from the raw parsetree (matches PG's
-    //    exec_simple_query, which calls CreateCommandTag on the
-    //    raw stmt before analyze).
-    // SAFETY: CreateCommandTag is a pure walk of the parsetree;
-    // raw_stmt is alive in parse_ctx for the whole call.
-    let command_tag = unsafe { pg_sys::CreateCommandTag((*raw_stmt).stmt) };
-
-    // 2. Per-statement working context. Child of parse_ctx so
-    //    parsetree lookups still resolve, but everything
-    //    pg_analyze_and_rewrite_fixedparams + pg_plan_queries
-    //    palloc into here is freed at end-of-statement.
-    //    PortalDefineQuery copies what it needs onto the portal's
-    //    own context, so we can drop this *after* PortalStart.
-    let stmt_ctx = ScopedMemoryContext::child_of(parse_ctx, c"pg_transport_stmt");
-    let _guard = stmt_ctx.switch_to(); // restores prior CurrentMemoryContext on drop
-
-    let (schema, encoders, qc, data_rows) = unsafe {
-        // 3. Analyze + rewrite (fixed params; simple-query has none).
-        let query_list = pg_sys::pg_analyze_and_rewrite_fixedparams(
-            raw_stmt,
-            sql_cstr.as_ptr(),
-            std::ptr::null(),       // paramTypes
-            0,                       // numParams
-            std::ptr::null_mut(),   // queryEnv
-        );
-
-        // 4. Plan. Matches PG's exec_simple_query call shape.
-        let plan_list = pg_sys::pg_plan_queries(
-            query_list,
-            sql_cstr.as_ptr(),
-            pg_sys::CURSOR_OPT_PARALLEL_OK as i32,
-            std::ptr::null_mut(),   // boundParams
-        );
-
-        // 5. Portal lifecycle via the existing wrapper. Portal's
-        //    own MemoryContext is independent of stmt_ctx.
-        let portal = Portal::create_anonymous(ctx);
-        portal.define(sql_cstr, command_tag, plan_list, std::ptr::null_mut());
-
-        // 6. Build schema + per-column encoders from the portal's
-        //    tupDesc (NULL for utility / no-tuple statements).
-        let tupdesc = TupleDescRef::from_raw((*portal.as_ptr()).tupDesc);
-        let (schema, encoders) = match tupdesc {
-            Some(td) => build_schema_and_encoders(&td),
-            None => (Vec::new(), Vec::new()),
-        };
-
-        // 7. Start. with_xact has already PushActiveSnapshot'd;
-        //    PortalStart records it on the QueryDesc. PortalRun
-        //    will push its own active snapshot internally for
-        //    SELECT; nested push/pop is fine — matches what the
-        //    extended-query direct backend already does.
-        portal.start(&ParamList::empty(), 0, pg_sys::GetActiveSnapshot());
-
-        // 8. Execute. Per-row encoding happens inside receiveSlot,
-        //    which appends to `data_rows`.
-        let mut data_rows: Vec<DataRow> = Vec::new();
-        let ncols = schema.len() as i16;
-        let mut dest = WireDestReceiver::new(&encoders, &mut data_rows, ncols);
-        let mut qc: pg_sys::QueryCompletion = std::mem::zeroed();
-        pg_sys::InitializeQueryCompletion(&mut qc);
-        let _completed = portal.run(
-            0,                                 // count = 0 => FETCH_ALL
-            true,                              // is_top_level
-            dest.as_dest_receiver(),
-            dest.as_dest_receiver(),
-            &mut qc,
-        );
-
-        // 9. portal drops here (PortalDrop on scope exit), tearing
-        //    down executor state and freeing the portal's
-        //    MemoryContext.
-        (schema, encoders, qc, data_rows)
-    };
-    drop(encoders); // no longer referenced; explicit for clarity
-    drop(_guard);   // switch back to parse_ctx
-    drop(stmt_ctx); // deletes the per-stmt analyze/plan context
-
-    // 10. Shape into pgwire Response. Same construction pattern as
-    //     extended/direct.rs::execute (see lines ~210-228).
-    if schema.is_empty() {
-        let tag_name = command_tag_name(qc.commandTag);
-        let mut tag = Tag::new(&tag_name);
-        if unsafe { pg_sys::command_tag_display_rowcount(qc.commandTag) } {
-            tag = tag.with_rows(qc.nprocessed as usize);
-        }
-        Ok(Response::Execution(tag))
-    } else {
-        let tag_name = command_tag_name(qc.commandTag);
-        let schema_arc = Arc::new(schema);
-        let row_stream = stream::iter(data_rows).map(Ok);
-        let mut response = QueryResponse::new(schema_arc, row_stream);
-        response.set_command_tag(&tag_name);
-        Ok(Response::Query(response))
-    }
-}
-```
-
-**Per-statement working context (step 2).** Analyze + plan
-`palloc` into `CurrentMemoryContext`. Without the child-context
-switch, every per-statement allocation would survive in
-`parse_ctx` until the whole `'Q'` message finishes — a leak
-linear in statement count. The `stmt_ctx` switch matches what
-`exec_simple_query` does via `MessageContext` + per-statement
-resets in vanilla PG.
-
-**Why `count = 0`.** The `Portal::run` wrapper inherits PG 18's
-signature; `count = 0` means "all rows". `exec_simple_query`
-passes `FETCH_ALL` which expands to the same value.
-
-**Helpers used.** `command_tag_name`, `Tag`, `QueryResponse`,
-`Response::Execution`/`Response::Query`, `stream::iter(..).map(Ok)`,
-`Arc::new(schema)`, `command_tag_display_rowcount` — all already
-used at [extended/direct.rs ~L210-228](../../../crates/core/src/backend/extended/direct.rs).
-The `Response`-construction block in this sketch is a literal
-lift of those lines. `command_tag_name` and `as_dest_receiver`
-move from `extended/direct.rs` to the shared `dest_receiver.rs`
-as part of the §7 refactor.
-
-**PG 18 signature note.** PG 16 removed the `run_once` argument
-from `PortalRun`; the live `Portal::run` wrapper matches PG 18
-and takes `(count, is_top_level, dest, altdest, qc)`. Earlier
-revisions of this doc included `run_once` based on the PG 14/15
-signature; that's stale.
-
-**Command-tag plumbing.** `command_tag_for(raw_stmt)` from earlier
-revisions of this doc isn't a separate helper; `pg_sys::CreateCommandTag`
-already returns the right enum and `extended/direct.rs` calls it
-exactly the same way.
-
-### 4.3.1 Building schema + encoders from `tupDesc`
-
-The schema/encoder construction (step 5 above) duplicates work
-that `extended/direct.rs` already does at `prepare` time from
-`CachedPlanSource::result_desc()`. The refactor in §7 lifts this
-into a shared helper `build_schema_and_encoders(&TupleDescRef)` so
-both sites call into the same code.
-
-### 4.4 `WireDestReceiver` reuse
-
-`extended/direct.rs` already defines a `WireDestReceiver` that
-walks `TupleTableSlot` columns and writes encoded bytes to a
-`BytesMut`. Two options:
-
-1. **Lift it to a shared module** (`crates/core/src/backend/dest_receiver.rs`)
-   used by both the simple-query and extended-query paths. Same
-   `#[repr(C)]` struct, same `receiveSlot`/`rStartup`/`rShutdown`
-   callbacks, parameterised on the per-column encoder cache.
-   **Recommended.**
-2. **Duplicate** the struct in a new `simple_direct.rs` module.
-   Faster to land but creates two `DestReceiver`s to maintain
-   through PG version changes.
-
-Option 1 is the right move; the receiver's API (set encoders +
-target buffer, then call as `*mut DestReceiver`) is already
-agnostic about who invokes `PortalRun`.
-
-### 4.5 `execute_simple_query_direct`
-
-Top-level entry, mirroring [`execute_simple_query`](../../../crates/core/src/backend/spi_bridge.rs#L65):
-
-```rust
-pub fn execute_simple_query_direct(query: &str) -> PgWireResult<Vec<Response>> {
-    let parsed = parse_and_keep(query)?;
-    let sql_cstr = CString::new(query).map_err(|_| {
-        generic_error("pg_transport", "query string contains a NUL byte")
-    })?;
-    let mut responses = Vec::with_capacity(parsed.statements.len());
-    for (text, raw_stmt) in &parsed.statements {
-        if text.trim().is_empty() {
-            continue;
-        }
-        // with_xact gives us per-statement xact bracketing matching
-        // PG's exec_simple_query (start_xact_command /
-        // finish_xact_command). The XactCtx is the token threaded
-        // through Portal::create_anonymous.
-        //
-        // Error shape matches today's spi_bridge::execute_simple_query:
-        // first-error returns Err and pgwire emits ErrorResponse +
-        // ReadyForQuery from the SimpleQueryHandler layer. We do
-        // **not** push Response::Error into the Vec; that would
-        // change framing relative to the SPI backend and break
-        // dual-backend test parity.
-        let resp = with_xact(|ctx| {
-            run_one_direct(ctx, &parsed.parse_ctx, *raw_stmt, text, &sql_cstr)
-        })?;  // ← 'Q' semantics: stop on first error, propagate Err
-        responses.push(resp);
-    }
-    // parsed drops here; ScopedMemoryContext deletes the parse context.
-    Ok(responses)
-}
-```
-
-**Error-shape rationale.** `?`-propagation is identical to
-today's [`execute_simple_query`](../../../crates/core/src/backend/spi_bridge.rs#L64);
-pgwire-v3's `SimpleQueryHandler::do_query` returns
-`PgWireResult<Vec<Response>>` and converts a top-level `Err`
-into wire `ErrorResponse` + `ReadyForQuery('I'|'E')`. Embedding
-`Response::Error` in the Vec would emit the same bytes for the
-error payload itself, but would *also* push an extra
-`ReadyForQuery` per response — different framing, observable to
-the client.
-
-## 5. Dispatch shape — `pg_transport.execution_backend` extended
-
-The existing GUC's documentation
-([configuration.md](../configuration.md#26))
-says "Extended-query execution backend". This doc proposes
-**extending its meaning to cover simple-query too**:
-
-```rust
-// crates/core/src/wire/pgwire_v3.rs (SimpleQueryHandler impl)
-match guc::execution_backend() {
-    ExecutionBackend::Spi    => spi_bridge::execute_simple_query(query),
-    ExecutionBackend::Direct => spi_bridge::execute_simple_query_direct(query),
-}
-```
-
-Default stays `'spi'` until the direct simple-query path soaks
-(parallel to the parent doc's Stage A→C migration timeline). The
-GUC docs need a small wording update: "Execution backend for
-`Q`/`Parse`/`Execute` messages" instead of "Extended-query
-execution backend".
-
-**Alternative considered**: a separate
-`pg_transport.simple_execution_backend` GUC. Rejected — operators
-canarying one backend over the other will want both ends to move
-together (avoids cross-protocol behaviour drift inside a single
-session), and the two backends share the same `WireDestReceiver`
-infrastructure.
-
-## 6. Tricky bits
-
-### 6.1 Memory-context lifecycle across statements
-
-Today, each `with_spi` opens its own SPI memory context and tears
-it down at `SPI_finish`. The direct path needs:
-
-- **Parse context** (`ParsedQuery.parse_ctx`) — lives across all
-  statements; owns the parsetree list.
-- **Per-statement analyze/plan context** — created inside
-  `run_one_direct` as a child of `parse_ctx`; deleted at function
-  exit. Holds the `List *Query` and `List *PlannedStmt` (they're
-  fed to `PortalDefineQuery` which `palloc`s them onto the
-  portal's own context, so deleting the working context after
-  `PortalStart` is safe).
-- **Portal context** — owned by PG (`portal->portalContext`);
-  `PortalDrop` releases it.
-
-Invariant: when statement N+1 starts analyzing, statement N's
-portal has been dropped but `parse_ctx` is still alive (so
-statement N+1's `raw_stmt` pointer is still valid). When
-`ParsedQuery` drops at the end, every per-statement context has
-already been deleted by `PortalDrop`, and `parse_ctx` is the last
-remaining context tied to the query.
-
-**Snapshot push interaction.** `with_xact` calls
+**Snapshot interaction.** `with_xact` calls
 `PushActiveSnapshot(GetTransactionSnapshot())`. `PortalRun` for
 SELECT internally does its own `PushActiveSnapshot` + matching
-pop around the executor scan. The nested push/pop is fine —
-PG's snapshot stack is designed for this (vanilla
-`exec_simple_query` hits the same path); the live extended-query
-direct backend already exercises it on every `'E'` message
-without issue. The `PortalStart(snapshot=GetActiveSnapshot())`
-call in step 7 of §4.3 records the with_xact snapshot on the
-QueryDesc; PortalRun's internal push is per-scan and doesn't
-replace it.
+pop per scan. Nested push/pop is fine — PG's snapshot stack is
+designed for this, vanilla `exec_simple_query` hits the same
+path, and the extended-query direct backend has exercised it on
+every `'E'` message since Stage B. The
+`PortalStart(snapshot=GetActiveSnapshot())` call records the
+`with_xact` snapshot on the `QueryDesc`; PortalRun's internal
+push is per-scan and doesn't replace it.
 
-### 6.2 Why `Vec<DataRow>` materialisation can't go away (yet)
+## 5. Subtleties (read before editing)
 
-pgwire's `SimpleQueryHandler::do_query` signature returns
-`PgWireResult<Vec<Response>>`. `Response::Query(QueryResponse)`
-takes a `Stream<Item = PgWireResult<DataRow>>`. pgwire consumes
-that stream **after** `do_query` returns to push the rows into the
-wire codec — *after* `PortalDrop` has already run.
+### 5.1 `FETCH_ALL` is `LONG_MAX`, not `0`
 
-We cannot stream from a live `Portal`/`WireDestReceiver` past
-`PortalDrop`. So `receiveSlot` writes encoded rows into a `BytesMut`,
-we slice that into `DataRow` frames after `PortalDrop`, and return
-`stream::iter(data_rows)` to pgwire.
+`PortalRun(count: i64, ...)`: PG 18 treats `count <= 0` as
+`NoMovementScanDirection` (i.e. "scan no rows"). The all-rows
+sentinel is `FETCH_ALL`, which `#define`s to `LONG_MAX`. The
+direct path passes `i64::MAX`. Passing `0` returns zero rows
+with no diagnostic, which surfaces as an empty `DataRow` vec
+even for `SELECT 1`. Both
+[`simple_direct::run_one_direct`](../../../crates/core/src/backend/simple_direct.rs)
+and
+[`extended::direct::execute_impl`](../../../crates/core/src/backend/extended/direct.rs)
+do this; do not regress.
 
-We still **avoid the `SPI_tuptable` step**: `BytesMut` holds
-already-encoded wire bytes (the per-row encoding work
-`receiveSlot` did), not heap tuples. Going from "two copies"
-(`SPI_tuptable` + `Vec<DataRow>`) to "one copy" (`BytesMut`
-materialised by the receiver). True row-by-row streaming would
-need pgwire-side API changes; out of scope for this work.
+### 5.2 `portal->tupDesc` is populated by `PortalStart`, not `PortalDefineQuery`
 
-### 6.3 Multi-statement error semantics
+The tupdesc is `NULL` immediately after `PortalDefineQuery` and
+only becomes valid after `PortalStart` (which runs
+`ExecutorStart`, which sets up the `QueryDesc`, which writes
+back the tupdesc onto the portal). The direct path reads
+`portal->tupDesc` strictly between `Portal::start(…)` and
+`Portal::run(…)`. Reading it earlier returns `None` and
+silently routes every SELECT down the utility-no-rows branch.
 
-Vanilla PG's `'Q'` semantics: on first error, abort the current
-transaction and stop processing later statements in the same
-message. `execute_simple_query` already implements this via
-`responses.extend(execute_one_statement(...)?)` + `?`. The
-direct version does the same via `?`-propagation in §4.5 — same
-shape, same wire framing (one `ErrorResponse` + one
-`ReadyForQuery`, not one per partial response).
+### 5.3 Error shape matches the SPI backend
 
-Subtlety: `with_xact`'s abort path calls
-`AbortCurrentTransaction` which collapses xact state to `DEFAULT`,
-matching `spi_bridge`'s current behaviour. See the deviation note
-in [`run_spi_statement`'s doc comment](../../../crates/core/src/backend/spi_bridge.rs#L106)
-— same caveat applies here.
+`execute_simple_query_direct` uses `?`-propagation. On first
+error the function returns `Err` and pgwire's
+`SimpleQueryHandler` emits one `ErrorResponse` + one
+`ReadyForQuery`. Pushing `Response::Error` into the `Vec`
+instead would emit the same error payload but double-emit
+`ReadyForQuery` — observable to clients and breaks
+dual-backend test parity. Keep the `?` shape.
 
-### 6.4 Utility statements
+### 5.4 `with_xact` abort path collapses to `DEFAULT`
 
-In current SPI path, `SET pg_transport.execution_backend = 'direct'`
-inside a `'Q'` message goes through `SPI_execute("SET ...")`, which
-routes utility statements via SPI's internal `ProcessUtility` call.
-Works fine.
+On a PG `ERROR` from inside the closure, `with_xact` calls
+`AbortCurrentTransaction`, which moves the xact state machine
+to `DEFAULT`. Vanilla PG would have left it at `TBLOCK_ABORT`,
+requiring the client to issue `ROLLBACK`. This deviation is
+inherited from the SPI bridge (see
+[`run_spi_statement`'s doc comment](../../../crates/core/src/backend/spi_bridge.rs))
+— harmless for our target workloads; flagged here so anyone
+chasing a "why doesn't my next statement need ROLLBACK after an
+error" question finds the answer.
 
-In the direct path, the same SQL would go through `PortalRun` →
-which itself routes utility through `ProcessUtility`. Same effect,
-same call site (literally the same PG function). The only
-difference is one less indirection layer.
+### 5.5 Utility statements go through `ProcessUtility`
 
-Edge case: utility statements that *change* xact state mid-query
-(e.g. `BEGIN; SELECT 1;` in one `'Q'`). PG routes
-`TransactionStmt` through `ProcessUtility` → `BeginTransactionBlock`
-/ `EndTransactionBlock`, which mutate xact-block state (e.g.
-`TBLOCK_STARTED` → `TBLOCK_INPROGRESS`). The bracketing
-`StartTransactionCommand` / `CommitTransactionCommand` that
-`with_xact` wraps each statement with handle the *command*
-boundary on top of any open block: from
+`SET`, `CREATE`, `VACUUM`, and `TransactionStmt`
+(BEGIN/COMMIT/ROLLBACK + their mode-list variants) all route
+through `PortalRun` → `ProcessUtility`. Same function PG's own
+`exec_simple_query` calls. The SPI backend's
+`handle_xact_control` / `XactCmd` intercept doesn't exist on
+the direct path because it isn't needed.
+
+`BEGIN; SELECT 1; COMMIT` in one `'Q'`: PG routes
+`TransactionStmt` via `ProcessUtility` →
+`BeginTransactionBlock` / `EndTransactionBlock`, which mutate
+xact-block state (`TBLOCK_STARTED` → `TBLOCK_INPROGRESS`). The
+`StartTransactionCommand` / `CommitTransactionCommand` brackets
+that `with_xact` wraps each statement with handle the
+*command* boundary on top of any open block: from
 `TBLOCK_INPROGRESS`, `CommitTransactionCommand` issues
-`CommandCounterIncrement` rather than an actual commit. Same
-machinery vanilla `exec_simple_query` relies on. Tested by the
-existing `xact_control_*` e2e tests
-([crates/e2e/tests/basic.rs](../../../crates/e2e/tests/basic.rs));
-these would need to pass against the direct backend too.
+`CommandCounterIncrement` rather than an actual commit.
 
-### 6.5 Cancel + interrupt handling
+### 5.6 `Vec<DataRow>` materialisation is intrinsic
 
-Today's SPI path has no special cancel plumbing — `SPI_execute`
-calls `CHECK_FOR_INTERRUPTS()` internally during executor scan.
-`PortalRun` does the same. No change needed for this work.
-Cancel routing itself is still deferred per
+pgwire's `SimpleQueryHandler::do_query` returns
+`PgWireResult<Vec<Response>>`. `Response::Query(QueryResponse)`
+takes a `Stream<Item = PgWireResult<DataRow>>` that pgwire
+consumes *after* `do_query` returns — i.e. after `PortalDrop`.
+We cannot stream from a live `Portal`/`WireDestReceiver` past
+`PortalDrop`, so `receiveSlot` writes encoded rows into a
+`Vec<DataRow>` and the response wraps `stream::iter(data_rows)`.
+
+This is one Rust-side `Vec` copy of already-encoded wire bytes,
+not a tuple copy. Removing it would need a pgwire-side API
+change (streaming `DataRow` from inside `do_query`); out of
+scope.
+
+### 5.7 Cancel + interrupt handling
+
+No special plumbing. `PortalRun` calls `CHECK_FOR_INTERRUPTS()`
+internally during executor scan, same as `SPI_execute` does
+today. Cancel-message routing itself is still deferred per
 [cancel-routing.md](cancel-routing.md).
 
-### 6.6 The `with_spi` → `with_xact` split (already shipped)
+## 6. Tests
 
-The parent doc's Stage C is "rename `spi.rs` to `executor.rs`,
-`with_spi` becomes `with_xact`". This has already happened: the
-rename is in [`executor.rs`](../../../crates/core/src/backend/executor.rs)
-and the live extended-query direct backend already uses `with_xact`.
-`with_spi` still exists in [`spi.rs`](../../../crates/core/src/backend/spi.rs)
-and continues to back the simple-query SPI path that this work
-introduces an *alternative* to. **This doc does not propose
-removing the SPI bridge.** Both backends ship side-by-side,
-selectable via `pg_transport.execution_backend`; any future
-deprecation decision is out of scope here.
+Unit tests in [`simple_direct.rs::tests`](../../../crates/core/src/backend/simple_direct.rs)
+cover the in-process paths:
 
-## 7. Reuse map
+- `pg_simple_direct_empty_query` — empty / whitespace-only /
+  comment-only inputs parse to zero statements.
+- `pg_simple_direct_select_one_row` — basic SELECT round-trip
+  including text-format decoding of the encoded `DataRow`.
+- `pg_simple_direct_multi_statement` — multi-statement `'Q'`
+  splits into one response per statement.
+- `pg_simple_direct_utility_set` — `SET` routes through
+  `ProcessUtility` and returns `Response::Execution`.
+- `pg_simple_direct_syntax_error_stops_batch` — syntax error
+  surfaces as `PgWireError`; later statements aren't executed.
 
-| Component | Source | Reuse strategy |
-|---|---|---|
-| `with_xact` / `XactCtx` | `executor.rs` | ✅ Already shipped. Used as-is. |
-| `Portal` (`create_anonymous`/`define`/`start`/`run`/Drop) | `executor.rs` | ✅ Already shipped. Used as-is; Drop calls `PortalDrop`. |
-| `ParamList::empty()` | `executor.rs` | ✅ Already shipped. Used as-is (simple-query has no params). |
-| `TupleDescRef` | `executor.rs` | ✅ Already shipped. Used as-is for schema construction. |
-| `caught_error_to_pgwire` | `spi.rs` | ✅ Already shipped. Used as-is via `with_xact`. |
-| `TypeOutput`/`TypeSend` (per-cell I/O) | `spi.rs` | ✅ Already shipped. Used as-is via `ColumnEncoder`. |
-| `pg_transport.execution_backend` GUC | `guc.rs` | ✅ Already shipped. New call site in `SimpleQueryHandler` reads it. |
-| `extract_statement_spans` | `spi_bridge.rs` | ✅ Already shipped. Reusable as-is by `parse_and_keep`. |
-| `WireDestReceiver` (custom `DestReceiver`) | `extended/direct.rs` | ⚠ Lift to new `backend/dest_receiver.rs`, parameterise by `&[ColumnEncoder]` + `&mut Vec<DataRow>`. |
-| `ColumnEncoder` enum + `for_column` | `extended/direct.rs` | ⚠ Lift to `dest_receiver.rs` alongside the receiver. |
-| `wire_receive_slot` C-callback | `extended/direct.rs` | ⚠ Lift to `dest_receiver.rs`. |
-| `WireDestReceiver::as_dest_receiver` | `extended/direct.rs` | ⚠ Lift with parent struct; bump visibility to `pub(crate)`. |
-| `command_tag_name(CommandTag::Type) -> String` | `extended/direct.rs` | ⚠ Lift to `dest_receiver.rs` (used by both backends); bump to `pub(crate)`. |
-| `generic_error(prefix, msg)` | `spi.rs` | ✅ Already shipped; reused for `CString::new` NUL conversion in `execute_simple_query_direct`. |
-| `build_schema_and_encoders(&TupleDescRef)` | derived from `extended/direct.rs` body | ⚠ New shared helper (~40 LoC) in `dest_receiver.rs`. |
-| `ScopedMemoryContext` RAII | — | 🆕 New (~20 LoC). Lives in `executor.rs`. |
-| `parse_and_keep` | derived from `parse_and_classify` | 🆕 New (~50 LoC). Lives in `simple_direct.rs`. |
-| `run_one_direct` | — | 🆕 New (~80 LoC). Lives in `simple_direct.rs`. |
-| `execute_simple_query_direct` | — | 🆕 New (~30 LoC). Lives in `simple_direct.rs`. |
-| GUC dispatch at `SimpleQueryHandler` | — | 🆕 New (~5 LoC). `wire/pgwire_v3.rs`. |
+`xact-control` (`BEGIN`/`COMMIT`/`ROLLBACK`) is **disabled** as a
+`#[pg_test]` because the pg_test framework wraps each test in
+an outer `START TRANSACTION`; running `BEGIN` inside that
+triggers a `WARNING: there is already a transaction in
+progress`, leaks a snapshot reference, and segfaults the test
+backend on commit. Vanilla PG hits the same WARNING path. The
+case is covered in [e2e](../../../crates/e2e/tests/basic.rs) by
+`simple_direct_xact_control_begin_commit` and
+`simple_direct_xact_control_rollback`, which speak to a real
+connection with no outer xact.
 
-**New code estimate:** ~150–200 LoC (the simple_direct.rs module +
-`ScopedMemoryContext` + tests). **Lifted/refactored:** ~100 LoC
-moved from `extended/direct.rs` to `dest_receiver.rs`
-(`WireDestReceiver` + `as_dest_receiver` + `ColumnEncoder` +
-`wire_receive_slot` + `command_tag_name` +
-`build_schema_and_encoders`).
+End-to-end coverage in [`crates/e2e/tests/basic.rs`](../../../crates/e2e/tests/basic.rs)
+runs the dual-backend cases against the live wire layer (8
+tests, `simple_direct_*` prefix): SELECT round-trip,
+multi-column, multi-statement, BEGIN/COMMIT, BEGIN/ROLLBACK,
+syntax error recovery, division-by-zero recovery, SET +
+read-back.
 
-**SPI bridge is *not* removed by this work.** Both backends ship
-side-by-side; `execute_simple_query` (SPI) remains the default
-route and stays maintained. Any future deprecation of the SPI
-bridge is out of scope and would need its own design pass.
+`just check` runs both pgrx and e2e suites.
 
-## 8. Test plan
+## 7. References
 
-### 8.1 Black-box: existing e2e tests against both backends
-
-[crates/e2e/tests/basic.rs](../../../crates/e2e/tests/basic.rs)
-already drives 31 scenarios via `psql` + tokio-postgres. The
-suite covers simple-query and extended-query paths against a real
-TCP socket. Plan:
-
-1. Add a test-helper that runs the entire suite twice: once with
-   default GUC (`spi`) and once with `SET pg_transport.execution_backend
-   = 'direct'` injected at session start.
-2. Both runs must pass. Tests that legitimately diverge (none
-   expected) get `#[cfg(...)]` gates with a documented reason.
-
-### 8.2 Unit tests in `simple_direct.rs`
-
-Mirror the existing `parse_and_classify` tests
-([crates/core/src/backend/spi_bridge.rs](../../../crates/core/src/backend/spi_bridge.rs#L475)):
-
-- Empty / whitespace-only / comment-only query → no statements.
-- Multi-statement split: `SELECT 1; SELECT 2` → 2 statements with
-  correct text slices.
-- Syntax error: `SELECTT 1` → `PgWireError::ParserError`.
-- Utility statement: `SET pg_transport.execution_backend = 'spi'`
-  → executes via `PortalRun` → `ProcessUtility`, no row output,
-  `OK` command tag.
-- Xact-control: `BEGIN; SELECT 1; COMMIT` → 3 statements, all via
-  `PortalRun`, no special xact intercept needed.
-
-### 8.3 Performance baseline
-
-Run `just pgbench pg18 select 15 8` with `execution_backend=direct`
-and verify the gap to vanilla closes from 0.94× to within ±2 pp.
-Expected outcome: 0.97×–1.00× on `select`, ≥ 1.00× on `nupdate`,
-unchanged or slightly better on `tpcb`. Custom bench numbers
-unchanged.
-
-### 8.4 Memory-leak soak
-
-A `pgbench select` run for 5 minutes should show flat RSS on the
-slot bgworker process. Any leak in the per-statement context
-plumbing surfaces here.
-
-## 9. Migration / rollout
-
-1. Land `simple_direct.rs` + GUC dispatch + tests. Default GUC
-   stays `spi`. Soak window starts.
-2. Operators canary `direct` per session / per role; report bugs.
-3. After soak passes, flip default to `direct`.
-
-Both backends remain available indefinitely after step 3 —
-this doc explicitly does **not** propose removing the SPI bridge.
-Operators who hit a direct-path regression can `SET
-pg_transport.execution_backend = 'spi'` per session/role to fall
-back. Whether/when to deprecate SPI is a separate decision out
-of scope here.
-
-Mirrors the rollout shape sketched in
-[planner-executor-direct-path.md §7.5](planner-executor-direct-path.md#75-coexistence-during-migration--runtime-guc),
-minus that doc's Stage-C removal step.
-
-## 10. Expected perf impact
-
-Decomposition of the 4–6 pp gap on `pgbench select` against vanilla
-PG (per the §1 analysis):
-
-| Removed overhead | Estimated pp gain on `pgbench select` |
-|---|---|
-| Second parse pass (today's `SPI_execute` re-parses) | ~1.5 pp |
-| `SPI_tuptable` heap-tuple materialisation | ~1.5 pp |
-| `SPI_connect`/`SPI_finish` bracket overhead | <1 pp |
-| Xact-intercept branch removed | <0.5 pp |
-
-Sum: ~4 pp. Closes the 4–6 pp gap entirely or leaves ≤2 pp residual
-(the irreducible tokio/pgwire async-framing cost on small queries,
-shared by both backends).
-
-`pgbench tpcb` (6 statements per `'Q'`) should gain proportionally
-more in absolute terms but proportionally less per statement —
-already at 1.07× vanilla, so ceiling-bound by the executor work
-itself.
-
-Custom bench numbers: **no change**. The custom bench exercises
-extended-query, which already uses the direct backend.
-
-## 11. Open questions
-
-> Q2 / Q3 / Q4 are **"verify at landing"** items, not design
-> blockers. Tag them in the landing PR description so reviewers
-> can confirm before merge.
-
-- **Q1.** Should `pg_transport.execution_backend = 'spi'` keep
-  routing simple-query through the existing SPI path indefinitely?
-  **This doc's answer: yes, indefinitely.** SPI stays as a
-  supported backend; no deprecation horizon is proposed here.
-  Any future change to that policy belongs in a separate design.
-- **Q2 (verify at landing).** Multi-statement `'Q'` with mixed
-  utility + DML (e.g. `SET x = 1; SELECT current_setting('x')`)
-  needs an extra `CommandCounterIncrement` between statements?
-  PG's `exec_simple_query` calls `CommandCounterIncrement`
-  between statements implicitly via xact state transitions;
-  `Portal*` inherits this. Confirm via the dedicated e2e test
-  (§8.1) before flipping the GUC default.
-- **Q3 (verify at landing).** Should `run_one_direct` thread
-  parse-error reporting through `caught_error_to_pgwire` the same
-  way `with_spi` does, or use a thinner wrapper?
-  `pg_analyze_and_rewrite_fixedparams` raises PG ERRORs via
-  `ereport`, same machinery, so the existing `with_xact`
-  `PgTryBuilder` catch should already cover it. Confirm during
-  implementation by deliberately triggering an analyze-time
-  error (`SELECT * FROM nonexistent`) and asserting wire shape.
-- **Q4 (verify at landing).** Does the parse `MemoryContext`
-  need to be a *child* of the per-statement working context, or a
-  *parent*? §6.1 picks parent (parsetree outlives each
-  statement's analyze/plan ctx); verify there's no PG-internal
-  call that walks up the context parent chain and trips on a
-  parse-ctx-owned `RawStmt` after a statement's working context
-  is gone. The memory-leak soak (§8.4) plus a deliberate
-  3-statement query exercising parsetree references should catch
-  any bug.
-
-## 12. References
-
-- [Parent: planner-executor-direct-path.md](planner-executor-direct-path.md) — strategic SPI-vs-direct trade space; this doc is its Stage B implementation plan.
-- [backend-wire.md §6](../backend-wire.md#6-spi-bridge) — SPI bridge architecture.
-- [performance.md §2](../performance.md#2-latest-stable-numbers-2026-05-21) — pgbench numbers that motivate this work.
+- Parent: [planner-executor-direct-path.md](planner-executor-direct-path.md) — strategic SPI-vs-direct trade space and the survey of what's callable from `postgres.c`.
+- [backend-wire.md §6](../backend-wire.md#6-spi-bridge) — SPI bridge architecture (the default backend).
+- [performance.md](../performance.md) — bench-driven motivation and current numbers.
 - [configuration.md](../configuration.md#26) — `pg_transport.execution_backend` GUC docs.
-- [crates/core/src/backend/spi_bridge.rs](../../../crates/core/src/backend/spi_bridge.rs) — current simple-query impl.
-- [crates/core/src/backend/executor.rs](../../../crates/core/src/backend/executor.rs) — `with_xact`, `XactCtx`, `Portal`, `CachedPlanSource`, `CachedPlan`, `ParamList`, `TupleDescRef`. Already shipped; the simple-query direct path consumes this.
-- [crates/core/src/backend/extended/direct.rs](../../../crates/core/src/backend/extended/direct.rs) — extended-query direct impl (`WireDestReceiver` / `ColumnEncoder` reuse source).
-- [crates/core/src/backend/spi.rs](../../../crates/core/src/backend/spi.rs) — `with_spi`, `caught_error_to_pgwire`, `TypeOutput`/`TypeSend`, the per-handoff state reset.
-- PG source: [`src/backend/tcop/postgres.c::exec_simple_query`](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/tcop/postgres.c) — the shape we're approximating.
-- PG source: [`src/backend/parser/analyze.c::pg_analyze_and_rewrite_fixedparams`](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/parser/analyze.c).
+- [`crates/core/src/backend/spi_bridge.rs`](../../../crates/core/src/backend/spi_bridge.rs) — the SPI backend (`execute_simple_query`); kept maintained side-by-side.
+- PG source: [`src/backend/tcop/postgres.c::exec_simple_query`](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/tcop/postgres.c) — the vanilla shape the direct path mirrors.
 - PG source: [`src/backend/tcop/pquery.c`](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/tcop/pquery.c) — `PortalRun`, the routing into `ProcessUtility` for utility statements.
+- PG source: [`src/backend/parser/analyze.c::pg_analyze_and_rewrite_fixedparams`](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/parser/analyze.c).

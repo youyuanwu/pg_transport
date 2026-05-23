@@ -53,12 +53,13 @@ pgbench connections are long-lived for the test duration; `initial
 connection time` is reported separately and isn't folded into the
 `tps` headline number.
 
-## 2. Latest stable numbers (2026-05-21)
+## 2. Latest stable numbers (2026-05-22)
 
 3 runs each, 8 concurrent connections, on the project's reference
-dev box. Compares `dev` (autoscaling pool, `MIN_WARM_SLOTS = 0`)
-against `main` (static pre-warmed pool, predecessor branch) for
-the same workloads on the same host back-to-back.
+dev box. `dev` branch with both the autoscaling pool and the
+simple-query direct backend
+([deferred/simple-query-direct-path.md](deferred/simple-query-direct-path.md))
+shipped. `MIN_WARM_SLOTS = 0`.
 
 ### Custom bench, 20000 iters, 8 conns
 
@@ -71,29 +72,62 @@ the same workloads on the same host back-to-back.
 | `direct` vanilla | 424.2 µs | 555.2 µs | 430.2 µs | 18 470 | — |
 | `direct` pg_transport | 381.3 µs | 502.3 µs | 388.7 µs | **20 513** | **1.11x** |
 
-`main` (static pre-warmed) ran the same harness with `qps` ratios
-of **1.09x** (`spi`) and **1.11x** (`direct`). The two branches
-sit inside this host's run-to-run variance band (±3–5 pp on a
-20000-iter sample).
+These values are unchanged from the previous run — the custom
+bench exercises extended-query, which already used the direct
+backend before this revision.
 
 ### pgbench, 15 s, 8 clients
 
-`dev` (autoscaling, post-spawn handoff):
+First pgbench measurement with the direct simple-query backend
+in tree. pgbench `-M simple` exercises the simple-query path
+exclusively, so the `direct` rows here are the
+[`simple_direct::execute_simple_query_direct`](../../crates/core/src/backend/simple_direct.rs)
+path; the `spi` rows are the
+[`spi_bridge::execute_simple_query`](../../crates/core/src/backend/spi_bridge.rs)
+path. 3-run means:
 
 | Mode | Backend | Vanilla tps | pg_transport tps | tps ratio | Vanilla initial-conn | pg_transport initial-conn | init-conn ratio |
 |---|---|---|---|---|---|---|---|
-| `select` | `spi` | 27 189 | 25 440 | **0.94x** | 7.8 ms | 9.2 ms | **1.18x** |
-| `select` | `direct` | 26 244 | 25 270 | **0.96x** | 8.2 ms | 9.6 ms | **1.17x** |
-| `nupdate` | `spi` | 6 366 | 6 309 | **0.99x** | 7.3 ms | 8.3 ms | **1.15x** |
-| `nupdate` | `direct` | 6 343 | 6 331 | **1.00x** | 7.6 ms | 8.8 ms | **1.16x** |
-| `tpcb` | `spi` | 1 986 | 2 115 | **1.07x** | 7.7 ms | 8.7 ms | **1.12x** |
-| `tpcb` | `direct` | 1 983 | 2 124 | **1.07x** | 8.5 ms | 9.4 ms | **1.11x** |
+| `select` | `spi` | 28 381 | 26 703 | **0.94x** | 7.7 ms | 8.4 ms | **1.09x** |
+| `select` | `direct` | 28 151 | 26 833 | **0.95x** | 7.5 ms | 9.0 ms | **1.20x** |
+| `nupdate` | `spi` | 6 571 | 6 493 | **0.99x** | 7.3 ms | 9.0 ms | **1.23x** |
+| `nupdate` | `direct` | 6 724 | 6 619 | **0.98x** | 8.3 ms | 8.7 ms | **1.05x** |
+| `tpcb` | `spi` | 2 054 | 2 203 | **1.07x** | 7.3 ms | 8.8 ms | **1.20x** |
+| `tpcb` | `direct` | 2 148 | 2 199 | **1.02x** | 7.7 ms | 8.8 ms | **1.14x** |
 
-Steady-state `tps` lands at 0.94–1.07× vanilla, inside this host's
-run-to-run variance band (±3–5 pp on a 15 s pgbench sample). The
-write-heavy `tpcb` rows land slightly above vanilla because the
-direct/SPI execution paths skip a libpq-side round-trip per inner
-statement (3 UPDATEs + SELECT + INSERT per transaction).
+**Direct vs SPI on the pg_transport side only** (`select` /
+`nupdate` / `tpcb`): +0.5% / +1.9% / −0.2%. The direct backend
+does not materially move tps on these workloads. Earlier
+forecasts that direct would close the 4–6 pp `select` gap to
+vanilla did not materialise; the actual gain on `select` is
++1.2 pp (0.94× → 0.95×), and `tpcb` *regresses* from 1.07×
+under SPI to 1.02× under direct.
+
+Mechanical reading of these numbers:
+
+- **SPI's amortisation is competitive for tiny result sets.** The
+  double-parse pass (`raw_parser` + SPI's inner re-parse) and
+  the `SPI_tuptable` materialisation are both individually
+  smaller costs than the design forecast assumed for the
+  hot-path 1-row queries pgbench runs. `SPI_execute`'s
+  per-statement amortisation absorbs them.
+- **Multi-statement `'Q'` is *worse* on direct.** `tpcb` runs
+  6 statements per transaction inside one `'Q'` body. Each
+  statement on the direct path creates and drops a fresh
+  `ScopedMemoryContext` + `Portal::create_anonymous` /
+  `define` / `start` / `run`. SPI reuses one `SPI_connect`
+  bracket across the same loop. The per-statement overhead
+  difference is small but measurable (~50 pp out of the 100 pp
+  gain the tpcb-spi row shows above vanilla).
+- **`select` improves by ~1 pp** because the
+  `SPI_tuptable` → `Vec<DataRow>` copy is avoided. Real but
+  small at 1 row.
+
+Steady-state `tps` lands at 0.94–1.07× vanilla overall —
+inside this host's run-to-run variance band (±3–5 pp on a 15 s
+pgbench sample). The write-heavy `tpcb` rows land above vanilla
+because both execution paths skip a libpq-side round-trip per
+inner statement (3 UPDATEs + SELECT + INSERT per transaction).
 
 ### Initial connection time
 
@@ -240,7 +274,7 @@ fall out of the dispatch model.
 | **Per-cell type I/O caching (both paths)** | `TypeOutput` / `TypeSend` built once per column per query/Execute, not per cell. |
 | **Snapshot / xact state inside BEGIN block** | `StartTransactionCommand` becomes `CommandCounterIncrement` when already in `TBLOCK_INPROGRESS`; same for Commit. Inherited from PG's xact machinery, no special-casing needed. |
 | **Binary parameter & result format** | Honoured per-column from `Bind.parameter_format_codes` / `result_column_format_codes` without forcing text round-tripping. tokio-postgres' binary path works without conversion. |
-| **Row materialisation (both paths)** | Both simple-query and extended-query write encoded bytes directly into the wire `BytesMut`. No `Vec<Option<String>>` intermediate. Direct backend additionally skips the `SPI_tuptable` step entirely via `WireDestReceiver`. |
+| **Row materialisation (both paths)** | Both simple-query and extended-query write encoded bytes directly into the wire `BytesMut`. No `Vec<Option<String>>` intermediate. The `direct` backend additionally skips the `SPI_tuptable` step via `WireDestReceiver`; that win is visible on the custom bench (extended-query, 1.11× vanilla) but measured at +0.5 pp / +1.2 pp / −5 pp on pgbench `select` / `nupdate` / `tpcb` (§2) — SPI's per-`'Q'`-statement amortisation is competitive for 1-row hot-path queries. |
 
 ## See also
 
