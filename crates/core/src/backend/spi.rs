@@ -411,9 +411,9 @@ pub fn plan_result_columns(plan: pg_sys::SPIPlanPtr) -> Option<Vec<PlanColumn>> 
     let out = tupdesc
         .iter()
         .map(|attr| {
-            let name = unsafe { CStr::from_ptr(attr.attname.data.as_ptr()) }
-                .to_string_lossy()
-                .into_owned();
+            // SAFETY: attname is a PG NameData buffer containing
+            // an ASCII identifier.
+            let name = unsafe { super::executor::pg_ident_to_string(attr.attname.data.as_ptr()) };
             PlanColumn {
                 name,
                 type_oid: attr.atttypid,

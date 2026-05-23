@@ -79,10 +79,14 @@ pub(crate) struct SpiBackendPlan {
     param_oids: Vec<pg_sys::Oid>,
     /// Per-result-column type OIDs (echoes [`super::PreparedStatement::result_schema`]).
     column_oids: Vec<pg_sys::Oid>,
-    /// Result-column schema (echoes [`super::PreparedStatement::result_schema`]).
-    /// Kept here too so the per-execute response builder can wrap
-    /// it in an Arc without re-walking the statement.
-    base_schema: Vec<FieldInfo>,
+    /// Result-column schema with every column's [`FieldFormat`]
+    /// set to `Text`. `Arc`-wrapped so the common case
+    /// ([`Format::UnifiedText`]) on Execute is a refcount bump
+    /// instead of a fresh `Vec<FieldInfo>` + per-column `String`
+    /// allocation. Non-text (Individual / UnifiedBinary) Bind
+    /// requests rebuild a per-Execute `Vec<FieldInfo>` from this
+    /// one, paying the same cost as before.
+    base_schema: Arc<Vec<FieldInfo>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -262,7 +266,7 @@ pub fn prepare(sql: &str, param_hints: &[Option<u32>]) -> PgWireResult<super::Pr
             plan,
             param_oids,
             column_oids,
-            base_schema: result_schema.clone(),
+            base_schema: Arc::new(result_schema.clone()),
         };
 
         Ok(super::PreparedStatement {
@@ -326,24 +330,33 @@ fn execute_impl(
     let ncols = base_schema.len();
     let result_format_per_col: Vec<FieldFormat> =
         (0..ncols).map(|i| result_format.format_for(i)).collect();
-    // Schema we hand back to pgwire — each FieldInfo carries the
-    // requested per-column format so a follow-up Describe(Portal)
-    // would report the same codes the client asked for. Cheap to
-    // rebuild because base_schema is small (one entry per result
-    // column).
-    let schema_vec: Vec<FieldInfo> = base_schema
-        .iter()
-        .zip(result_format_per_col.iter())
-        .map(|(fi, fmt)| {
-            FieldInfo::new(
-                fi.name().to_string(),
-                fi.table_id(),
-                fi.column_id(),
-                fi.datatype().clone(),
-                *fmt,
-            )
-        })
-        .collect();
+    // Fast path: when the client asked for all-text results (the
+    // pgwire `Format::UnifiedText` default and the common case for
+    // pgbench / tokio-postgres), we ship the cached text-format
+    // `Arc<Vec<FieldInfo>>` straight through. Per Execute the cost
+    // collapses to one `Arc::clone` (atomic increment) instead of
+    // `ncols` `String` allocations + a fresh `Vec<FieldInfo>` +
+    // `Arc::new`.
+    let schema_arc: Arc<Vec<FieldInfo>> = if matches!(result_format, Format::UnifiedText) {
+        Arc::clone(base_schema)
+    } else {
+        // Slow path: rebuild per-column with the requested
+        // format codes. Same cost as before.
+        let rebuilt: Vec<FieldInfo> = base_schema
+            .iter()
+            .zip(result_format_per_col.iter())
+            .map(|(fi, fmt)| {
+                FieldInfo::new(
+                    fi.name().to_string(),
+                    fi.table_id(),
+                    fi.column_id(),
+                    fi.datatype().clone(),
+                    *fmt,
+                )
+            })
+            .collect();
+        Arc::new(rebuilt)
+    };
     let column_oids = &backend.column_oids;
     let param_oids = &backend.param_oids;
     let param_bytes: Vec<Option<Bytes>> = parameters.to_vec();
@@ -418,7 +431,6 @@ fn execute_impl(
         }
 
         let tag_name = command_tag_from_rc(exec_rc);
-        let schema_arc = Arc::new(schema_vec);
         let row_stream = stream::iter(data_rows).map(Ok);
         let mut response = QueryResponse::new(schema_arc, row_stream);
         response.set_command_tag(&tag_name);

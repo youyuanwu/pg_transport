@@ -20,7 +20,7 @@
 //! through PG's xact-block API. Resolves Q25 in
 //! [roadmap.md](../../../../docs/design/roadmap.md).
 
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
@@ -403,9 +403,10 @@ fn run_via_spi(ctx: &SpiCtx, query: &str) -> PgWireResult<Vec<Response>> {
         // SAFETY: tupdesc non-null; i is in 0..natts; the returned
         // FormData_pg_attribute lives as long as the tupdesc.
         let attr = unsafe { &*pg_sys::TupleDescAttr(tupdesc, i as i32) };
-        let name = unsafe { CStr::from_ptr(attr.attname.data.as_ptr()) }
-            .to_string_lossy()
-            .into_owned();
+        // SAFETY: attname is a PG NameData buffer containing an
+        // ASCII identifier.
+        let name =
+            unsafe { crate::backend::executor::pg_ident_to_string(attr.attname.data.as_ptr()) };
         let pgwire_type = Type::from_oid(attr.atttypid.to_u32()).unwrap_or(Type::TEXT);
         schema_vec.push(FieldInfo::new(
             name,

@@ -28,7 +28,7 @@ use pgwire::api::Type;
 use pgwire::api::results::{FieldFormat, FieldInfo};
 use pgwire::messages::data::DataRow;
 
-use super::executor::TupleDescRef;
+use super::executor::{TupleDescRef, pg_ident_to_string};
 use super::spi::{TypeOutput, TypeSend};
 
 // ---------------------------------------------------------------------------
@@ -200,9 +200,9 @@ pub(crate) fn command_tag_name(tag: pg_sys::CommandTag::Type) -> String {
     if ptr.is_null() {
         "OK".to_string()
     } else {
-        unsafe { CStr::from_ptr(ptr) }
-            .to_string_lossy()
-            .into_owned()
+        // SAFETY: GetCommandTagName returns a static ASCII C
+        // string (e.g. "SELECT", "INSERT 0 1") or NULL.
+        unsafe { pg_ident_to_string(ptr) }
     }
 }
 
@@ -224,9 +224,9 @@ pub(crate) fn schema_and_encoders_text(
     let mut schema = Vec::with_capacity(n);
     let mut encoders = Vec::with_capacity(n);
     for attr in tupdesc.iter() {
-        let name = unsafe { CStr::from_ptr(attr.attname.data.as_ptr()) }
-            .to_string_lossy()
-            .into_owned();
+        // SAFETY: attr.attname is a PG `NameData` buffer
+        // containing an ASCII identifier (column name).
+        let name = unsafe { pg_ident_to_string(attr.attname.data.as_ptr()) };
         let oid = attr.atttypid;
         schema.push(FieldInfo::new(
             name,

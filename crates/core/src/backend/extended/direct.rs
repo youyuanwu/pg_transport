@@ -42,7 +42,7 @@
 //! Execute) is automatic via `GetCachedPlan` at execute time;
 //! commit 5 will wire that in.
 
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -83,10 +83,14 @@ pub(crate) struct DirectBackendPlan {
     column_oids: Vec<pg_sys::Oid>,
     /// Parse-time command tag reused in `PortalDefineQuery`.
     command_tag: pg_sys::CommandTag::Type,
-    /// Result-column schema (echoes [`super::PreparedStatement::result_schema`]).
-    /// Kept here too so the per-execute response builder can wrap
-    /// it in an Arc without re-walking the source.
-    base_schema: Vec<FieldInfo>,
+    /// Result-column schema with every column's [`FieldFormat`]
+    /// set to `Text`. `Arc`-wrapped so the common case
+    /// ([`Format::UnifiedText`]) on Execute is a refcount bump
+    /// instead of a fresh `Vec<FieldInfo>` + per-column `String`
+    /// allocation. Non-text (Individual / UnifiedBinary) Bind
+    /// requests rebuild a per-Execute `Vec<FieldInfo>` from this
+    /// one, paying the same cost as before.
+    base_schema: Arc<Vec<FieldInfo>>,
     /// Cached CString for `PortalDefineQuery` — avoids a heap
     /// alloc per Execute.
     portal_src_text: CString,
@@ -136,19 +140,34 @@ fn execute_impl(
     let ncols = base_schema.len();
     let result_format_per_col: Vec<FieldFormat> =
         (0..ncols).map(|i| result_format.format_for(i)).collect();
-    let schema_vec: Vec<FieldInfo> = base_schema
-        .iter()
-        .zip(result_format_per_col.iter())
-        .map(|(fi, fmt)| {
-            FieldInfo::new(
-                fi.name().to_string(),
-                fi.table_id(),
-                fi.column_id(),
-                fi.datatype().clone(),
-                *fmt,
-            )
-        })
-        .collect();
+    // Fast path: when the client asked for all-text results (the
+    // pgwire `Format::UnifiedText` default and the common case for
+    // pgbench / tokio-postgres), we can ship the cached
+    // text-format `Arc<Vec<FieldInfo>>` straight through. Per
+    // Bind the cost collapses to one `Arc::clone` (atomic
+    // increment) instead of `ncols` `String` allocations + a
+    // fresh `Vec<FieldInfo>` + `Arc::new`.
+    let schema_arc: Arc<Vec<FieldInfo>> = if matches!(result_format, Format::UnifiedText) {
+        Arc::clone(base_schema)
+    } else {
+        // Slow path: rebuild per-column with the requested
+        // format codes. Pays N `String::clone` + 1 `Vec` alloc +
+        // 1 `Arc::new`, same as before.
+        let rebuilt: Vec<FieldInfo> = base_schema
+            .iter()
+            .zip(result_format_per_col.iter())
+            .map(|(fi, fmt)| {
+                FieldInfo::new(
+                    fi.name().to_string(),
+                    fi.table_id(),
+                    fi.column_id(),
+                    fi.datatype().clone(),
+                    *fmt,
+                )
+            })
+            .collect();
+        Arc::new(rebuilt)
+    };
 
     let param_bytes: Vec<Option<Bytes>> = parameters.to_vec();
     let param_is_binary: Vec<bool> = (0..parameters.len())
@@ -221,7 +240,6 @@ fn execute_impl(
         }
 
         let tag_name = command_tag_name(qc.commandTag);
-        let schema_arc = Arc::new(schema_vec);
         let row_stream = stream::iter(data_rows).map(Ok);
         let mut response = QueryResponse::new(schema_arc, row_stream);
         response.set_command_tag(&tag_name);
@@ -404,19 +422,27 @@ pub fn prepare(sql: &str, param_hints: &[Option<u32>]) -> PgWireResult<PreparedS
             .map(|oid| Type::from_oid(oid.to_u32()).unwrap_or(Type::UNKNOWN))
             .collect();
 
+        // Share one Arc-wrapped Vec<FieldInfo> between the
+        // backend plan (per-Execute hot path) and the
+        // PreparedStatement.result_schema clone used by
+        // Describe (cold). Per-Execute UnifiedText then
+        // `Arc::clone`s this same allocation.
+        let base_schema_arc = Arc::new(base_schema);
+        let result_schema_for_describe = (*base_schema_arc).clone();
+
         let backend_plan = DirectBackendPlan {
             source,
             param_oids: resolved_oids,
             column_oids,
             command_tag,
-            base_schema: base_schema.clone(),
+            base_schema: base_schema_arc,
             portal_src_text: CString::new("direct-path statement").expect("literal has no NUL"),
         };
 
         Ok(PreparedStatement {
             sql: sql_owned,
             param_types,
-            result_schema: base_schema,
+            result_schema: result_schema_for_describe,
             plan: Box::new(backend_plan),
         })
     })
@@ -438,9 +464,10 @@ unsafe fn result_schema_from_source(source: &CachedPlanSource) -> Vec<FieldInfo>
     tupdesc
         .iter()
         .map(|attr| {
-            let name = unsafe { CStr::from_ptr(attr.attname.data.as_ptr()) }
-                .to_string_lossy()
-                .into_owned();
+            // SAFETY: attname is a PG NameData buffer containing
+            // an ASCII identifier.
+            let name =
+                unsafe { super::super::executor::pg_ident_to_string(attr.attname.data.as_ptr()) };
             FieldInfo::new(
                 name,
                 None,

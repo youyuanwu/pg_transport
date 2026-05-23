@@ -432,6 +432,41 @@ impl<'a> ParamList<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// pg_ident_to_string — ASCII-only CStr → String shortcut
+// ---------------------------------------------------------------------------
+
+/// Convert a PG identifier-class NUL-terminated C string to an
+/// owned `String` without paying for UTF-8 validation.
+///
+/// PG enforces ASCII for identifier-class strings at parse time
+/// (table / column / type names, command tags, SPI rc names,
+/// etc.). `CStr::to_string_lossy().into_owned()` re-scans the
+/// bytes to validate UTF-8 every call; for short hot-path names
+/// (e.g. one per result column per `'Q'`) that scan is pure
+/// overhead.
+///
+/// In debug builds the ASCII assumption is checked via
+/// `debug_assert!` so a regression — e.g. PG ever loosening the
+/// identifier-charset rule, or this helper being applied to a
+/// non-identifier C string — surfaces loudly in tests.
+///
+/// # Safety
+///
+/// `ptr` must be a valid pointer to a NUL-terminated C string
+/// whose bytes are ASCII. Identifier-class fields from
+/// `Form_pg_attribute`, `GetCommandTagName`,
+/// `SPI_result_code_string`, etc. all satisfy this.
+pub(crate) unsafe fn pg_ident_to_string(ptr: *const std::ffi::c_char) -> String {
+    let bytes = unsafe { CStr::from_ptr(ptr) }.to_bytes();
+    debug_assert!(
+        bytes.is_ascii(),
+        "expected ASCII PG identifier, got {bytes:?}"
+    );
+    // SAFETY: ASCII is valid UTF-8.
+    unsafe { std::str::from_utf8_unchecked(bytes) }.to_owned()
+}
+
+// ---------------------------------------------------------------------------
 // TupleDescRef — borrowed TupleDesc accessor
 // ---------------------------------------------------------------------------
 
@@ -497,11 +532,10 @@ impl<'a> TupleDescRef<'a> {
 
     /// Column name for attribute `i` (0-based).
     pub fn col_name(&self, i: usize) -> Option<String> {
-        self.get(i).map(|attr| {
-            unsafe { CStr::from_ptr(attr.attname.data.as_ptr()) }
-                .to_string_lossy()
-                .into_owned()
-        })
+        self.get(i)
+            // SAFETY: attname is a PG NameData buffer containing
+            // an ASCII identifier.
+            .map(|attr| unsafe { pg_ident_to_string(attr.attname.data.as_ptr()) })
     }
 
     /// Column type OID for attribute `i` (0-based).
