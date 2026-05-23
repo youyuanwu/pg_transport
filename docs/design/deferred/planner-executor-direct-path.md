@@ -6,7 +6,10 @@
 > **Status: Stage B shipped (extended-query).** The direct backend
 > uses `CachedPlanSource` + `Portal` + a custom `WireDestReceiver`
 > whose `receiveSlot` encodes DataRows inline during `PortalRun`.
-> Simple-query still routes through SPI (Stage B scope in §7).
+> Simple-query still routes through SPI; the concrete plan for
+> bringing it onto the same path lives in
+> [simple-query-direct-path.md](simple-query-direct-path.md)
+> (Stage B of §7).
 >
 > v0 ships with both SPI and direct backends, selectable via
 > `pg_transport.execution_backend` GUC. Current bench: direct at
@@ -315,14 +318,18 @@ next:
    eliminating the second analyze pass too. **~150 LOC new unsafe;
    removes ~50 LOC SPI-specific code.**
 
-2. **Stage B — simple-query direct path (Strategy 1).** Apply the
-   same pattern to [`spi_bridge.rs`](../../../crates/core/src/backend/spi_bridge.rs).
-   Reuses the tuplestore + portal-lifecycle wrappers from Stage A.
-   **Removes** `handle_xact_control`, `XactCmd`, `command_tag_from_rc`,
-   and `parse_and_classify`'s classification logic (still needs the
-   per-statement span list, just not the `TransactionStmt` detection).
-   **~80 LOC new unsafe; removes ~200 LOC SPI-specific code.** Net
-   code reduction.
+2. **Stage B — simple-query direct path.** Apply the
+   `WireDestReceiver` pattern (Strategy 2, not the original
+   Strategy 1 tuplestore) to [`spi_bridge.rs`](../../../crates/core/src/backend/spi_bridge.rs).
+   Reuses the receiver, encoder cache, and portal-lifecycle
+   wrappers from the extended-query direct path. **Removes**
+   `handle_xact_control`, `XactCmd`, `command_tag_from_rc`, and
+   `parse_and_classify`'s classification logic (still needs the
+   per-statement span list, just not the `TransactionStmt`
+   detection — `PortalRun` → `ProcessUtility` handles it).
+   Concrete design + function shapes + memory-context strategy
+   live in [simple-query-direct-path.md](simple-query-direct-path.md).
+   **~250 LoC new; removes ~400 LoC at Stage C sunset.**
 
 3. **Stage C — `spi.rs` cleanup.** Rename to `pg.rs` or `executor.rs`;
    `SpiPlan` → `CachedPlan`; `with_spi` becomes `with_xact` (the
