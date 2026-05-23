@@ -58,7 +58,6 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use bytes::Bytes;
 use pgrx::pg_sys;
 use pgrx::pg_sys::panic::{CaughtError, ErrorReportWithLevel};
-use pgrx::varlena;
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 // ---------------------------------------------------------------------------
@@ -541,10 +540,11 @@ impl TypeReceive {
     }
 }
 
-/// Bundled `typoutput` OID lookup. [`Self::call`] runs the type's
-/// text-format output function on a `Datum` and returns the
-/// resulting bytes as an owned `Vec<u8>` (freeing the palloc'd
-/// cstring).
+/// Bundled `typoutput` OID lookup. The cached OID is consumed by
+/// [`super::dest_receiver::ColumnEncoder::encode_into`], which
+/// runs the type's text-format output function and writes the
+/// length-prefixed cstring straight into a [`bytes::BytesMut`]
+/// (no intermediate `Vec<u8>` allocation).
 pub struct TypeOutput {
     pub(crate) typoutput: pg_sys::Oid,
 }
@@ -559,25 +559,13 @@ impl TypeOutput {
         }
         Self { typoutput }
     }
-
-    /// Run the type's `typoutput` on `datum` and copy the result.
-    /// The PG-allocated cstring is freed before we return.
-    pub fn call(&self, datum: pg_sys::Datum) -> Vec<u8> {
-        // SAFETY: OidOutputFunctionCall returns a non-null palloc'd
-        // NUL-terminated cstring; we copy + pfree.
-        unsafe {
-            let ptr = pg_sys::OidOutputFunctionCall(self.typoutput, datum);
-            let bytes = CStr::from_ptr(ptr).to_bytes().to_owned();
-            pg_sys::pfree(ptr as *mut _);
-            bytes
-        }
-    }
 }
 
-/// Bundled `typsend` OID lookup. [`Self::call`] runs the type's
-/// binary-format `typsend` function on a `Datum` and returns the
-/// resulting bytes as an owned `Vec<u8>` (freeing the palloc'd
-/// `bytea`).
+/// Bundled `typsend` OID lookup. The cached OID is consumed by
+/// [`super::dest_receiver::ColumnEncoder::encode_into`], which
+/// runs the type's binary-format `typsend` function and writes the
+/// resulting `bytea` payload (header stripped) straight into a
+/// [`bytes::BytesMut`].
 pub struct TypeSend {
     pub(crate) typsend: pg_sys::Oid,
 }
@@ -591,22 +579,6 @@ impl TypeSend {
             pg_sys::getTypeBinaryOutputInfo(oid, &mut typsend, &mut is_varlena);
         }
         Self { typsend }
-    }
-
-    /// Run the type's `typsend` on `datum` and copy the resulting
-    /// `bytea`'s data bytes (header stripped). The PG-allocated
-    /// `bytea` is freed before we return.
-    pub fn call(&self, datum: pg_sys::Datum) -> Vec<u8> {
-        // SAFETY: OidSendFunctionCall returns a non-null palloc'd
-        // bytea (varlena). pgrx::varlena::varlena_to_byte_slice
-        // handles short/long/external headers. We copy out into
-        // an owned Vec before pfree.
-        unsafe {
-            let ptr = pg_sys::OidSendFunctionCall(self.typsend, datum);
-            let bytes = varlena::varlena_to_byte_slice(ptr as *const pg_sys::varlena).to_owned();
-            pg_sys::pfree(ptr as *mut _);
-            bytes
-        }
     }
 }
 

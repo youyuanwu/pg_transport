@@ -57,9 +57,9 @@ use pgwire::api::results::{FieldFormat, FieldInfo, QueryResponse, Response, Tag}
 use pgwire::error::PgWireResult;
 use pgwire::messages::data::DataRow;
 
+use super::super::dest_receiver::ColumnEncoder;
 use super::super::spi::{
-    self, SpiCtx, SpiPlan, SpiTuples, TypeInput, TypeOutput, TypeReceive, TypeSend, generic_error,
-    spi_rc_error, with_spi,
+    self, SpiCtx, SpiPlan, SpiTuples, TypeInput, TypeReceive, generic_error, spi_rc_error, with_spi,
 };
 use super::PreparedPlan;
 
@@ -359,7 +359,6 @@ fn execute_impl(
     };
     let column_oids = &backend.column_oids;
     let param_oids = &backend.param_oids;
-    let param_bytes: Vec<Option<Bytes>> = parameters.to_vec();
     let param_is_binary: Vec<bool> = (0..parameters.len())
         .map(|i| parameter_format.is_binary(i))
         .collect();
@@ -368,7 +367,7 @@ fn execute_impl(
         // Decode params into the SPI-shaped (values, nulls) pair.
         // Per-type input/receive helpers raise PG ERROR on
         // malformed bytes; with_spi catches that.
-        let (mut values, nulls) = decode_parameters(&param_bytes, param_oids, &param_is_binary)?;
+        let (mut values, nulls) = decode_parameters(parameters, param_oids, &param_is_binary)?;
 
         // SAFETY: inside SPI; SPI_execute_plan is the documented
         // executor for SPI_prepare'd plans. Negative rc → error.
@@ -413,18 +412,17 @@ fn execute_impl(
 
         // Materialise rows. SPI tuples die at SPI_finish; we own
         // the resulting Vec<DataRow> which is sent to the client
-        // after we leave the SPI session.
+        // after we leave the SPI session. `encode_into` writes
+        // length-prefixed cells straight into `buf`, avoiding the
+        // per-cell `Vec<u8>` allocation the older `encode` shape
+        // forced.
         let mut data_rows: Vec<DataRow> = Vec::with_capacity(tuples.len());
         for row_idx in 0..tuples.len() {
             let mut buf = BytesMut::with_capacity(64);
             for (c, encoder) in encoders.iter().enumerate() {
                 match tuples.cell(row_idx, c) {
                     None => buf.put_i32(-1),
-                    Some(datum) => {
-                        let bytes = encoder.encode(datum);
-                        buf.put_i32(bytes.len() as i32);
-                        buf.put_slice(&bytes);
-                    }
+                    Some(datum) => encoder.encode_into(datum, &mut buf),
                 }
             }
             data_rows.push(DataRow::new(buf, ncols as i16));
@@ -472,30 +470,6 @@ fn decode_parameters(
         }
     }
     Ok((values, nulls))
-}
-
-/// Per-column result encoder. Holds the cached
-/// (typoutput | typsend) lookup so the row loop just calls
-/// `encoder.encode(datum)` per cell.
-enum ColumnEncoder {
-    Text(TypeOutput),
-    Binary(TypeSend),
-}
-
-impl ColumnEncoder {
-    fn for_column(type_oid: pg_sys::Oid, format: FieldFormat) -> Self {
-        match format {
-            FieldFormat::Text => Self::Text(TypeOutput::for_type(type_oid)),
-            FieldFormat::Binary => Self::Binary(TypeSend::for_type(type_oid)),
-        }
-    }
-
-    fn encode(&self, datum: pg_sys::Datum) -> Vec<u8> {
-        match self {
-            Self::Text(fns) => fns.call(datum),
-            Self::Binary(fns) => fns.call(datum),
-        }
-    }
 }
 
 /// Pick a CommandTag name from the SPI result code. We only handle

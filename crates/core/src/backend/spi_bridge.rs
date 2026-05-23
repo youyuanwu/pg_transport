@@ -34,9 +34,10 @@ use pgwire::api::results::{FieldFormat, FieldInfo, QueryResponse, Response, Tag}
 use pgwire::error::PgWireResult;
 use pgwire::messages::data::DataRow;
 
+use super::dest_receiver::ColumnEncoder;
 use super::spi::{
-    SpiCtx, SpiTuples, TypeOutput, caught_error_to_pgwire, generic_error, panic_to_pgwire,
-    spi_rc_error, with_spi,
+    SpiCtx, SpiTuples, caught_error_to_pgwire, generic_error, panic_to_pgwire, spi_rc_error,
+    with_spi,
 };
 
 /// Run a simple-query string through SPI and shape the result into
@@ -340,16 +341,17 @@ fn handle_xact_control(cmd: XactCmd) -> PgWireResult<Vec<Response>> {
 /// * Returns a `Response::Execution(Tag::new("OK").with_rows(N))`
 ///   for utility / no-RETURNING DML (no result tuples).
 /// * Materialises every result row directly into a per-row
-///   [`BytesMut`] via [`TypeOutput`] (text format only, since the
+///   [`BytesMut`] via [`ColumnEncoder`] (text format only, since the
 ///   simple-query protocol is text-format-by-definition), wraps each
 ///   in a [`DataRow`], and returns `Response::Query` with a
 ///   length-prefixed wire-format-ready stream.
 ///
 /// The encoding shape is symmetric with
-/// [`super::extended`]'s extended-query path: cache `TypeOutput`
-/// once per column (one syscache lookup amortised over all rows
+/// [`super::extended`]'s extended-query path: cache the per-column
+/// encoder once (one syscache lookup amortised over all rows
 /// instead of per cell — folds in performance.md §3.5), then per
-/// cell either write `-1` (NULL marker) or `(len: i32, bytes)`. We
+/// cell either write `-1` (NULL marker) or have `encode_into`
+/// write `(len: i32, bytes)` straight into the per-row buffer. We
 /// deliberately bypass pgwire's `DataRowEncoder` (which is
 /// Rust-value-oriented and would force `Vec<Option<String>>`
 /// re-encoding) — see performance.md §3.2.
@@ -392,13 +394,13 @@ fn run_via_spi(ctx: &SpiCtx, query: &str) -> PgWireResult<Vec<Response>> {
     // returning Some); its tupdesc is valid for the SPI session.
     let tupdesc = unsafe { (*pg_sys::SPI_tuptable).tupdesc };
 
-    // Build the RowDescription schema and the per-column TypeOutput
+    // Build the RowDescription schema and the per-column encoder
     // cache in a single tupdesc walk. Columns with an OID pgwire
     // doesn't recognise fall back to TEXT — harmless because we're
     // emitting text format anyway; the OID is just a parsing hint
     // for the client.
     let mut schema_vec: Vec<FieldInfo> = Vec::with_capacity(ncols);
-    let mut encoders: Vec<TypeOutput> = Vec::with_capacity(ncols);
+    let mut encoders: Vec<ColumnEncoder> = Vec::with_capacity(ncols);
     for i in 0..ncols {
         // SAFETY: tupdesc non-null; i is in 0..natts; the returned
         // FormData_pg_attribute lives as long as the tupdesc.
@@ -415,7 +417,7 @@ fn run_via_spi(ctx: &SpiCtx, query: &str) -> PgWireResult<Vec<Response>> {
             pgwire_type,
             FieldFormat::Text,
         ));
-        encoders.push(TypeOutput::for_type(attr.atttypid));
+        encoders.push(ColumnEncoder::for_column(attr.atttypid, FieldFormat::Text));
     }
 
     // Materialise every row up-front into BytesMut. The SPI tupdesc
@@ -429,11 +431,7 @@ fn run_via_spi(ctx: &SpiCtx, query: &str) -> PgWireResult<Vec<Response>> {
         for (c, enc) in encoders.iter().enumerate() {
             match tuples.cell(row_idx, c) {
                 None => buf.put_i32(-1),
-                Some(datum) => {
-                    let bytes = enc.call(datum);
-                    buf.put_i32(bytes.len() as i32);
-                    buf.put_slice(&bytes);
-                }
+                Some(datum) => enc.encode_into(datum, &mut buf),
             }
         }
         data_rows.push(DataRow::new(buf, ncols as i16));

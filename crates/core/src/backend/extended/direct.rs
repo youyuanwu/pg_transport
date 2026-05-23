@@ -169,14 +169,13 @@ fn execute_impl(
         Arc::new(rebuilt)
     };
 
-    let param_bytes: Vec<Option<Bytes>> = parameters.to_vec();
     let param_is_binary: Vec<bool> = (0..parameters.len())
         .map(|i| parameter_format.is_binary(i))
         .collect();
 
     with_xact(|ctx| -> PgWireResult<Response> {
         let (param_values, param_is_null) =
-            decode_parameters(&param_bytes, &backend.param_oids, &param_is_binary)?;
+            decode_parameters(parameters, &backend.param_oids, &param_is_binary)?;
         // SAFETY: inside with_xact; Datums are palloc'd in this
         // xact's MemoryContext and live until the closure returns.
         let params =
