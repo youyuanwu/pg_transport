@@ -195,14 +195,24 @@ impl ColumnEncoder {
 /// Convert a `CommandTag` enum to its display name. Falls back to
 /// `"OK"` for unknown / null tags (utility statements before
 /// `InitializeQueryCompletion` ran).
-pub(crate) fn command_tag_name(tag: pg_sys::CommandTag::Type) -> String {
+///
+/// Returns a `&'static str` because PG's command-tag table
+/// (`commandTagBuiltinList[]`) is statically allocated for the
+/// lifetime of the backend — see `src/backend/tcop/cmdtag.c`. The
+/// strings are ASCII (e.g. `"SELECT"`, `"INSERT 0 1"`), so
+/// `from_utf8_unchecked` is sound. Caller pays no allocation.
+pub(crate) fn command_tag_name(tag: pg_sys::CommandTag::Type) -> &'static str {
     let ptr = unsafe { pg_sys::GetCommandTagName(tag) };
     if ptr.is_null() {
-        "OK".to_string()
+        "OK"
     } else {
-        // SAFETY: GetCommandTagName returns a static ASCII C
-        // string (e.g. "SELECT", "INSERT 0 1") or NULL.
-        unsafe { pg_ident_to_string(ptr) }
+        // SAFETY: GetCommandTagName returns a pointer into PG's
+        // static commandTagBuiltinList table; lifetime is 'static
+        // and contents are ASCII.
+        unsafe {
+            let bytes = CStr::from_ptr(ptr).to_bytes();
+            std::str::from_utf8_unchecked(bytes)
+        }
     }
 }
 

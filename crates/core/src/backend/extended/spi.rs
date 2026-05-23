@@ -399,7 +399,7 @@ fn execute_impl(
             Some(t) if !base_schema.is_empty() => t,
             _ => {
                 let processed = SpiTuples::processed_rows_without_table(ctx);
-                let tag = Tag::new(&command_tag_from_rc(exec_rc)).with_rows(processed);
+                let tag = Tag::new(command_tag_from_rc(exec_rc)).with_rows(processed);
                 return Ok(Response::Execution(tag));
             }
         };
@@ -431,7 +431,7 @@ fn execute_impl(
         let tag_name = command_tag_from_rc(exec_rc);
         let row_stream = stream::iter(data_rows).map(Ok);
         let mut response = QueryResponse::new(schema_arc, row_stream);
-        response.set_command_tag(&tag_name);
+        response.set_command_tag(tag_name);
         Ok(Response::Query(response))
     })
 }
@@ -474,19 +474,22 @@ fn decode_parameters(
 
 /// Pick a CommandTag name from the SPI result code. We only handle
 /// the common SELECT / INSERT / UPDATE / DELETE / utility-OK cases;
-/// everything else degrades to "OK" which is the same string the
+/// everything else degrades to `"OK"` which is the same string the
 /// simple-query path uses for utility.
-fn command_tag_from_rc(rc: i32) -> String {
+///
+/// Returns a `&'static str` (string literals) so per-Execute pays
+/// no allocation.
+fn command_tag_from_rc(rc: i32) -> &'static str {
     match rc as u32 {
-        pg_sys::SPI_OK_SELECT => "SELECT".to_string(),
-        pg_sys::SPI_OK_INSERT => "INSERT".to_string(),
-        pg_sys::SPI_OK_UPDATE => "UPDATE".to_string(),
-        pg_sys::SPI_OK_DELETE => "DELETE".to_string(),
-        pg_sys::SPI_OK_INSERT_RETURNING => "INSERT".to_string(),
-        pg_sys::SPI_OK_UPDATE_RETURNING => "UPDATE".to_string(),
-        pg_sys::SPI_OK_DELETE_RETURNING => "DELETE".to_string(),
-        pg_sys::SPI_OK_MERGE => "MERGE".to_string(),
-        pg_sys::SPI_OK_UTILITY => "OK".to_string(),
-        _ => "OK".to_string(),
+        pg_sys::SPI_OK_SELECT => "SELECT",
+        pg_sys::SPI_OK_INSERT => "INSERT",
+        pg_sys::SPI_OK_UPDATE => "UPDATE",
+        pg_sys::SPI_OK_DELETE => "DELETE",
+        pg_sys::SPI_OK_INSERT_RETURNING => "INSERT",
+        pg_sys::SPI_OK_UPDATE_RETURNING => "UPDATE",
+        pg_sys::SPI_OK_DELETE_RETURNING => "DELETE",
+        pg_sys::SPI_OK_MERGE => "MERGE",
+        pg_sys::SPI_OK_UTILITY => "OK",
+        _ => "OK",
     }
 }

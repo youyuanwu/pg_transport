@@ -83,6 +83,15 @@ pub(crate) struct DirectBackendPlan {
     column_oids: Vec<pg_sys::Oid>,
     /// Parse-time command tag reused in `PortalDefineQuery`.
     command_tag: pg_sys::CommandTag::Type,
+    /// Pre-resolved display name for [`Self::command_tag`] (e.g.
+    /// `"SELECT"`, `"INSERT"`). Computed once at Parse from
+    /// PG's static `commandTagBuiltinList`, so per-Execute pays
+    /// neither the `GetCommandTagName` FFI nor a `String` alloc.
+    tag_name: &'static str,
+    /// Pre-resolved `command_tag_display_rowcount` flag for
+    /// [`Self::command_tag`]. Same motivation as [`Self::tag_name`]:
+    /// look it up once at Parse, skip the per-Execute FFI.
+    tag_display_rowcount: bool,
     /// Result-column schema with every column's [`FieldFormat`]
     /// set to `Text`. `Arc`-wrapped so the common case
     /// ([`Format::UnifiedText`]) on Execute is a refcount bump
@@ -206,8 +215,19 @@ fn execute_impl(
         };
 
         // WireDestReceiver encodes DataRows inline during
-        // PortalRun — no tuplestore intermediate.
-        let mut data_rows: Vec<DataRow> = Vec::new();
+        // PortalRun — no tuplestore intermediate. Pre-size to the
+        // client-supplied row cap when reasonable (max_rows>0 and
+        // small), else a modest default that skips the
+        // 0→4→8→16 geometric-growth chain `Vec::new` would pay
+        // on any multi-row SELECT.
+        const DATA_ROWS_DEFAULT_CAP: usize = 16;
+        const DATA_ROWS_HINT_CAP: usize = 1024;
+        let cap = if max_rows > 0 && max_rows <= DATA_ROWS_HINT_CAP {
+            max_rows
+        } else {
+            DATA_ROWS_DEFAULT_CAP
+        };
+        let mut data_rows: Vec<DataRow> = Vec::with_capacity(cap);
         let mut wire_recv = WireDestReceiver::new(&encoders, &mut data_rows, ncols as i16);
 
         let mut qc: pg_sys::QueryCompletion = Default::default();
@@ -230,18 +250,16 @@ fn execute_impl(
         };
 
         if ncols == 0 {
-            let tag_name = command_tag_name(qc.commandTag);
-            let mut tag = Tag::new(&tag_name);
-            if unsafe { pg_sys::command_tag_display_rowcount(qc.commandTag) } {
+            let mut tag = Tag::new(backend.tag_name);
+            if backend.tag_display_rowcount {
                 tag = tag.with_rows(qc.nprocessed as usize);
             }
             return Ok(Response::Execution(tag));
         }
 
-        let tag_name = command_tag_name(qc.commandTag);
         let row_stream = stream::iter(data_rows).map(Ok);
         let mut response = QueryResponse::new(schema_arc, row_stream);
-        response.set_command_tag(&tag_name);
+        response.set_command_tag(backend.tag_name);
         Ok(Response::Query(response))
     })
 }
@@ -434,6 +452,14 @@ pub fn prepare(sql: &str, param_hints: &[Option<u32>]) -> PgWireResult<PreparedS
             param_oids: resolved_oids,
             column_oids,
             command_tag,
+            // SAFETY: command_tag was produced by `CreateCommandTag`
+            // on the raw_stmt above; it's a valid enum discriminant
+            // for the PG cmdtag table, so `command_tag_name` returns
+            // a pointer into `commandTagBuiltinList` (static-lifetime
+            // ASCII) and `command_tag_display_rowcount` is a pure
+            // table lookup.
+            tag_name: command_tag_name(command_tag),
+            tag_display_rowcount: unsafe { pg_sys::command_tag_display_rowcount(command_tag) },
             base_schema: base_schema_arc,
             portal_src_text: CString::new("direct-path statement").expect("literal has no NUL"),
         };

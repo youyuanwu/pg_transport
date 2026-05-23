@@ -331,8 +331,11 @@ fn run_one_direct(
 
         // 7. Execute. Per-row encoding happens inside the
         //    receiver's receiveSlot callback, which appends to
-        //    `data_rows`.
-        let mut data_rows: Vec<DataRow> = Vec::new();
+        //    `data_rows`. Pre-size to a modest default so a typical
+        //    multi-row SELECT doesn't pay the 0→4→8→16 geometric
+        //    growth chain `Vec::new` would force.
+        const DATA_ROWS_DEFAULT_CAP: usize = 16;
+        let mut data_rows: Vec<DataRow> = Vec::with_capacity(DATA_ROWS_DEFAULT_CAP);
         let ncols = schema.len() as i16;
         let mut dest = WireDestReceiver::new(&encoders, &mut data_rows, ncols);
         let mut qc: pg_sys::QueryCompletion = Default::default();
@@ -357,7 +360,7 @@ fn run_one_direct(
     //    wire bytes; no SPI_tuptable step.
     let tag_name = command_tag_name(qc.commandTag);
     if schema.is_empty() {
-        let mut tag = Tag::new(&tag_name);
+        let mut tag = Tag::new(tag_name);
         if unsafe { pg_sys::command_tag_display_rowcount(qc.commandTag) } {
             tag = tag.with_rows(qc.nprocessed as usize);
         }
@@ -366,7 +369,7 @@ fn run_one_direct(
         let schema_arc = Arc::new(schema);
         let row_stream = stream::iter(data_rows).map(Ok);
         let mut response = QueryResponse::new(schema_arc, row_stream);
-        response.set_command_tag(&tag_name);
+        response.set_command_tag(tag_name);
         Ok(Response::Query(response))
     }
 }

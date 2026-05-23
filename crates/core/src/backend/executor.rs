@@ -30,7 +30,7 @@
 #![allow(dead_code)]
 
 use std::any::Any;
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -584,17 +584,52 @@ impl Portal {
     /// counter), so `allowDup=false` is safe and catches
     /// genuine bugs.
     ///
+    /// The name is written into a stack `[u8; 32]` buffer and
+    /// passed straight to `CreatePortal` (which copies the bytes
+    /// into the portal's own MemoryContext before returning), so
+    /// per-statement portal creation pays no heap allocation for
+    /// the name — neither `format!` nor `CString::new`.
+    ///
     /// # Safety
     ///
     /// Must be called inside [`with_xact`].
     pub unsafe fn create_anonymous(_ctx: &XactCtx) -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let name = CString::new(format!("pgxport_{id}")).expect("portal name has no NUL");
+
+        // Layout: "pgxport_" (8) + up-to-20 ASCII digits (u64::MAX
+        // is 20 digits) + trailing NUL (1) = 29 bytes max, rounded
+        // up to 32 for alignment.
+        let mut buf = [0u8; 32];
+        buf[..8].copy_from_slice(b"pgxport_");
+        // Write digits least-significant-first into a scratch
+        // buffer, then copy them in MSB-first order into `buf`.
+        let mut digits = [0u8; 20];
+        let mut d = digits.len();
+        if id == 0 {
+            d -= 1;
+            digits[d] = b'0';
+        } else {
+            let mut n = id;
+            while n > 0 {
+                d -= 1;
+                digits[d] = b'0' + (n % 10) as u8;
+                n /= 10;
+            }
+        }
+        let digit_len = digits.len() - d;
+        buf[8..8 + digit_len].copy_from_slice(&digits[d..]);
+        // buf[8 + digit_len] is already 0 from the array init, so
+        // the string is NUL-terminated.
+
         // SAFETY: CreatePortal(name, allowDup=false, dupSilent=true).
-        // dupSilent doesn't matter when allowDup=false (collision
-        // raises ERROR which longjmps out).
-        let raw = unsafe { pg_sys::CreatePortal(name.as_ptr(), false, true) };
+        // The name pointer is read synchronously and copied into
+        // the portal's MemoryContext; our stack buffer doesn't
+        // need to outlive this call. dupSilent doesn't matter
+        // when allowDup=false (collision raises ERROR which
+        // longjmps out).
+        let raw =
+            unsafe { pg_sys::CreatePortal(buf.as_ptr() as *const std::ffi::c_char, false, true) };
         Portal {
             raw,
             _phantom: PhantomData,
