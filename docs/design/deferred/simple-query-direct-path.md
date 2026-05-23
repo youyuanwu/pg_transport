@@ -60,21 +60,19 @@ One pgwire-side copy remains and is intrinsic to the
                               ┌──────────────────────────────────────┐
                               │ for each (text, *mut RawStmt):       │
                               │   with_xact(|ctx|                    │
-                              │     run_one_direct(ctx, &parse_ctx,  │
-                              │                    raw_stmt,         │
-                              │                    text, &sql_cstr)) │
+                              │     run_one_direct(ctx, raw_stmt,    │
+                              │                    &sql_cstr))       │
                               │      ├─ CreateCommandTag             │
-                              │      ├─ child stmt_ctx               │
-                              │      ├─ pg_analyze_and_rewrite_fixed │
-                              │      ├─ pg_plan_queries              │
-                              │      ├─ Portal::create_anonymous     │
-                              │      ├─ Portal::define               │
-                              │      ├─ Portal::start                │
+                              │      ├─ pg_analyze_and_rewrite_fixed │   ← lands in
+                              │      ├─ pg_plan_queries              │     TopTransactionContext
+                              │      ├─ Portal::create_anonymous     │     (created/dropped by
+                              │      ├─ Portal::define               │     with_xact's Start /
+                              │      ├─ Portal::start                │     CommitTransactionCommand)
                               │      ├─ read portal->tupDesc         │
                               │      │   → schema + ColumnEncoder[]  │
                               │      ├─ Portal::run(WireDestReceiver,│
                               │      │              count=FETCH_ALL) │
-                              │      └─ Drop: Portal, stmt_ctx       │
+                              │      └─ Drop: Portal                 │
                               └──────────────────────────────────────┘
                                               │ Vec<Response>
                                               ▼ pgwire encodes Response → wire bytes
@@ -108,23 +106,30 @@ was preserved byte-for-byte; only visibility changed.
 
 ## 4. Memory-context discipline
 
-Three contexts, three lifetimes:
+Two contexts, two lifetimes:
 
 - **Parse context** (`ParsedQuery.parse_ctx`, named
   `pg_transport_parse_ctx`) owns the parsetree list returned by
   `raw_parser`. Created by `parse_and_keep`; deleted when
   `ParsedQuery` drops at the end of
-  `execute_simple_query_direct`. Spans the whole `'Q'` body.
-- **Per-statement working context** (`stmt_ctx`, named
-  `pg_transport_stmt_ctx`) is a child of `parse_ctx`. Created
-  inside `run_one_direct`; everything
-  `pg_analyze_and_rewrite_fixedparams` and `pg_plan_queries`
-  `palloc`s during that call lands here. Deleted at function
-  exit (after `PortalDrop` has copied what it needs onto the
-  portal's own context). Matches what `exec_simple_query` does
-  via `MessageContext` + per-statement reset.
+  `execute_simple_query_direct`. Spans the whole `'Q'` body so
+  the `*mut RawStmt` pointers stay valid across the
+  per-statement `with_xact` loop.
 - **Portal context** (`portal->portalContext`) is owned by PG;
-  `PortalDrop` releases it on `Portal::drop`.
+  `PortalDefineQuery` copies the planned-statement list onto it,
+  and `PortalDrop` releases it on `Portal::drop`. Independent of
+  the parse + transaction contexts.
+
+Per-statement analyze/plan transients land in PG's own
+**`TopTransactionContext`**, which `with_xact`'s
+`StartTransactionCommand` creates and switches
+`CurrentMemoryContext` into for the body of each statement.
+`CommitTransactionCommand` on the way out deletes that context,
+freeing the transients in one shot. `PortalDefineQuery` having
+copied the plan onto the portal's own context means
+`Portal::run` is unaffected by that teardown. This matches
+vanilla `exec_simple_query`'s discipline — no framework-owned
+per-statement context is needed.
 
 The pointer-lifetime invariant: each `*mut pg_sys::RawStmt` in
 `ParsedQuery.statements` is valid for the lifetime of

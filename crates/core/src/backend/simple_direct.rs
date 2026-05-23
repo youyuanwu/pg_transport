@@ -16,14 +16,21 @@
 //!   ├─ parse_and_keep                         (one raw_parser pass)
 //!   │    └─ ParsedQuery { statements, parse_ctx, sql_cstr }
 //!   └─ for each statement:
-//!        with_xact(|ctx| run_one_direct(ctx, &parse_ctx, raw_stmt, &sql_cstr))
+//!        with_xact(|ctx| run_one_direct(ctx, raw_stmt, &sql_cstr))
 //!         ├─ CreateCommandTag(raw_stmt)
-//!         ├─ child ScopedMemoryContext (stmt_ctx) under parse_ctx
-//!         ├─ pg_analyze_and_rewrite_fixedparams
-//!         ├─ pg_plan_queries
+//!         ├─ pg_analyze_and_rewrite_fixedparams  (→ TopTransactionContext)
+//!         ├─ pg_plan_queries                      (→ TopTransactionContext)
 //!         ├─ Portal::create_anonymous → define → start → run(WireDestReceiver)
-//!         └─ Portal drops (PortalDrop), then stmt_ctx drops
+//!         └─ Portal drops (PortalDrop)
 //! ```
+//!
+//! `with_xact`'s `StartTransactionCommand` creates a fresh
+//! `TopTransactionContext` and switches `CurrentMemoryContext`
+//! into it; `CommitTransactionCommand` deletes it. Per-statement
+//! analyze/plan transients land in `TopTransactionContext` and
+//! are freed automatically at end-of-statement. This matches
+//! vanilla `exec_simple_query`'s memory discipline — no
+//! framework-owned per-statement context is needed.
 
 use std::ffi::{CStr, CString};
 use std::panic::AssertUnwindSafe;
@@ -41,9 +48,7 @@ use pgwire::messages::data::DataRow;
 use super::dest_receiver::{
     ColumnEncoder, WireDestReceiver, command_tag_name, schema_and_encoders_text,
 };
-use super::executor::{
-    MemoryContextGuard, ParamList, Portal, ScopedMemoryContext, TupleDescRef, XactCtx, with_xact,
-};
+use super::executor::{ParamList, Portal, ScopedMemoryContext, TupleDescRef, XactCtx, with_xact};
 use super::spi::{caught_error_to_pgwire, generic_error};
 
 // ---------------------------------------------------------------------------
@@ -69,7 +74,12 @@ pub(crate) struct ParsedQuery<'q> {
     /// them (matches PG's `'Q'` semantics).
     pub(crate) statements: Vec<(&'q str, *mut pg_sys::RawStmt)>,
     /// MemoryContext that owns every `RawStmt` in `statements`.
-    /// Drop the `ParsedQuery` to delete it.
+    /// Held purely for its `Drop` side effect: dropping
+    /// `ParsedQuery` deletes the context, freeing the parsetree.
+    /// Per-statement analyze/plan transients land in PG's
+    /// `TopTransactionContext` via [`with_xact`] and don't touch
+    /// this context.
+    #[allow(dead_code)]
     pub(crate) parse_ctx: ScopedMemoryContext,
     /// NUL-terminated copy of the original query string, used by
     /// `pg_analyze_and_rewrite_fixedparams` /
@@ -217,12 +227,11 @@ pub fn execute_simple_query_direct(query: &str) -> PgWireResult<Vec<Response>> {
             continue;
         }
         let raw_stmt = *raw_stmt;
-        // Borrow parse_ctx + sql_cstr for the closure's lifetime;
-        // raw_stmt is alive as long as parse_ctx is, and with_xact
+        // Borrow sql_cstr for the closure's lifetime; raw_stmt
+        // is alive as long as parsed.parse_ctx is, and with_xact
         // runs the closure to completion synchronously.
-        let parse_ctx_ref: &ScopedMemoryContext = &parsed.parse_ctx;
         let sql_cstr_ref: &CStr = parsed.sql_cstr.as_c_str();
-        let resp = with_xact(|ctx| run_one_direct(ctx, parse_ctx_ref, raw_stmt, sql_cstr_ref))?;
+        let resp = with_xact(|ctx| run_one_direct(ctx, raw_stmt, sql_cstr_ref))?;
         responses.push(resp);
     }
     // parsed drops here; parse_ctx deletes the MemoryContext that
@@ -244,15 +253,20 @@ pub fn execute_simple_query_direct(query: &str) -> PgWireResult<Vec<Response>> {
 ///    Rust-side `Vec<DataRow>`; pgwire consumes that vec after
 ///    we return.
 ///
-/// Memory-context discipline: a child of `parse_ctx` named
-/// `pg_transport_stmt_ctx` is created and switched into for the
-/// duration of analyze + plan. `PortalDefineQuery` `palloc`s
-/// what it needs onto the portal's own context; everything else
-/// that landed in `stmt_ctx` is freed when `stmt_ctx` drops at
-/// function exit.
+/// Memory-context discipline: relies on [`with_xact`]'s
+/// `StartTransactionCommand` having switched
+/// `CurrentMemoryContext` to a fresh `TopTransactionContext`.
+/// Everything `pg_analyze_and_rewrite_fixedparams` and
+/// `pg_plan_queries` `palloc` lands there;
+/// `CommitTransactionCommand` (called by `with_xact` on the way
+/// out) deletes the context, freeing those transients without
+/// an explicit per-statement `AllocSetContextCreateInternal` +
+/// `MemoryContextDelete` pair. `PortalDefineQuery` copies what
+/// it needs onto the portal's own independent context, so
+/// `PortalRun` is unaffected by the TopTransactionContext
+/// teardown.
 fn run_one_direct(
     ctx: &XactCtx,
-    parse_ctx: &ScopedMemoryContext,
     raw_stmt: *mut pg_sys::RawStmt,
     sql_cstr: &CStr,
 ) -> PgWireResult<Response> {
@@ -263,22 +277,16 @@ fn run_one_direct(
     // raw_stmt is alive in parse_ctx for the whole call.
     let command_tag = unsafe { pg_sys::CreateCommandTag((*raw_stmt).stmt) };
 
-    // 2. Per-statement working context. Child of parse_ctx so
-    //    nothing palloc'd here leaks into the parse-context
-    //    parent. _guard must stay live for the analyze/plan
-    //    span; dropping it switches CurrentMemoryContext back to
-    //    parse_ctx (= what it was when run_one_direct was
-    //    entered).
-    let stmt_ctx = ScopedMemoryContext::new_child_of(parse_ctx, c"pg_transport_stmt_ctx");
-    let _guard: MemoryContextGuard = stmt_ctx.switch_to();
-
     // Move the unsafe block out of the inner scope so the
     // captured (schema, encoders, qc, data_rows) tuple is owned
     // by safe Rust after PortalDrop ran (Portal drops at end of
     // the unsafe block).
     let (schema, encoders, qc, data_rows) = unsafe {
-        // 3. Analyze + rewrite (no client-side type hints in
-        //    simple-query; pass NULL/0/NULL).
+        // 2. Analyze + rewrite (no client-side type hints in
+        //    simple-query; pass NULL/0/NULL). Output querytree
+        //    list is palloc'd in CurrentMemoryContext =
+        //    TopTransactionContext (set by with_xact's
+        //    StartTransactionCommand).
         let query_list = pg_sys::pg_analyze_and_rewrite_fixedparams(
             raw_stmt,
             sql_cstr.as_ptr(),
@@ -287,7 +295,8 @@ fn run_one_direct(
             std::ptr::null_mut(), // queryEnv
         );
 
-        // 4. Plan. Same call shape as exec_simple_query.
+        // 3. Plan. Same call shape as exec_simple_query. Output
+        //    PlannedStmt list also lands in TopTransactionContext.
         let plan_list = pg_sys::pg_plan_queries(
             query_list,
             sql_cstr.as_ptr(),
@@ -295,13 +304,14 @@ fn run_one_direct(
             std::ptr::null_mut(), // boundParams
         );
 
-        // 5. Portal lifecycle via the existing wrapper. Portal's
-        //    own MemoryContext is independent of stmt_ctx;
-        //    PortalDefineQuery copies what it needs onto it.
+        // 4. Portal lifecycle via the existing wrapper. Portal's
+        //    own MemoryContext is independent of
+        //    TopTransactionContext; PortalDefineQuery copies
+        //    what it needs onto it.
         let portal = Portal::create_anonymous(ctx);
         portal.define(sql_cstr, command_tag, plan_list, std::ptr::null_mut());
 
-        // 6. Start. with_xact already PushActiveSnapshot'd;
+        // 5. Start. with_xact already PushActiveSnapshot'd;
         //    PortalStart records it on the QueryDesc and
         //    populates portal->tupDesc as a side effect (we read
         //    it next). PortalRun later pushes its own active
@@ -310,7 +320,7 @@ fn run_one_direct(
         //    backend).
         portal.start(&ParamList::empty(), 0, pg_sys::GetActiveSnapshot());
 
-        // 7. Schema + per-column encoders from the now-populated
+        // 6. Schema + per-column encoders from the now-populated
         //    portal->tupDesc. NULL tupdesc → utility / no-tuple
         //    statement → empty schema, no encoders.
         let tupdesc = TupleDescRef::from_raw((*portal.as_ptr()).tupDesc);
@@ -319,7 +329,7 @@ fn run_one_direct(
             None => (Vec::new(), Vec::new()),
         };
 
-        // 8. Execute. Per-row encoding happens inside the
+        // 7. Execute. Per-row encoding happens inside the
         //    receiver's receiveSlot callback, which appends to
         //    `data_rows`.
         let mut data_rows: Vec<DataRow> = Vec::new();
@@ -335,18 +345,16 @@ fn run_one_direct(
             &mut qc,
         );
 
-        // 9. portal drops here (PortalDrop on scope exit),
+        // 8. portal drops here (PortalDrop on scope exit),
         //    tearing down executor state and freeing the portal's
         //    MemoryContext. dest also drops; its rows/encoders
         //    borrow ends.
         (schema, encoders, qc, data_rows)
     };
     drop(encoders); // no longer referenced; explicit for clarity
-    drop(_guard); // switch CurrentMemoryContext back to parse_ctx
-    drop(stmt_ctx); // delete the per-stmt context
 
-    // 10. Shape into pgwire Response. data_rows holds encoded
-    //     wire bytes; no SPI_tuptable step.
+    // 9. Shape into pgwire Response. data_rows holds encoded
+    //    wire bytes; no SPI_tuptable step.
     let tag_name = command_tag_name(qc.commandTag);
     if schema.is_empty() {
         let mut tag = Tag::new(&tag_name);

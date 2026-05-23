@@ -72,15 +72,13 @@ shipped. `MIN_WARM_SLOTS = 0`.
 | `direct` vanilla | 424.2 µs | 555.2 µs | 430.2 µs | 18 470 | — |
 | `direct` pg_transport | 381.3 µs | 502.3 µs | 388.7 µs | **20 513** | **1.11x** |
 
-These values are unchanged from the previous run — the custom
-bench exercises extended-query, which already used the direct
-backend before this revision.
+The custom bench exercises extended-query, which has used the
+direct backend since Stage A shipped.
 
 ### pgbench, 15 s, 8 clients
 
-First pgbench measurement with the direct simple-query backend
-in tree. pgbench `-M simple` exercises the simple-query path
-exclusively, so the `direct` rows here are the
+pgbench `-M simple` exercises the simple-query path
+exclusively, so the `direct` rows are the
 [`simple_direct::execute_simple_query_direct`](../../crates/core/src/backend/simple_direct.rs)
 path; the `spi` rows are the
 [`spi_bridge::execute_simple_query`](../../crates/core/src/backend/spi_bridge.rs)
@@ -97,11 +95,11 @@ path. 3-run means:
 
 **Direct vs SPI on the pg_transport side only** (`select` /
 `nupdate` / `tpcb`): +0.5% / +1.9% / −0.2%. The direct backend
-does not materially move tps on these workloads. Earlier
-forecasts that direct would close the 4–6 pp `select` gap to
-vanilla did not materialise; the actual gain on `select` is
-+1.2 pp (0.94× → 0.95×), and `tpcb` *regresses* from 1.07×
-under SPI to 1.02× under direct.
+does not materially move tps on these `'Q'`-protocol workloads;
+at 1-row hot-path result sets, SPI's amortisation of analyze +
+plan + execute into one `SPI_execute` FFI call is competitive
+with the direct path's separate `pg_analyze_and_rewrite_*` +
+`pg_plan_queries` + `Portal*` sequence.
 
 Mechanical reading of these numbers:
 
@@ -134,10 +132,6 @@ Mechanical reading of these numbers:
 - **What both backends pay vs. vanilla `exec_simple_query`** on
   the `'Q'` path is structural to going through pgwire instead
   of libpq:
-  - **Per-statement memory context.** Vanilla resets one
-    `MessageContext` at end-of-`'Q'`; we
-    `AllocSetContextCreateInternal` + `MemoryContextDelete`
-    per statement.
   - **Intermediate `Vec<DataRow>`.** Vanilla's `DestRemote`
     writes directly into libpq's output buffer; direct's
     `WireDestReceiver` fills a `Vec<DataRow>` which pgwire
@@ -164,21 +158,6 @@ Where direct *does* pay off, and pgbench does not exercise it:
 extended-query (custom bench shows 1.11× vanilla), multi-row
 SELECTs (the `Vec<DataRow>` copy avoided per row), and
 binary-format results (no SPI text→binary detour).
-
-> **Note (2026-05-23).** A follow-up pass removed a handful of
-> per-`'Q'` allocations (string-GUC lookup → enum GUC; deduped
-> `CString` of the query body; dropped a per-statement `String`
-> clone in the direct path). A re-run of the same 3×3 pgbench
-> grid the same day showed all ratios drifting +2 to +9 pp,
-> but vanilla absolute tps dropped 10–17% over the same
-> interval (machine under different background load), and the
-> SPI rows — which only received the GUC change — moved by
-> similar amounts to the direct rows. The cleanups save a small
-> fixed number of allocations per `'Q'`; at ~25 000 tps/client
-> that's a sub-percent budget shift, below pgbench's noise
-> floor at 3-run × 15 s. The table above stays as the
-> headline; the cleanups are micro-wins that a profiler would
-> show but pgbench at this sample size cannot.
 
 ### Initial connection time
 
@@ -325,7 +304,7 @@ fall out of the dispatch model.
 | **Per-cell type I/O caching (both paths)** | `TypeOutput` / `TypeSend` built once per column per query/Execute, not per cell. |
 | **Snapshot / xact state inside BEGIN block** | `StartTransactionCommand` becomes `CommandCounterIncrement` when already in `TBLOCK_INPROGRESS`; same for Commit. Inherited from PG's xact machinery, no special-casing needed. |
 | **Binary parameter & result format** | Honoured per-column from `Bind.parameter_format_codes` / `result_column_format_codes` without forcing text round-tripping. tokio-postgres' binary path works without conversion. |
-| **Row materialisation (both paths)** | Both simple-query and extended-query write encoded bytes directly into the wire `BytesMut`. No `Vec<Option<String>>` intermediate. The `direct` backend additionally skips the `SPI_tuptable` step via `WireDestReceiver`; that win is visible on the custom bench (extended-query, 1.11× vanilla) but measured at +0.5% / +1.9% / −0.2% on pgbench `select` / `nupdate` / `tpcb` (§2) — at 1-row hot-path result sets the per-`'Q'` framing overhead (per-statement `AllocSetContextCreateInternal`, intermediate `Vec<DataRow>`, async dispatch) dominates the per-row saving. |
+| **Row materialisation (both paths)** | Both simple-query and extended-query write encoded bytes directly into the wire `BytesMut`. No `Vec<Option<String>>` intermediate. The `direct` backend additionally skips the `SPI_tuptable` step via `WireDestReceiver`; that win is visible on the custom bench (extended-query, 1.11× vanilla) but measured at +0.5% / +1.9% / −0.2% on pgbench `select` / `nupdate` / `tpcb` (§2) — at 1-row hot-path result sets the per-`'Q'` framing overhead (intermediate `Vec<DataRow>`, async dispatch, per-`'Q'` schema construction) dominates the per-row saving. |
 
 ## See also
 

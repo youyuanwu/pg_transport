@@ -73,11 +73,10 @@ pub static TLS_KEY_FILE: GucSetting<Option<CString>> = GucSetting::<Option<CStri
 /// a time via `ALTER ROLE ... SET pg_transport.execution_backend =
 /// 'direct'`. See [deferred/planner-executor-direct-path.md §7.5](../../docs/design/deferred/planner-executor-direct-path.md).
 ///
-/// Registered as an *enum* GUC (not string) so the per-query
-/// accessor [`execution_backend`] is a single cell read — the
-/// previous `GucSetting<Option<CString>>` shape clone'd a fresh
-/// `CString` on every `.get()`, which was a measurable per-`'Q'`
-/// allocation (see [performance.md §2](../../docs/design/performance.md#2-latest-stable-numbers-2026-05-22)).
+/// Registered as an *enum* GUC so the per-query accessor
+/// [`execution_backend`] is a single cell read. PG's enum-GUC
+/// machinery validates `SET` values at parse time, so unknown
+/// strings never reach the accessor.
 pub static EXECUTION_BACKEND: GucSetting<ExecutionBackend> =
     GucSetting::<ExecutionBackend>::new(ExecutionBackend::Spi);
 
