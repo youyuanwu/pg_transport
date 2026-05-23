@@ -652,6 +652,118 @@ impl Drop for Portal {
 }
 
 // ---------------------------------------------------------------------------
+// ScopedMemoryContext — RAII wrapper around AllocSetContextCreate*
+// ---------------------------------------------------------------------------
+
+/// Owned `pg_sys::MemoryContext`. Drops via `MemoryContextDelete`.
+///
+/// Used by the simple-query direct path (see
+/// [deferred/simple-query-direct-path.md §4.1](../../../../docs/design/deferred/simple-query-direct-path.md#41-parse_and_keep))
+/// to keep a raw parsetree alive across multiple per-statement
+/// portals, and per-statement to confine analyze + plan
+/// allocations so they don't leak into the parse context.
+///
+/// `!Send` + `!Sync` via `PhantomData<*const ()>`. PG memory
+/// contexts are per-backend and not safe to cross threads.
+pub struct ScopedMemoryContext {
+    raw: pg_sys::MemoryContext,
+    _phantom: PhantomData<*const ()>,
+}
+
+impl ScopedMemoryContext {
+    /// Create a fresh `AllocSetContext` as a child of `parent`.
+    /// Uses the default min/initial/max sizes
+    /// (`ALLOCSET_DEFAULT_*`).
+    ///
+    /// `name` is shown in `MemoryContextStats` output / EXPLAIN
+    /// memory accounting; pick a stable static string per call
+    /// site.
+    pub fn new_child(parent: pg_sys::MemoryContext, name: &'static CStr) -> Self {
+        // SAFETY: AllocSetContextCreateInternal is the documented
+        // entry point; raises on alloc failure which longjmps
+        // through us.
+        let raw = unsafe {
+            pg_sys::AllocSetContextCreateInternal(
+                parent,
+                name.as_ptr(),
+                pg_sys::ALLOCSET_DEFAULT_MINSIZE as pg_sys::Size,
+                pg_sys::ALLOCSET_DEFAULT_INITSIZE as pg_sys::Size,
+                pg_sys::ALLOCSET_DEFAULT_MAXSIZE as pg_sys::Size,
+            )
+        };
+        ScopedMemoryContext {
+            raw,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Create as a child of the current `CurrentMemoryContext`.
+    /// Convenience wrapper for the common case.
+    pub fn new(name: &'static CStr) -> Self {
+        // SAFETY: CurrentMemoryContext is a TLS-like global.
+        let parent = unsafe { pg_sys::CurrentMemoryContext };
+        Self::new_child(parent, name)
+    }
+
+    /// Create as a child of `parent`'s underlying context.
+    pub fn new_child_of(parent: &ScopedMemoryContext, name: &'static CStr) -> Self {
+        Self::new_child(parent.as_ptr(), name)
+    }
+
+    /// Borrow the raw pointer for FFI pass-through.
+    pub fn as_ptr(&self) -> pg_sys::MemoryContext {
+        self.raw
+    }
+
+    /// Switch `CurrentMemoryContext` to this context for the
+    /// returned guard's lifetime. Dropping the guard restores the
+    /// previous `CurrentMemoryContext`.
+    ///
+    /// **The returned guard must outlive any pallocs you want
+    /// routed into this context.** Use `let _guard = ...` (NOT
+    /// `let _ = ...`, which drops immediately).
+    pub fn switch_to(&self) -> MemoryContextGuard {
+        // SAFETY: MemoryContextSwitchTo returns the previously
+        // active context. We restore it on Drop.
+        let prev = unsafe { pg_sys::MemoryContextSwitchTo(self.raw) };
+        MemoryContextGuard {
+            prev,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl Drop for ScopedMemoryContext {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            // SAFETY: matches AllocSetContextCreateInternal. If
+            // the caller forgot to drop a switch_to guard first
+            // and CurrentMemoryContext is still pointing here,
+            // MemoryContextDelete will refuse via Assert
+            // (ERRORCODE_OUT_OF_MEMORY-ish) — caller bug.
+            unsafe { pg_sys::MemoryContextDelete(self.raw) };
+            self.raw = std::ptr::null_mut();
+        }
+    }
+}
+
+/// RAII guard returned by [`ScopedMemoryContext::switch_to`].
+/// Restores the previously-active `CurrentMemoryContext` on
+/// `Drop`. `!Send` + `!Sync` via `PhantomData<*const ()>`.
+pub struct MemoryContextGuard {
+    prev: pg_sys::MemoryContext,
+    _phantom: PhantomData<*const ()>,
+}
+
+impl Drop for MemoryContextGuard {
+    fn drop(&mut self) {
+        // SAFETY: prev is whatever MemoryContextSwitchTo returned
+        // when we activated; restoring it is symmetric.
+        unsafe { pg_sys::MemoryContextSwitchTo(self.prev) };
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

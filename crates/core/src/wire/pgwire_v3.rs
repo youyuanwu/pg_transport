@@ -471,6 +471,13 @@ impl SimpleQueryHandler for SimpleQuery {
         C::PortalStore: PortalStore,
     {
         pgrx::log!("pgwire-v3 simple query: {query:?}");
-        crate::backend::spi_bridge::execute_simple_query(query)
+        match crate::guc::execution_backend() {
+            crate::guc::ExecutionBackend::Spi => {
+                crate::backend::spi_bridge::execute_simple_query(query)
+            }
+            crate::guc::ExecutionBackend::Direct => {
+                crate::backend::simple_direct::execute_simple_query_direct(query)
+            }
+        }
     }
 }

@@ -9,11 +9,13 @@
 //!
 //! Phase 2 lands the socket plumbing only; the wire layer is phase 4.
 
+pub mod dest_receiver;
 pub mod executor;
 pub mod extended;
 pub mod fd_pass;
 pub mod paths;
 pub mod pool;
+pub mod simple_direct;
 pub mod slot;
 pub mod spi;
 pub mod spi_bridge;

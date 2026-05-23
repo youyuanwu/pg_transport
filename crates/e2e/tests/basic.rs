@@ -799,3 +799,193 @@ async fn extended_query_per_handoff_state_isolation() -> Result<()> {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Simple-query direct backend
+// ---------------------------------------------------------------------------
+//
+// Mirrors the core simple-query tests above against
+// `pg_transport.execution_backend = 'direct'`, exercising the
+// Portal* + WireDestReceiver path landed per
+// [deferred/simple-query-direct-path.md](../../../../docs/design/deferred/simple-query-direct-path.md).
+//
+// The default backend stays `spi`; these tests `SET` per session
+// to opt into direct.
+
+#[tokio::test]
+async fn simple_direct_select_one_roundtrip() -> Result<()> {
+    let c = Cluster::shared().await;
+    let client = c.connect("postgres").await?;
+    client
+        .simple_query("SET pg_transport.execution_backend = 'direct'")
+        .await?;
+    let msgs = client.simple_query("SELECT 1").await?;
+    assert_eq!(first_text_cell(&msgs).as_deref(), Some("1"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn simple_direct_multi_column_select() -> Result<()> {
+    let c = Cluster::shared().await;
+    let client = c.connect("postgres").await?;
+    client
+        .simple_query("SET pg_transport.execution_backend = 'direct'")
+        .await?;
+    let msgs = client
+        .simple_query("SELECT 1+1 AS sum, 'hello' AS greeting")
+        .await?;
+    let row = msgs
+        .iter()
+        .find_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => Some(r),
+            _ => None,
+        })
+        .expect("at least one row");
+    assert_eq!(row.get(0), Some("2"));
+    assert_eq!(row.get(1), Some("hello"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn simple_direct_multi_statement() -> Result<()> {
+    let c = Cluster::shared().await;
+    let client = c.connect("postgres").await?;
+    client
+        .simple_query("SET pg_transport.execution_backend = 'direct'")
+        .await?;
+    let msgs = client.simple_query("SELECT 1; SELECT 2").await?;
+    assert_eq!(text_column(&msgs), vec!["1", "2"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn simple_direct_xact_control_begin_commit() -> Result<()> {
+    // Direct path doesn't need the SPI xact-intercept;
+    // PortalRun routes TransactionStmt through ProcessUtility
+    // natively. Verifies that round-trip works end-to-end.
+    let c = Cluster::shared().await;
+    let client = c.connect("postgres").await?;
+    client
+        .simple_query("SET pg_transport.execution_backend = 'direct'")
+        .await?;
+    let table = "e2e_simple_direct_xact";
+    let _ = client
+        .simple_query(&format!("DROP TABLE IF EXISTS {table}"))
+        .await;
+    client
+        .simple_query(&format!(
+            "BEGIN; \
+             CREATE TABLE {table} (n int); \
+             INSERT INTO {table} VALUES (1), (2), (3); \
+             COMMIT"
+        ))
+        .await?;
+    let msgs = client
+        .simple_query(&format!("SELECT count(*) FROM {table}"))
+        .await?;
+    assert_eq!(first_text_cell(&msgs).as_deref(), Some("3"));
+    client.simple_query(&format!("DROP TABLE {table}")).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn simple_direct_xact_control_rollback() -> Result<()> {
+    let c = Cluster::shared().await;
+    let client = c.connect("postgres").await?;
+    client
+        .simple_query("SET pg_transport.execution_backend = 'direct'")
+        .await?;
+    let table = "e2e_simple_direct_xact_rb";
+    client
+        .simple_query(&format!(
+            "DROP TABLE IF EXISTS {table}; \
+             CREATE TABLE {table} (n int); \
+             INSERT INTO {table} VALUES (1)"
+        ))
+        .await?;
+    client
+        .simple_query(&format!(
+            "BEGIN; INSERT INTO {table} VALUES (2), (3); ROLLBACK"
+        ))
+        .await?;
+    let msgs = client
+        .simple_query(&format!("SELECT count(*) FROM {table}"))
+        .await?;
+    assert_eq!(first_text_cell(&msgs).as_deref(), Some("1"));
+    client.simple_query(&format!("DROP TABLE {table}")).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn simple_direct_syntax_error_surfaces_pg_native_message() -> Result<()> {
+    let c = Cluster::shared().await;
+    let client = c.connect("postgres").await?;
+    client
+        .simple_query("SET pg_transport.execution_backend = 'direct'")
+        .await?;
+    let err = client
+        .simple_query("SELECTT 1")
+        .await
+        .expect_err("syntax error must fail");
+    let db = err
+        .as_db_error()
+        .unwrap_or_else(|| panic!("expected DbError, got {err:?}"));
+    assert!(
+        db.message().contains("syntax error"),
+        "expected PG-native message, got: {}",
+        db.message()
+    );
+    // Connection still usable.
+    let msgs = client.simple_query("SELECT 1").await?;
+    assert_eq!(first_text_cell(&msgs).as_deref(), Some("1"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn simple_direct_division_by_zero_recovers() -> Result<()> {
+    // Execute-time PG ERROR through PortalRun. with_xact's
+    // AbortCurrentTransaction must reset xact state so the next
+    // query on the same connection succeeds.
+    let c = Cluster::shared().await;
+    let client = c.connect("postgres").await?;
+    client
+        .simple_query("SET pg_transport.execution_backend = 'direct'")
+        .await?;
+    let err = client
+        .simple_query("SELECT 1/0")
+        .await
+        .expect_err("division by zero must fail");
+    let db = err
+        .as_db_error()
+        .unwrap_or_else(|| panic!("expected DbError, got {err:?}"));
+    assert!(
+        db.message().contains("division by zero"),
+        "expected PG-native message, got: {}",
+        db.message()
+    );
+    let msgs = client.simple_query("SELECT 99").await?;
+    assert_eq!(first_text_cell(&msgs).as_deref(), Some("99"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn simple_direct_set_and_read_back() -> Result<()> {
+    // Mixed utility + DML in one 'Q': SET sets a GUC; a later
+    // SELECT current_setting reads it. Validates that
+    // CommandCounterIncrement (or equivalent) fires between
+    // statements so the second statement sees the first's
+    // effects. (Spec'd as Q2 in the design doc.)
+    let c = Cluster::shared().await;
+    let client = c.connect("postgres").await?;
+    client
+        .simple_query("SET pg_transport.execution_backend = 'direct'")
+        .await?;
+    let msgs = client
+        .simple_query(
+            "SET LOCAL pg_transport.execution_backend = 'direct'; \
+             SELECT current_setting('pg_transport.execution_backend')",
+        )
+        .await?;
+    assert_eq!(first_text_cell(&msgs).as_deref(), Some("direct"));
+    Ok(())
+}

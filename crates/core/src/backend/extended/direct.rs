@@ -43,10 +43,9 @@
 //! commit 5 will wire that in.
 
 use std::ffi::{CStr, CString};
-use std::marker::PhantomData;
 use std::sync::Arc;
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream;
 use pgrx::pg_sys;
@@ -56,8 +55,9 @@ use pgwire::api::results::{FieldFormat, FieldInfo, QueryResponse, Response, Tag}
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::data::DataRow;
 
+use super::super::dest_receiver::{ColumnEncoder, WireDestReceiver, command_tag_name};
 use super::super::executor::{CachedPlanSource, ParamList, Portal, with_xact};
-use super::super::spi::{TypeInput, TypeOutput, TypeReceive, TypeSend, generic_error};
+use super::super::spi::{TypeInput, TypeReceive, generic_error};
 use super::{PreparedPlan, PreparedStatement};
 
 // ---------------------------------------------------------------------------
@@ -484,169 +484,12 @@ fn decode_parameters(
 }
 
 // ---------------------------------------------------------------------------
-// WireDestReceiver — custom DestReceiver that encodes DataRows
-// inline during PortalRun.
+// WireDestReceiver, ColumnEncoder, command_tag_name lifted to
+// `super::super::dest_receiver` (shared with the simple-query
+// direct backend per
+// [deferred/simple-query-direct-path.md](../../../../../docs/design/deferred/simple-query-direct-path.md)
+// §7 reuse map).
 // ---------------------------------------------------------------------------
-
-/// State passed through the `DestReceiver` vtable callbacks.
-///
-/// `#[repr(C)]` with `base` at offset 0 so the cast from
-/// `*mut DestReceiver` to `*mut WireDestReceiver` is sound —
-/// standard C "inheritance" pattern used by PG's own
-/// `DR_transientrel`, `DR_copy`, etc.
-///
-/// The lifetime `'a` ties this receiver to the borrowed encoder
-/// slice and output `Vec<DataRow>` — the borrow checker prevents
-/// either from being dropped while the receiver exists.
-#[repr(C)]
-struct WireDestReceiver<'a> {
-    /// Must be at offset 0. PG calls through this vtable.
-    base: pg_sys::DestReceiver,
-    /// Per-column encoders (borrowed from the caller's Vec).
-    encoders: *const ColumnEncoder,
-    /// Output rows pushed here by `receiveSlot`.
-    rows: *mut Vec<DataRow>,
-    /// Number of result columns.
-    ncols: i16,
-    /// Ties lifetime to the borrowed encoders + rows.
-    _lifetime: PhantomData<&'a ()>,
-}
-
-impl<'a> WireDestReceiver<'a> {
-    /// Build a `WireDestReceiver` on the stack. The returned
-    /// struct borrows `encoders` and `rows` — caller must keep
-    /// both alive for the duration of `PortalRun`.
-    fn new(encoders: &'a [ColumnEncoder], rows: &'a mut Vec<DataRow>, ncols: i16) -> Self {
-        WireDestReceiver {
-            base: pg_sys::DestReceiver {
-                receiveSlot: Some(wire_receive_slot),
-                rStartup: Some(wire_startup),
-                rShutdown: Some(wire_shutdown),
-                rDestroy: Some(wire_destroy),
-                mydest: pg_sys::CommandDest::DestNone,
-            },
-            encoders: encoders.as_ptr(),
-            rows: rows as *mut _,
-            ncols,
-            _lifetime: PhantomData,
-        }
-    }
-
-    /// Return a `*mut DestReceiver` suitable for `Portal::run`.
-    fn as_dest_receiver(&mut self) -> *mut pg_sys::DestReceiver {
-        &mut self.base as *mut pg_sys::DestReceiver
-    }
-}
-
-/// `receiveSlot` callback — encodes one row directly into a
-/// `DataRow` and pushes it onto the output Vec.
-///
-/// # Safety
-///
-/// Called by the executor inside `PortalRun`. `slot` is a valid
-/// `TupleTableSlot` owned by the executor. `self_` points to the
-/// `base` field of our `WireDestReceiver` (offset 0).
-unsafe extern "C-unwind" fn wire_receive_slot(
-    slot: *mut pg_sys::TupleTableSlot,
-    self_: *mut pg_sys::DestReceiver,
-) -> bool {
-    let recv = self_ as *mut WireDestReceiver;
-    let ncols = unsafe { (*recv).ncols } as usize;
-
-    // Deform all columns so tts_values / tts_isnull are populated.
-    unsafe { pg_sys::slot_getallattrs(slot) };
-
-    let mut buf = BytesMut::with_capacity(64);
-    for c in 0..ncols {
-        let is_null = unsafe { *(*slot).tts_isnull.add(c) };
-        if is_null {
-            buf.put_i32(-1);
-        } else {
-            let datum = unsafe { *(*slot).tts_values.add(c) };
-            let encoder = unsafe { &*(*recv).encoders.add(c) };
-            encoder.encode_into(datum, &mut buf);
-        }
-    }
-    unsafe { (*(*recv).rows).push(DataRow::new(buf, (*recv).ncols)) };
-    true
-}
-
-/// `rStartup` callback — no-op (encoders are pre-built at Bind time).
-unsafe extern "C-unwind" fn wire_startup(
-    _self: *mut pg_sys::DestReceiver,
-    _operation: std::ffi::c_int,
-    _typeinfo: pg_sys::TupleDesc,
-) {
-}
-
-/// `rShutdown` callback — no-op (BytesMut is Rust-owned).
-unsafe extern "C-unwind" fn wire_shutdown(_self: *mut pg_sys::DestReceiver) {}
-
-/// `rDestroy` callback — no-op (struct is stack-allocated in Rust,
-/// not palloc'd — Rust Drop handles cleanup).
-unsafe extern "C-unwind" fn wire_destroy(_self: *mut pg_sys::DestReceiver) {}
-
-// ---------------------------------------------------------------------------
-// ColumnEncoder — per-column type I/O cache
-// ---------------------------------------------------------------------------
-
-/// Per-column result encoder. Holds the cached
-/// (typoutput | typsend) lookup so the row loop just calls
-/// `encoder.encode_into(datum, buf)` per cell.
-enum ColumnEncoder {
-    Text(TypeOutput),
-    Binary(TypeSend),
-}
-
-impl ColumnEncoder {
-    fn for_column(type_oid: pg_sys::Oid, format: FieldFormat) -> Self {
-        match format {
-            FieldFormat::Text => Self::Text(TypeOutput::for_type(type_oid)),
-            FieldFormat::Binary => Self::Binary(TypeSend::for_type(type_oid)),
-        }
-    }
-
-    /// Encode `datum` directly into `buf` as a length-prefixed
-    /// field, avoiding the intermediate `Vec<u8>` allocation.
-    fn encode_into(&self, datum: pg_sys::Datum, buf: &mut BytesMut) {
-        match self {
-            Self::Text(fns) => {
-                // SAFETY: OidOutputFunctionCall returns a palloc'd
-                // NUL-terminated cstring.
-                unsafe {
-                    let ptr = pg_sys::OidOutputFunctionCall(fns.typoutput, datum);
-                    let slice = CStr::from_ptr(ptr).to_bytes();
-                    buf.put_i32(slice.len() as i32);
-                    buf.put_slice(slice);
-                    pg_sys::pfree(ptr as *mut _);
-                }
-            }
-            Self::Binary(fns) => {
-                // SAFETY: OidSendFunctionCall returns a palloc'd
-                // bytea (varlena).
-                unsafe {
-                    let ptr = pg_sys::OidSendFunctionCall(fns.typsend, datum);
-                    let slice = pgrx::varlena::varlena_to_byte_slice(ptr as *const pg_sys::varlena);
-                    buf.put_i32(slice.len() as i32);
-                    buf.put_slice(slice);
-                    pg_sys::pfree(ptr as *mut _);
-                }
-            }
-        }
-    }
-}
-
-/// Convert a `CommandTag` enum to its display name.
-fn command_tag_name(tag: pg_sys::CommandTag::Type) -> String {
-    let ptr = unsafe { pg_sys::GetCommandTagName(tag) };
-    if ptr.is_null() {
-        "OK".to_string()
-    } else {
-        unsafe { CStr::from_ptr(ptr) }
-            .to_string_lossy()
-            .into_owned()
-    }
-}
 
 #[cfg(any(test, feature = "pg_test"))]
 #[pgrx::pg_schema]
