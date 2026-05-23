@@ -141,12 +141,15 @@ Mechanical reading of these numbers:
   - **Async dispatch.** pgwire dispatches via
     `Arc<dyn SimpleQueryHandler>` + `async fn` + tokio
     poll/wake per `'Q'`.
-  - **Per-`'Q'` schema construction.** `schema_and_encoders_text`
-    builds a fresh `Vec<FieldInfo>` (one `String` allocation per
-    column) and wraps it in `Arc<Vec<FieldInfo>>` because
-    `QueryResponse` requires it; vanilla writes the
-    `RowDescription` straight from the tupdesc into the output
-    buffer with no intermediate.
+  - **Per-`'Q'` schema build (simple-query only).**
+    `dest_receiver::schema_and_encoders_text` walks the
+    portal's tupdesc and builds a fresh `Vec<FieldInfo>` per
+    `'Q'` (one column-name `String` per column,
+    `from_utf8_unchecked` since PG identifiers are ASCII),
+    wrapped in `Arc::new` for `QueryResponse`. The slot
+    doesn't track simple-query SQL across `'Q'`s, so each
+    query rebuilds. Extended-query (`'B'`/`'E'`) avoids this
+    entirely — see §5 "Schema caching (extended-query)".
 
 The write-heavy `tpcb` rows still land above vanilla overall
 (1.02–1.07×) because both execution paths skip a libpq-side
@@ -284,7 +287,7 @@ client TCP → kernel → tokio TcpStream
 | 3 | [crates/core/src/backend/spi.rs](../../crates/core/src/backend/spi.rs) (`with_spi`) | Per-query xact bracket; opened once per `'Q'`-inner-statement or once per Execute |
 | 4 | `spi_bridge::parse_and_classify` (simple) + `extended::infer_param_types` (extended) | Calls PG's `raw_parser` / `pg_analyze_and_rewrite_varparams` |
 | 5 | spi backend: PG's `SPI_execute*` / `SPI_execute_plan*` · direct backend: [extended/direct.rs](../../crates/core/src/backend/extended/direct.rs) (`CachedPlanSource` + `Portal*` + `WireDestReceiver`) | Result materialised into `SPI_tuptable` (spi) or written inline by `receiveSlot` (direct) |
-| 6 | [extended::ColumnEncoder](../../crates/core/src/backend/extended.rs) + [`TypeOutput`/`TypeSend`](../../crates/core/src/backend/spi.rs) | Per-column encoder cache built once; cell write is `BytesMut::put_i32` + `put_slice` |
+| 6 | [dest_receiver::ColumnEncoder](../../crates/core/src/backend/dest_receiver.rs) wrapping [`TypeOutput`/`TypeSend`](../../crates/core/src/backend/spi.rs) | One encoder per column built once per query/Execute; cell write is `ColumnEncoder::encode_into(datum, &mut buf)` — one `OidOutputFunctionCall` / `OidSendFunctionCall` then `put_slice` straight into the row's `BytesMut`, no per-cell `Vec<u8>` |
 | 7 | pgwire `DataRowEncoder` (simple) or our manual `BytesMut::put_i32` + `put_slice` (extended) | The encode step is folded into stage 6 for the extended-query path |
 
 ## 5. What's structurally fast
@@ -301,10 +304,12 @@ fall out of the dispatch model.
 | **Tokio runtime** | Built once per slot (`Rc<Runtime>`), reused across handoffs. Not rebuilt per query. |
 | **TLS** | rustls + ring; same crypto class as PG's OpenSSL. Per-byte overhead identical. |
 | **SPI plan caching (extended-query)** | `SPI_keepplan`'d once at Parse, reused across Execute via `SPI_execute_plan`. Matches PG's `CachedPlanSource` semantics. At Execute time we are at zero-parse parity with PG. |
-| **Per-cell type I/O caching (both paths)** | `TypeOutput` / `TypeSend` built once per column per query/Execute, not per cell. |
+| **Schema caching (extended-query)** | Both extended backends (`extended/direct.rs`, `extended/spi.rs`) cache the result-column schema as `Arc<Vec<FieldInfo>>` on the `PreparedStatement` at Parse time, with every column's `FieldFormat` set to `Text`. Per-Execute on the common `Format::UnifiedText` path the response uses `Arc::clone` of that cached schema — one atomic refcount increment, zero per-column `String` allocations and no fresh `Vec`/`Arc`. `Format::UnifiedBinary` / `Format::Individual` rebuilds a per-Execute `Vec<FieldInfo>` from the cached one to carry the requested format codes. Simple-query doesn't have an equivalent cache (no SQL→statement memo); see §2. |
+| **Per-cell type I/O caching (both paths)** | The shared [`dest_receiver::ColumnEncoder`](../../crates/core/src/backend/dest_receiver.rs) wraps `TypeOutput` (text) or `TypeSend` (binary), built once per column per query/Execute, never per cell. Per-cell write is `encode_into(datum, &mut buf)`: the palloc'd cstring / `bytea` is read once and `put_slice`d straight into the row's `BytesMut` before being `pfree`'d — no per-cell `Vec<u8>` intermediate on either the simple-query or extended-query path. |
+| **Parameter slice (extended-query)** | Bind/Execute hands the wire-format `&[Option<Bytes>]` straight through to the per-type input/receive decoders — no per-Execute clone of the slice. `Bytes` is refcounted, so each `Some(bytes)` is an `Arc`-style reference, not a payload copy. |
 | **Snapshot / xact state inside BEGIN block** | `StartTransactionCommand` becomes `CommandCounterIncrement` when already in `TBLOCK_INPROGRESS`; same for Commit. Inherited from PG's xact machinery, no special-casing needed. |
 | **Binary parameter & result format** | Honoured per-column from `Bind.parameter_format_codes` / `result_column_format_codes` without forcing text round-tripping. tokio-postgres' binary path works without conversion. |
-| **Row materialisation (both paths)** | Both simple-query and extended-query write encoded bytes directly into the wire `BytesMut`. No `Vec<Option<String>>` intermediate. The `direct` backend additionally skips the `SPI_tuptable` step via `WireDestReceiver`; that win is visible on the custom bench (extended-query, 1.11× vanilla) but measured at +0.5% / +1.9% / −0.2% on pgbench `select` / `nupdate` / `tpcb` (§2) — at 1-row hot-path result sets the per-`'Q'` framing overhead (intermediate `Vec<DataRow>`, async dispatch, per-`'Q'` schema construction) dominates the per-row saving. |
+| **Row materialisation (both paths)** | Both simple-query and extended-query write encoded bytes directly into the wire `BytesMut`. No `Vec<Option<String>>` intermediate. The `direct` backend additionally skips the `SPI_tuptable` step via `WireDestReceiver`; that win is visible on the custom bench (extended-query, 1.11× vanilla) but measured at +0.5% / +1.9% / −0.2% on pgbench `select` / `nupdate` / `tpcb` (§2) — at 1-row hot-path result sets the per-`'Q'` framing overhead (intermediate `Vec<DataRow>`, async dispatch, simple-query schema rebuild) dominates the per-row saving. |
 
 ## See also
 
