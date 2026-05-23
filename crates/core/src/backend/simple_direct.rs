@@ -14,9 +14,9 @@
 //! ```text
 //! execute_simple_query_direct(query)
 //!   ├─ parse_and_keep                         (one raw_parser pass)
-//!   │    └─ ParsedQuery { statements, parse_ctx }
+//!   │    └─ ParsedQuery { statements, parse_ctx, sql_cstr }
 //!   └─ for each statement:
-//!        with_xact(|ctx| run_one_direct(ctx, &parse_ctx, raw_stmt, text, &cstr))
+//!        with_xact(|ctx| run_one_direct(ctx, &parse_ctx, raw_stmt, &sql_cstr))
 //!         ├─ CreateCommandTag(raw_stmt)
 //!         ├─ child ScopedMemoryContext (stmt_ctx) under parse_ctx
 //!         ├─ pg_analyze_and_rewrite_fixedparams
@@ -52,8 +52,9 @@ use super::spi::{caught_error_to_pgwire, generic_error};
 
 /// Parsed multi-statement `'Q'` body. Owns the
 /// [`ScopedMemoryContext`] the [`pg_sys::RawStmt`] pointers live
-/// in; per-statement analyze/plan contexts are created as
-/// children under `parse_ctx` and dropped at end-of-statement.
+/// in, plus the single [`CString`] copy of the input query that
+/// PG's `*_fixedparams` / `pg_plan_queries` / `PortalDefineQuery`
+/// helpers all want as a raw `*const c_char`.
 ///
 /// **Pointer-lifetime invariant.** Each `*mut pg_sys::RawStmt`
 /// in `statements` is valid for the lifetime of `parse_ctx`.
@@ -70,6 +71,12 @@ pub(crate) struct ParsedQuery<'q> {
     /// MemoryContext that owns every `RawStmt` in `statements`.
     /// Drop the `ParsedQuery` to delete it.
     pub(crate) parse_ctx: ScopedMemoryContext,
+    /// NUL-terminated copy of the original query string, used by
+    /// `pg_analyze_and_rewrite_fixedparams` /
+    /// `PortalDefineQuery` as the source-text pointer they store
+    /// for error-reporting. Borrowed by `run_one_direct` per
+    /// statement to avoid re-allocating per `'Q'`.
+    pub(crate) sql_cstr: CString,
 }
 
 /// One raw-parser pass over `query`. Keeps the parsetree alive
@@ -131,6 +138,7 @@ pub(crate) fn parse_and_keep(query: &str) -> PgWireResult<ParsedQuery<'_>> {
     Ok(ParsedQuery {
         statements,
         parse_ctx,
+        sql_cstr: cstr,
     })
 }
 
@@ -202,8 +210,6 @@ unsafe fn extract_raw_stmt_spans(
 ///   xact-control intercept: PG handles them natively.
 pub fn execute_simple_query_direct(query: &str) -> PgWireResult<Vec<Response>> {
     let parsed = parse_and_keep(query)?;
-    let sql_cstr = CString::new(query)
-        .map_err(|_| generic_error("pg_transport", "query string contains a NUL byte"))?;
 
     let mut responses = Vec::with_capacity(parsed.statements.len());
     for (text, raw_stmt) in &parsed.statements {
@@ -211,16 +217,16 @@ pub fn execute_simple_query_direct(query: &str) -> PgWireResult<Vec<Response>> {
             continue;
         }
         let raw_stmt = *raw_stmt;
-        let text_owned = text.to_string();
-        // Borrow parse_ctx for the closure's lifetime; raw_stmt
-        // is alive as long as parse_ctx is.
+        // Borrow parse_ctx + sql_cstr for the closure's lifetime;
+        // raw_stmt is alive as long as parse_ctx is, and with_xact
+        // runs the closure to completion synchronously.
         let parse_ctx_ref: &ScopedMemoryContext = &parsed.parse_ctx;
-        let resp =
-            with_xact(|ctx| run_one_direct(ctx, parse_ctx_ref, raw_stmt, &text_owned, &sql_cstr))?;
+        let sql_cstr_ref: &CStr = parsed.sql_cstr.as_c_str();
+        let resp = with_xact(|ctx| run_one_direct(ctx, parse_ctx_ref, raw_stmt, sql_cstr_ref))?;
         responses.push(resp);
     }
     // parsed drops here; parse_ctx deletes the MemoryContext that
-    // owned every raw_stmt pointer.
+    // owned every raw_stmt pointer, and sql_cstr is freed.
     Ok(responses)
 }
 
@@ -248,7 +254,6 @@ fn run_one_direct(
     ctx: &XactCtx,
     parse_ctx: &ScopedMemoryContext,
     raw_stmt: *mut pg_sys::RawStmt,
-    _sql: &str,
     sql_cstr: &CStr,
 ) -> PgWireResult<Response> {
     // 1. Command tag from the raw parsetree. Matches

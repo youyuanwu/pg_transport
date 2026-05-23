@@ -72,8 +72,14 @@ pub static TLS_KEY_FILE: GucSetting<Option<CString>> = GucSetting::<Option<CStri
 /// Per-session (`USERSET`) so operators can canary one workload at
 /// a time via `ALTER ROLE ... SET pg_transport.execution_backend =
 /// 'direct'`. See [deferred/planner-executor-direct-path.md §7.5](../../docs/design/deferred/planner-executor-direct-path.md).
-pub static EXECUTION_BACKEND: GucSetting<Option<CString>> =
-    GucSetting::<Option<CString>>::new(Some(c"spi"));
+///
+/// Registered as an *enum* GUC (not string) so the per-query
+/// accessor [`execution_backend`] is a single cell read — the
+/// previous `GucSetting<Option<CString>>` shape clone'd a fresh
+/// `CString` on every `.get()`, which was a measurable per-`'Q'`
+/// allocation (see [performance.md §2](../../docs/design/performance.md#2-latest-stable-numbers-2026-05-22)).
+pub static EXECUTION_BACKEND: GucSetting<ExecutionBackend> =
+    GucSetting::<ExecutionBackend>::new(ExecutionBackend::Spi);
 
 /// Typed view of [`AUTH_SOURCE`]. See module-level docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,14 +97,20 @@ pub enum AuthSource {
 }
 
 /// Typed view of [`EXECUTION_BACKEND`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Registered as a PG enum GUC via [`pgrx::PostgresGucEnum`];
+/// variant order defines the on-disk ordinal, so do not reorder
+/// existing variants — PG persists the integer value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, pgrx::PostgresGucEnum)]
 pub enum ExecutionBackend {
     /// Route extended-query via SPI (`SPI_prepare` /
     /// `SPI_execute_plan`). v0 default.
+    #[name = c"spi"]
     Spi,
     /// Route extended-query via the planner+executor direct path
     /// (`CreateCachedPlan` / `Portal*` + Tuplestore destination).
     /// Stage A implementation; opt-in until soak completes.
+    #[name = c"direct"]
     Direct,
 }
 
@@ -154,7 +166,7 @@ pub fn register() {
         GucFlags::default(),
     );
 
-    GucRegistry::define_string_guc(
+    GucRegistry::define_enum_guc(
         c"pg_transport.execution_backend",
         c"Extended-query execution backend ('spi' or 'direct').",
         c"'spi' (default) uses SPI_prepare + SPI_execute_plan; \
@@ -247,26 +259,13 @@ pub fn tls_files() -> Result<Option<(String, String)>, String> {
     }
 }
 
-/// Typed accessor for [`EXECUTION_BACKEND`]. Unknown values
-/// (including unset, which shouldn't happen given the default)
-/// silently fall back to [`ExecutionBackend::Spi`] — the safe
-/// default. We log unknown values at WARNING so misconfigurations
-/// are visible.
+/// Typed accessor for [`EXECUTION_BACKEND`].
+///
+/// One atomic cell read — no allocations. PG's enum-GUC machinery
+/// validates the input string at SET time, so unknown values are
+/// rejected by PG itself (with `ERROR: invalid value for parameter
+/// "pg_transport.execution_backend"`); we never see them here.
+#[inline]
 pub fn execution_backend() -> ExecutionBackend {
-    let raw = EXECUTION_BACKEND.get();
-    let s = raw
-        .as_ref()
-        .map(|c| c.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    match s.as_str() {
-        "spi" | "" => ExecutionBackend::Spi,
-        "direct" => ExecutionBackend::Direct,
-        other => {
-            pgrx::warning!(
-                "pg_transport.execution_backend = {other:?} is not recognised; \
-                 falling back to 'spi'. Valid values: 'spi', 'direct'."
-            );
-            ExecutionBackend::Spi
-        }
-    }
+    EXECUTION_BACKEND.get()
 }
