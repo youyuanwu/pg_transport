@@ -53,7 +53,29 @@ pgbench connections are long-lived for the test duration; `initial
 connection time` is reported separately and isn't folded into the
 `tps` headline number.
 
-## 2. Latest stable numbers (2026-05-22)
+### sysbench
+
+Standard `sysbench` driving libpq's extended-query / prepared-statement
+path (the path tokio-postgres uses by default for typed binds).
+Three workloads in §2:
+
+- **`oltp_point_select`** — bare prepared-statement Execute per
+  transaction (no `BEGIN`/`COMMIT`).
+- **`oltp_read_only`** — 12 SELECTs per transaction inside an
+  explicit `BEGIN`/`COMMIT` (point selects + range, sum, order,
+  distinct queries).
+- **`oltp_update_index`** — one indexed `UPDATE` per transaction
+  inside an explicit `BEGIN`/`COMMIT`.
+
+Recipe: `just sysbench pg18 <workload> <tables> <table_size> <duration_s> <threads> "" {spi|direct} off`.
+Matrix runs: [`scripts/sysbench_sweep.sh`](../../scripts/sysbench_sweep.sh).
+
+Same per-cluster setup as pgbench (fresh `initdb`, `shared_preload_libraries`,
+dual-port). Connections are long-lived; the win surface here is
+*how each side schedules concurrent active sessions*, not
+connection establishment.
+
+## 2. Latest stable numbers (2026-05-24)
 
 3 runs each, 8 concurrent connections, on the project's reference
 dev box. `dev` branch with both the autoscaling pool and the
@@ -285,6 +307,116 @@ just pgbench pg18 select 20 32 "" spi 1                                # clients
 just pgbench pg18 select 20 16 "" spi 1 bench/scripts/select_one.sql   # probe
 ```
 
+### sysbench, 20 s, 16 tables × 100k rows (cache-hot), 2026-05-24
+
+Steady-state OLTP through libpq's extended-query / prepared-statement
+path — same code path tokio-postgres uses for `client.execute`, and
+the path the [xact-control fix](../../crates/core/src/backend/extended/spi.rs)
+unblocked for BEGIN/COMMIT-wrapped workloads. Three workloads ×
+two backends × three thread counts; single run per cell;
+[`scripts/sysbench_sweep.sh`](../../scripts/sysbench_sweep.sh)
+renders the matrix below in one pass:
+
+**`oltp_point_select`** — bare prepared-statement Execute per
+transaction, no `BEGIN`/`COMMIT` wrapping:
+
+| Backend | Threads | Vanilla tps | pg_transport tps | Ratio |
+|---|---:|---:|---:|---:|
+| spi    |  4 | 18 377 | 15 545 | **0.85x** |
+| spi    | 16 | 67 090 | 68 288 | **1.02x** |
+| spi    | 32 | 36 921 | 64 797 | **1.76x** |
+| direct |  4 | 20 141 | 17 237 | **0.86x** |
+| direct | 16 | 63 907 | 72 884 | **1.14x** |
+| direct | 32 | 44 617 | 71 415 | **1.60x** |
+
+**`oltp_read_only`** — 10 point selects + 1 range query + 1
+sum/order/distinct query, all wrapped in explicit `BEGIN`/`COMMIT`
+(the path the extended-query xact-control fix landed in 2026-05-23):
+
+| Backend | Threads | Vanilla tps | pg_transport tps | Ratio |
+|---|---:|---:|---:|---:|
+| spi    |  4 |   810 |   934 | **1.15x** |
+| spi    | 16 | 1 299 | 3 017 | **2.32x** |
+| spi    | 32 | 1 042 | 2 966 | **2.85x** |
+| direct |  4 |   773 |   907 | **1.17x** |
+| direct | 16 | 1 281 | 2 984 | **2.33x** |
+| direct | 32 | 1 026 | 2 949 | **2.87x** |
+
+**`oltp_update_index`** — single `UPDATE … WHERE id = ?` per
+transaction inside an explicit `BEGIN`/`COMMIT`:
+
+| Backend | Threads | Vanilla tps | pg_transport tps | Ratio |
+|---|---:|---:|---:|---:|
+| spi    |  4 | 16 395 | 14 981 | **0.91x** |
+| spi    | 16 | 45 671 | 52 485 | **1.15x** |
+| spi    | 32 | 28 709 | 52 507 | **1.83x** |
+| direct |  4 | 16 204 | 15 016 | **0.93x** |
+| direct | 16 | 45 194 | 50 598 | **1.12x** |
+| direct | 32 | 27 084 | 52 222 | **1.93x** |
+
+Mechanical reading:
+
+- **Wins grow with concurrency** — same pattern as the
+  [connection-churn sweep](#pgbench-connection-churn--c-20-s-3-runs-each-2026-05-23)
+  but driven by a different mechanism. Here the connections are
+  long-lived; the win at threads=32 comes from how each side
+  schedules *concurrent active sessions*: vanilla holds one OS
+  process per session and pays context-switch + lock-contention
+  + per-backend cache pressure as N grows, while pg_transport
+  multiplexes onto a fixed pool of warm slot bgworkers
+  ([pool.md §5](pool.md#5-the-autoscaler)) that the autoscaler
+  sizes to the active set. At threads=32 vanilla's per-tx
+  throughput drops vs. threads=16 across every cell (point_select
+  67 k → 37 k; read_only 1 299 → 1 042; update_index 45 671 →
+  28 709), while pg_transport stays flat or grows.
+
+- **`oltp_read_only` shows the largest absolute ratios (up to
+  2.87x).** This workload bundles 12 statements per transaction
+  inside `BEGIN`/`COMMIT`, so per-transaction framework cost
+  (and, for vanilla, per-connection cache fault pressure) is
+  amortised over more work. The xact-control sniff that landed
+  in the extended-query Parse path routes BEGIN/COMMIT around
+  `SPI_execute_plan` via the shared
+  [`spi_bridge::handle_xact_control_one`](../../crates/core/src/backend/spi_bridge.rs)
+  path — same code as the simple-query bridge — so the
+  framework cost we're amortising is one xact-block API call
+  per BEGIN/COMMIT (not a `Portal*` round trip).
+
+- **`oltp_point_select` at threads=4 looks like a loss (0.85–0.86x)
+  but isn't a real signal.** At low concurrency vanilla's per-tx
+  cost is its floor and pg_transport's framework overhead
+  (extended-query Parse + Bind + Execute through pgwire's async
+  dispatcher; backend slot UDS round trip; SPI/direct execution)
+  is a measurable fraction of that floor. As concurrency rises
+  vanilla's floor moves up faster than ours.
+
+- **Backend choice barely matters on these workloads** — every
+  cell has SPI and direct within ~10% of each other, on the
+  same side of parity with vanilla. Consistent with §2's pgbench
+  finding: direct's wins are concentrated in multi-row SELECTs
+  and binary results, neither of which sysbench's
+  prepared-statement-shaped workloads exercise heavily. Use
+  whichever backend matches your operational story.
+
+- **Workloads omitted from the matrix on purpose:** `oltp_read_write`,
+  `oltp_delete`, and `oltp_insert` race on sysbench's own
+  `delete_inserts` pattern at threads > 1 — multiple threads
+  pick the same random ID for a `DELETE … WHERE id = X; INSERT
+  id = X;` sequence and trip a unique-violation. Not a
+  pg_transport bug; same race against vanilla PG at threads > 1.
+  Documented in [bench.md §3.2](bench.md#32-workload-matrix-on-v0-pg_transport)
+  footnote ¹.
+
+Reproduce:
+
+```sh
+# Default matrix (3 workloads × 2 backends × 3 threads, ~22 min):
+./scripts/sysbench_sweep.sh
+
+# Single cell:
+just sysbench pg18 oltp_read_only 16 100000 20 32 "" spi off
+```
+
 ## 3. Where we sit vs. other pooling solutions
 
 | Solution | Typical qps vs. direct PG | Why |
@@ -292,7 +424,9 @@ just pgbench pg18 select 20 16 "" spi 1 bench/scripts/select_one.sql   # probe
 | pgbouncer (transaction mode) | 0.7x – 0.85x | libpq parse/encode round-trip on every message |
 | pgcat | 0.75x – 0.90x | same shape as pgbouncer, Rust-based |
 | pgpool-II | 0.6x – 0.8x | proxy + query rewriting overhead |
-| **pg_transport** | **0.97x – 1.14x** | bgworker reuse + in-process execution path (SPI and direct/WireDestReceiver modes) |
+| **pg_transport, steady-state low concurrency** | **0.85x – 1.15x** | per-tx framework cost (Parse/Bind/Execute + slot UDS + SPI/direct) is a measurable fraction of vanilla's per-tx floor |
+| **pg_transport, steady-state high concurrency (sysbench threads=32)** | **1.60x – 2.87x** | vanilla pays per-connection cache pressure + context-switch + lock contention as N grows; warm-slot multiplexing sidesteps all three. See §2 sysbench rows. |
+| **pg_transport, connection churn (`pgbench -C`)** | **7.78x – 11.80x** | fork+RelCache warmup vs. SCM_RIGHTS handoff to a hot slot. See §2 pgbench-`-C` rows. |
 
 The reason we land in the same range as direct PG (rather than the
 0.7–0.85x range typical of pooling) is structural: **we don't proxy

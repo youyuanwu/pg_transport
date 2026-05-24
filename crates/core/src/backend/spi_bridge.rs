@@ -250,9 +250,15 @@ unsafe fn extract_statement_spans(
 /// Inspect a `RawStmt`'s inner node; return `Some(cmd)` if it's a
 /// `TransactionStmt` we want to intercept, `None` otherwise.
 ///
+/// Pure pointer inspection — no parsing, no allocation. The
+/// extended-query backends call this on the `RawStmt` their own
+/// `pg_parse_query` already produced (direct path: directly;
+/// SPI path: via [`infer_param_types_and_classify`]) so neither
+/// pays an extra parse pass for xact-control detection.
+///
 /// SAFETY: caller guarantees `raw_stmt` points at a valid `RawStmt`
-/// inside a parse tree returned by `raw_parser`.
-unsafe fn classify_raw_stmt(raw_stmt: *mut pg_sys::RawStmt) -> Option<XactCmd> {
+/// inside a parse tree returned by `raw_parser` / `pg_parse_query`.
+pub(super) unsafe fn classify_raw_stmt(raw_stmt: *mut pg_sys::RawStmt) -> Option<XactCmd> {
     let node = unsafe { (*raw_stmt).stmt };
     if node.is_null() {
         return None;
@@ -354,34 +360,6 @@ pub(super) fn handle_xact_control_one(cmd: XactCmd) -> PgWireResult<Response> {
             Err(panic_to_pgwire(panic_payload))
         }
     }
-}
-
-/// Classify a single SQL string the way the extended-query path
-/// needs it: parse it (`pg_parse_query` via [`parse_and_classify`])
-/// and, if it parses to exactly one non-empty statement that is a
-/// transaction-control command, return the matching [`XactCmd`].
-/// Returns `Ok(None)` for any other shape (zero / multiple
-/// statements, or a non-xact-control single statement) so the
-/// caller falls back to its existing SPI plan path.
-///
-/// `pub(super)` so [`super::extended::spi::prepare`] can call it;
-/// surface kept narrow because the multi-statement
-/// [`parse_and_classify`] is only meaningful for simple-query.
-pub(super) fn classify_single_statement(sql: &str) -> PgWireResult<Option<XactCmd>> {
-    let stmts = parse_and_classify(sql)?;
-    let mut non_empty = stmts
-        .into_iter()
-        .filter(|(text, _)| !text.trim().is_empty());
-    let first = match non_empty.next() {
-        Some(s) => s,
-        None => return Ok(None),
-    };
-    // More than one non-empty statement → not an extended-query
-    // xact-control shape; let SPI_prepare raise its own error.
-    if non_empty.next().is_some() {
-        return Ok(None);
-    }
-    Ok(first.1)
 }
 
 /// Body of [`run_spi_statement`]'s `with_spi` closure. Executes one

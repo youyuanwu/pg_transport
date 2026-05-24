@@ -312,6 +312,35 @@ pub fn prepare(sql: &str, param_hints: &[Option<u32>]) -> PgWireResult<PreparedS
             ))));
         }
 
+        // 1b. xact-control short-circuit.
+        //
+        // BEGIN / COMMIT / ROLLBACK (and their mode-list variants)
+        // must NOT reach the `Portal*` path — utility statements
+        // (`TransactionStmt`) mis-dispatch there and trip a
+        // `0x7f7f7f7f` WIPE_MEM use-after-free, pinned for posterity
+        // by `xact_control_begin_via_extended_query_direct_backend_*`
+        // in `crates/e2e/tests/basic.rs`. Detection is free here:
+        // `classify_raw_stmt` is a pure pointer inspection of the
+        // node we already parsed above, so this fix adds zero
+        // additional parser work to the non-xact-control hot path.
+        //
+        // Only meaningful for single-statement Parse — multi-stmt
+        // Parse can't be a valid xact-control shape. Returning Ok
+        // lets `with_xact`'s cleanup (Pop + Commit) run normally;
+        // the actual xact-block API call (which manages its own
+        // Start/Begin/Commit sequence) only fires on Execute, by
+        // which time we're back in TBLOCK_DEFAULT.
+        if unsafe { (*raw_list).length } == 1
+            && let Some(cmd) = unsafe { super::super::spi_bridge::classify_raw_stmt(raw_stmt) }
+        {
+            return Ok(PreparedStatement {
+                sql: sql_owned,
+                param_types: Vec::new(),
+                result_schema: Vec::new(),
+                plan: Box::new(super::XactControlBackendPlan::new(cmd)),
+            });
+        }
+
         // 2. Command tag from the raw parse tree (used by the
         // CachedPlanSource and later by PortalDefineQuery).
         // SAFETY: CreateCommandTag is a pure walk of the parsetree.

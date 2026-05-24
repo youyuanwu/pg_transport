@@ -104,3 +104,62 @@ pub fn prepare(sql: &str, param_hints: &[Option<u32>]) -> PgWireResult<PreparedS
         ExecutionBackend::Direct => direct::prepare(sql, param_hints),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Shared backend plan for xact-control (Parse + Bind + Execute)
+// ---------------------------------------------------------------------------
+
+/// Backend plan for transaction-control statements (BEGIN /
+/// COMMIT / ROLLBACK and their mode-list variants) routed
+/// through Parse + Bind + Execute.
+///
+/// Both extended-query backends short-circuit on xact-control
+/// before they would otherwise reach a backend-specific path
+/// that can't dispatch it correctly:
+///
+/// * **SPI backend** ([`spi::prepare`]) — `SPI_execute_plan` in
+///   atomic mode rejects xact-control with `SPI_ERROR_TRANSACTION`.
+/// * **Direct backend** ([`direct::prepare`]) — the `Portal*`
+///   path mis-dispatches `TransactionStmt` and trips a
+///   `0x7f7f7f7f` WIPE_MEM use-after-free.
+///
+/// Both backends instead build a `PreparedStatement` whose plan
+/// is this type, classified at Parse time via
+/// [`super::spi_bridge::classify_single_statement`]. On Execute,
+/// the dispatch funnels through
+/// [`super::spi_bridge::handle_xact_control_one`] — the same
+/// xact-block API path the simple-query bridge uses.
+///
+/// Carries no per-Execute state beyond the classified
+/// `XactCmd`; parameter binding is rejected at Execute time
+/// because xact-control has no `$n` placeholders.
+pub(super) struct XactControlBackendPlan {
+    cmd: super::spi_bridge::XactCmd,
+}
+
+impl XactControlBackendPlan {
+    pub(super) fn new(cmd: super::spi_bridge::XactCmd) -> Self {
+        Self { cmd }
+    }
+}
+
+impl PreparedPlan for XactControlBackendPlan {
+    fn execute(
+        &self,
+        parameters: &[Option<Bytes>],
+        _parameter_format: &Format,
+        _result_format: &Format,
+        _max_rows: usize,
+    ) -> PgWireResult<Response> {
+        if !parameters.is_empty() {
+            return Err(super::spi::generic_error(
+                "pg_transport extended",
+                &format!(
+                    "transaction-control statement takes no parameters; got {}",
+                    parameters.len()
+                ),
+            ));
+        }
+        super::spi_bridge::handle_xact_control_one(self.cmd)
+    }
+}

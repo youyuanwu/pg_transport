@@ -128,14 +128,42 @@ pub(crate) struct SpiBackendPlan {
 /// snapshot + queryEnv the analyzer needs). Raises PG ERROR on
 /// syntax errors / analysis failures, which our [`with_spi`]
 /// wrapper catches.
-unsafe fn infer_param_types(sql: &CString) -> Vec<pg_sys::Oid> {
+/// Combined varparams type inference + xact-control classification.
+///
+/// Runs a single [`pg_sys::pg_parse_query`] and uses the resulting
+/// `RawStmt` for two purposes:
+///
+/// 1. Inspect the parsed node tag via
+///    [`super::super::spi_bridge::classify_raw_stmt`]. If the
+///    statement is `BEGIN` / `COMMIT` / `ROLLBACK` (or a
+///    mode-list variant), return the matching `XactCmd` so the
+///    caller can short-circuit into the shared
+///    [`super::XactControlBackendPlan`] instead of feeding the
+///    statement to `SPI_execute_plan` (which would reject with
+///    `SPI_ERROR_TRANSACTION`).
+/// 2. Otherwise, run `pg_analyze_and_rewrite_varparams` on the
+///    *same* RawStmt to infer the parameter OIDs the client
+///    didn't declare in Parse — same behaviour as the previous
+///    `infer_param_types` helper.
+///
+/// Folding both passes onto one parse keeps the no-hints hot
+/// path's cost identical to before the xact-control fix (no
+/// additional [`pg_sys::raw_parser`] invocation).
+///
+/// SAFETY: must be called inside an SPI session (which sets up
+/// the snapshot + queryEnv the analyzer needs). Raises PG ERROR
+/// on syntax errors / analysis failures, which our [`with_spi`]
+/// wrapper catches.
+unsafe fn infer_param_types_and_classify(
+    sql: &CString,
+) -> (Vec<pg_sys::Oid>, Option<super::super::spi_bridge::XactCmd>) {
     let raw_list = unsafe { pg_sys::pg_parse_query(sql.as_ptr()) };
     if raw_list.is_null() {
-        return Vec::new();
+        return (Vec::new(), None);
     }
     let length = unsafe { (*raw_list).length } as usize;
     if length == 0 {
-        return Vec::new();
+        return (Vec::new(), None);
     }
     // For multi-statement Parse strings, fall back to running the
     // analyzer just on the first RawStmt. v0's extended path is
@@ -145,7 +173,19 @@ unsafe fn infer_param_types(sql: &CString) -> Vec<pg_sys::Oid> {
     let elements = unsafe { (*raw_list).elements };
     let first_raw = unsafe { (*elements).ptr_value } as *mut pg_sys::RawStmt;
     if first_raw.is_null() {
-        return Vec::new();
+        return (Vec::new(), None);
+    }
+
+    // xact-control short-circuit: a `TransactionStmt` node makes
+    // the rest of this pass (analyze + downstream SPI_prepare)
+    // pointless — return now so the caller can dispatch the
+    // command via the shared XactControlBackendPlan. Only
+    // meaningful for single-statement Parse (length == 1);
+    // multi-statement Parse can't be a valid xact-control shape.
+    if length == 1
+        && let Some(cmd) = unsafe { super::super::spi_bridge::classify_raw_stmt(first_raw) }
+    {
+        return (Vec::new(), Some(cmd));
     }
 
     let mut types_ptr: *mut pg_sys::Oid = std::ptr::null_mut();
@@ -176,7 +216,7 @@ unsafe fn infer_param_types(sql: &CString) -> Vec<pg_sys::Oid> {
         };
         out.push(resolved);
     }
-    out
+    (out, None)
 }
 
 // ---------------------------------------------------------------------------
@@ -193,46 +233,65 @@ unsafe fn infer_param_types(sql: &CString) -> Vec<pg_sys::Oid> {
 /// client asserted, `None` means "infer from context".
 ///
 /// Inference path: when `param_hints` is empty *or* all `None`,
-/// we run a varparams pre-pass (see [`infer_param_types`]) and
-/// pass the resolved OIDs to `SPI_prepare` as fixed types. The
-/// plan is then promoted via [`SpiCtx::keep_plan`] so it survives
-/// `SPI_finish`.
+/// we run a varparams pre-pass (see
+/// [`infer_param_types_and_classify`]) and pass the resolved OIDs
+/// to `SPI_prepare` as fixed types. The plan is then promoted via
+/// [`SpiCtx::keep_plan`] so it survives `SPI_finish`.
+///
+/// ## xact-control short-circuit
+///
+/// `BEGIN` / `COMMIT` / `ROLLBACK` (and their mode-list variants)
+/// can't reach `SPI_prepare` — SPI atomic mode rejects them with
+/// `SPI_ERROR_TRANSACTION`. Detection rides on the parse that
+/// the varparams branch already performs: when
+/// [`infer_param_types_and_classify`] reports an `XactCmd`, we
+/// build a [`super::XactControlBackendPlan`] and skip
+/// `SPI_prepare` entirely. **The fixedparams branch (hints
+/// present) does *not* parse and does *not* check** —
+/// transaction-control statements have no `$N` placeholders, so
+/// a client sending hint OIDs alongside `BEGIN` is malformed;
+/// such requests fall through to `SPI_prepare` and get its
+/// native `SPI_ERROR_TRANSACTION` rejection. Real clients
+/// (libpq, tokio-postgres, sysbench) always land in the
+/// varparams branch for xact-control because they don't declare
+/// hints when there are no parameters.
 pub fn prepare(sql: &str, param_hints: &[Option<u32>]) -> PgWireResult<super::PreparedStatement> {
     let sql_cstring = CString::new(sql)
         .map_err(|_| generic_error("pg_transport extended", "query string contains a NUL byte"))?;
     let sql_owned = sql.to_string();
     let any_hint_present = param_hints.iter().any(|o| o.is_some());
 
-    // Short-circuit: xact-control (BEGIN / COMMIT / ROLLBACK and
-    // their mode-list variants) must NOT reach SPI_prepare —
-    // `SPI_execute_plan` in atomic mode rejects them with
-    // SPI_ERROR_TRANSACTION (surfaced as the
-    // `xact_control_begin_via_extended_query_spi_backend_*` bug
-    // pin in `crates/e2e/tests/basic.rs`). Route them through
-    // the same xact-block API the simple-query bridge uses by
-    // returning a `PreparedStatement` whose plan is an
-    // `XactControlBackendPlan` that calls
-    // `spi_bridge::handle_xact_control_one` on each Execute.
-    if let Some(cmd) = super::super::spi_bridge::classify_single_statement(sql)? {
-        return Ok(super::PreparedStatement {
-            sql: sql_owned,
-            param_types: Vec::new(),
-            result_schema: Vec::new(),
-            plan: Box::new(XactControlBackendPlan { cmd }),
-        });
-    }
-
     with_spi(|ctx: &SpiCtx| -> PgWireResult<super::PreparedStatement> {
         // Resolve types (either echo client hints, or run
-        // varparams inference).
-        let mut arg_oids: Vec<pg_sys::Oid> = if any_hint_present {
-            param_hints
+        // varparams inference). The varparams branch also folds
+        // in xact-control classification using the same parse it
+        // would do anyway — no extra raw_parser pass.
+        let (mut arg_oids, classification) = if any_hint_present {
+            let hints: Vec<pg_sys::Oid> = param_hints
                 .iter()
                 .map(|o| pg_sys::Oid::from(o.unwrap_or(0)))
-                .collect()
+                .collect();
+            (hints, None)
         } else {
-            unsafe { infer_param_types(&sql_cstring) }
+            unsafe { infer_param_types_and_classify(&sql_cstring) }
         };
+
+        // xact-control short-circuit — see module docs and the
+        // doc on `infer_param_types_and_classify`. Returning Ok
+        // here lets `with_spi`'s cleanup (SPI_finish + Pop +
+        // Commit) run normally; the actual xact-block API call
+        // happens on Execute, by which time we're back in
+        // TBLOCK_DEFAULT so `handle_xact_control_one`'s own
+        // Start/Commit pair is safe.
+        if let Some(cmd) = classification {
+            return Ok(super::PreparedStatement {
+                sql: sql_owned,
+                param_types: Vec::new(),
+                result_schema: Vec::new(),
+                plan: Box::new(super::XactControlBackendPlan::new(cmd)),
+            });
+        }
+
         let n_args = arg_oids.len() as i32;
 
         // SAFETY: inside SPI; SPI_prepare is the standard plan
@@ -300,47 +359,6 @@ pub fn prepare(sql: &str, param_hints: &[Option<u32>]) -> PgWireResult<super::Pr
 // ---------------------------------------------------------------------------
 // execute — Bind+Execute path (PreparedPlan trait impl)
 // ---------------------------------------------------------------------------
-
-/// Backend plan for transaction-control statements (BEGIN / COMMIT
-/// / ROLLBACK and their mode-list variants) routed through Parse +
-/// Bind + Execute.
-///
-/// SPI's atomic mode rejects xact-control with
-/// `SPI_ERROR_TRANSACTION`, so the wire layer must intercept them
-/// before they reach `SPI_execute_plan`. The simple-query bridge
-/// does the same sniff at the top of
-/// [`super::super::spi_bridge::execute_simple_query`]; this plan
-/// is the extended-query equivalent. Selected by
-/// [`prepare`]'s [`super::super::spi_bridge::classify_single_statement`]
-/// short-circuit.
-///
-/// Carries no per-Execute state beyond the classified [`XactCmd`];
-/// parameter binding is rejected at Execute time (xact-control has
-/// no `$n` placeholders).
-struct XactControlBackendPlan {
-    cmd: super::super::spi_bridge::XactCmd,
-}
-
-impl PreparedPlan for XactControlBackendPlan {
-    fn execute(
-        &self,
-        parameters: &[Option<Bytes>],
-        _parameter_format: &Format,
-        _result_format: &Format,
-        _max_rows: usize,
-    ) -> PgWireResult<Response> {
-        if !parameters.is_empty() {
-            return Err(generic_error(
-                "pg_transport extended",
-                &format!(
-                    "transaction-control statement takes no parameters; got {}",
-                    parameters.len()
-                ),
-            ));
-        }
-        super::super::spi_bridge::handle_xact_control_one(self.cmd)
-    }
-}
 
 impl PreparedPlan for SpiBackendPlan {
     /// Execute the SPI plan with bound parameters. `max_rows` of

@@ -998,37 +998,40 @@ async fn simple_direct_set_and_read_back() -> Result<()> {
 // before SPI sees them via `spi_bridge.rs::parse_and_classify` +
 // `handle_xact_control`, routing them through PG's xact-block
 // API so they don't trip SPI's atomic-mode rejection
-// (`SPI_ERROR_TRANSACTION`). The extended-query SPI path
-// (`extended/spi.rs`) shares the same machinery via
-// `spi_bridge::classify_single_statement` +
-// `handle_xact_control_one` — see the short-circuit at the top
-// of `extended::spi::prepare`. The test below exercises that
-// shared path through Parse + Bind + Execute, which is the exact
-// shape sysbench's libpq driver uses for `oltp_read_only` /
-// `oltp_read_write` BEGIN/COMMIT statements.
+// (`SPI_ERROR_TRANSACTION`). Both extended-query backends share
+// the same machinery via `spi_bridge::classify_raw_stmt`
+// (pure pointer inspection of the parsed RawStmt — no extra
+// parser pass) + `handle_xact_control_one`, plumbed through the
+// shared `extended::XactControlBackendPlan`:
 //
-// Bug pin still applies to the `direct` backend (`extended/direct.rs`);
-// see `xact_control_begin_via_extended_query_direct_backend_pins_bug`
-// below for the still-broken UAF symptom on that path.
+//   * SPI backend — classification folded into the existing
+//                   `pg_analyze_and_rewrite_varparams` parse
+//                   inside `extended::spi::prepare`.
+//   * direct backend — classification on the existing
+//                      `pg_parse_query` result inside
+//                      `extended::direct::prepare`'s `with_xact`.
+//
+// The two tests below exercise that shared path through Parse +
+// Bind + Execute, one per backend. This is the exact shape
+// sysbench's libpq driver uses for `oltp_read_only` /
+// `oltp_read_write` BEGIN/COMMIT statements.
 
-#[tokio::test]
-async fn xact_control_begin_commit_via_extended_query_spi_backend() -> Result<()> {
-    // Mirror of `xact_control_begin_commit` against the SPI
-    // backend's extended-query path. `client.execute(sql, &[])`
-    // goes through Parse + Bind + Execute on the wire even with
-    // zero parameters; this verifies the xact-control sniff at
-    // `extended::spi::prepare` correctly routes BEGIN / COMMIT
-    // around `SPI_execute_plan`.
+async fn run_xact_control_begin_commit_via_extended_query(backend: &str) -> Result<()> {
     let c = Cluster::shared().await;
     let client = c.connect("postgres").await?;
     client
-        .simple_query("SET pg_transport.execution_backend = 'spi'")
+        .simple_query(&format!("SET pg_transport.execution_backend = '{backend}'"))
         .await?;
 
-    let table = "e2e_xact_commit_ext_spi_demo";
+    let table = format!("e2e_xact_commit_ext_{backend}_demo");
     let _ = client
         .simple_query(&format!("DROP TABLE IF EXISTS {table}"))
         .await;
+    // `client.execute(sql, &[])` goes through Parse + Bind +
+    // Execute on the wire even with zero parameters; this is the
+    // shape that originally tripped SPI_ERROR_TRANSACTION (SPI
+    // backend) and the 0x7f7f7f7f WIPE_MEM UAF (direct backend)
+    // before the shared xact-control sniff was added.
     client.execute("BEGIN", &[]).await?;
     client
         .execute(&format!("CREATE TABLE {table} (n int)"), &[])
@@ -1046,47 +1049,12 @@ async fn xact_control_begin_commit_via_extended_query_spi_backend() -> Result<()
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Bug pin — xact-control via extended-query, direct backend (NOT YET FIXED)
-// ---------------------------------------------------------------------------
-//
-// The direct backend (`extended/direct.rs`) does not yet share
-// the simple-query xact-control sniff; its failure mode is more
-// severe than the now-fixed SPI path was: instead of a clean
-// `SPI_ERROR_TRANSACTION`, it surfaces PG's
-// `unrecognized node type: 2139062143` — that magic number is
-// `0x7f7f7f7f`, PG's WIPE_MEM clobber pattern for freed palloc'd
-// memory. This is a use-after-free symptom on the
-// `Portal*`-based path when handed a utility statement (BEGIN)
-// that the path was not designed to dispatch.
-//
-// Fix path: lift the same `classify_single_statement` /
-// `handle_xact_control_one` short-circuit into
-// `extended::direct::prepare` that `extended::spi::prepare` now
-// uses. Pinning the `0x7f7f7f7f` symptom here so we notice if
-// the failure mode changes (e.g. regresses into a hard crash).
-// When fixed, mirror `xact_control_begin_commit_via_extended_query_spi_backend`.
+#[tokio::test]
+async fn xact_control_begin_commit_via_extended_query_spi_backend() -> Result<()> {
+    run_xact_control_begin_commit_via_extended_query("spi").await
+}
 
 #[tokio::test]
-async fn xact_control_begin_via_extended_query_direct_backend_pins_bug() -> Result<()> {
-    let c = Cluster::shared().await;
-    let client = c.connect("postgres").await?;
-    client
-        .simple_query("SET pg_transport.execution_backend = 'direct'")
-        .await?;
-
-    let err = client
-        .execute("BEGIN", &[])
-        .await
-        .expect_err("KNOWN BUG: BEGIN via extended-query must currently fail (direct backend)");
-    let db = err
-        .as_db_error()
-        .unwrap_or_else(|| panic!("expected DbError, got: {err:?}"));
-    let m = db.message();
-    assert!(
-        m.contains("unrecognized node type") && m.contains("2139062143"),
-        "bug pin: expected the 0x7f7f7f7f WIPE_MEM symptom from \
-         direct-backend's utility-statement path; got: {m}"
-    );
-    Ok(())
+async fn xact_control_begin_commit_via_extended_query_direct_backend() -> Result<()> {
+    run_xact_control_begin_commit_via_extended_query("direct").await
 }

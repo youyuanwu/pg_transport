@@ -351,7 +351,7 @@ Positional arguments:
 | 6        | `threads`    | `16`                 | Concurrent worker threads per side (`--threads`); bound by `max_backend_pool_size` against pg_transport. |
 | 7        | `pool`       | `""`                 | Override `max_backend_pool_size`. Empty ⇒ ceiling stays at the default.                                  |
 | 8        | `backend`    | `spi`                | pg_transport execution backend: `spi` ([`extended/spi.rs`](../../crates/core/src/backend/extended/spi.rs)) or `direct` ([`extended/direct.rs`](../../crates/core/src/backend/extended/direct.rs)). Passed via `PGOPTIONS=-c pg_transport.execution_backend=...`. |
-| 9        | `skip_trx`   | `off`                | `on` appends `--skip_trx=on`, making sysbench run every query in libpq AUTOCOMMIT mode. The SPI backend now handles explicit BEGIN/COMMIT natively on the extended-query path (`extended::spi::prepare` sniff), so this is no longer required for the SPI workloads — see §3.2. Still required for the `direct` backend (extended-query xact-control UAF still pinned), and useful as a measurement axis: with/without explicit-transaction overhead. |
+| 9        | `skip_trx`   | `off`                | `on` appends `--skip_trx=on`, making sysbench run every query in libpq AUTOCOMMIT mode. Both backends now handle explicit BEGIN/COMMIT natively on the extended-query path (shared `spi_bridge::classify_raw_stmt` short-circuit), so this is no longer required for correctness — see §3.2. Still useful as a measurement axis: with/without explicit-transaction overhead. |
 
 ### 3.1 Why sysbench (complement to `just pgbench`)
 
@@ -373,47 +373,27 @@ around the per-transaction query group.
 
 ### 3.2 Workload matrix on v0 pg_transport
 
-The SPI backend (default — [`extended/spi.rs`](../../crates/core/src/backend/extended/spi.rs))
-now sniffs `BEGIN` / `COMMIT` / `ROLLBACK` at Parse time via
-[`spi_bridge::classify_single_statement`](../../crates/core/src/backend/spi_bridge.rs),
-so every sysbench workload runs end-to-end with sysbench's default
-explicit-transaction wrapping. The direct backend
-([`extended/direct.rs`](../../crates/core/src/backend/extended/direct.rs))
-does NOT yet have the sniff and crashes on `BEGIN` with a
-use-after-free symptom — see [crates/e2e/tests/basic.rs](../../crates/e2e/tests/basic.rs)
-`xact_control_begin_via_extended_query_direct_backend_pins_bug`.
+Both extended-query backends now sniff `BEGIN` / `COMMIT` /
+`ROLLBACK` directly from the parsed `RawStmt` they already
+produce — via [`spi_bridge::classify_raw_stmt`](../../crates/core/src/backend/spi_bridge.rs)
++ the shared [`extended::XactControlBackendPlan`](../../crates/core/src/backend/extended/mod.rs)
+— so every sysbench workload runs end-to-end with sysbench's
+default explicit-transaction wrapping. The classifier is pure
+pointer inspection of the node tag, so neither backend pays an
+additional parser pass on the hot path. The only remaining
+caveats are inherent to sysbench's per-thread workload generator.
 
-| Workload                | SPI backend (default) | direct backend ¹      | `skip_trx=on` workaround ² | Notes                                                              |
-| ----------------------- | --------------------- | --------------------- | -------------------------- | ------------------------------------------------------------------ |
-| `oltp_point_select`     | ✅ works               | ✅ works               | n/a                        | No transactions; runs natively on both backends.                   |
-| `oltp_read_only`        | ✅ works               | ❌ direct bug ¹        | ⚠️ workload-dep            | SPI backend handles native BEGIN/COMMIT.                           |
-| `oltp_read_write`       | ⚠️ sysbench race ³    | ❌ direct bug ¹        | ⚠️ threads=1 only ²        | Even with our BEGIN/COMMIT working, sysbench's INSERT/DELETE pair races on dup IDs across threads. |
-| `oltp_update_index`     | ✅ works               | ❌ direct bug ¹        | n/a                        | BEGIN/COMMIT-wrapped UPDATEs through SPI extended path.            |
-| `oltp_update_non_index` | ✅ works               | ❌ direct bug ¹        | n/a                        | Same as `oltp_update_index`.                                       |
-| `oltp_delete`           | ⚠️ sysbench race ³    | ❌ direct bug ¹        | ⚠️ threads=1 only ²        | Delete-then-insert pattern races across threads.                   |
-| `oltp_insert`           | ⚠️ sysbench race ³    | ❌ direct bug ¹        | ⚠️ threads=1 only ²        | INSERTs of monotonically-similar IDs across threads can collide.   |
+| Workload                | SPI backend (default) | direct backend     | `skip_trx=on` measurement axis ² | Notes                                                              |
+| ----------------------- | --------------------- | ------------------ | -------------------------------- | ------------------------------------------------------------------ |
+| `oltp_point_select`     | ✅ works               | ✅ works            | n/a                              | No transactions; runs natively on both backends.                   |
+| `oltp_read_only`        | ✅ works               | ✅ works            | optional                         | BEGIN/COMMIT-wrapped reads via shared xact-control sniff.          |
+| `oltp_read_write`       | ⚠️ sysbench race ¹    | ⚠️ sysbench race ¹  | optional                         | Backends work; sysbench's INSERT/DELETE pair races on dup IDs across threads. |
+| `oltp_update_index`     | ✅ works               | ✅ works            | optional                         | BEGIN/COMMIT-wrapped UPDATEs.                                      |
+| `oltp_update_non_index` | ✅ works               | ✅ works            | optional                         | Same as `oltp_update_index`.                                       |
+| `oltp_delete`           | ⚠️ sysbench race ¹    | ⚠️ sysbench race ¹  | optional                         | Delete-then-insert pattern races across threads.                   |
+| `oltp_insert`           | ⚠️ sysbench race ¹    | ⚠️ sysbench race ¹  | optional                         | INSERTs of monotonically-similar IDs across threads can collide.   |
 
-**¹ direct-backend bug: extended-query xact-control crashes with UAF.**
-The direct backend forwards xact-control statements straight into
-its `Portal*` path, which is not designed to dispatch utility
-statements (`TransactionStmt`). The symptom is PG's
-`unrecognized node type: 2139062143` — the `0x7f7f7f7f` WIPE_MEM
-clobber pattern, i.e. a use-after-free. Fix: lift the same
-[`classify_single_statement`](../../crates/core/src/backend/spi_bridge.rs) +
-[`handle_xact_control_one`](../../crates/core/src/backend/spi_bridge.rs)
-short-circuit that the SPI backend uses into
-[`extended::direct::prepare`](../../crates/core/src/backend/extended/direct.rs).
-Pinned by `xact_control_begin_via_extended_query_direct_backend_pins_bug`.
-
-**² `skip_trx=on` workaround (legacy axis).**
-Originally needed because both extended backends lacked the
-xact-control sniff (`SPI_ERROR_TRANSACTION` on first BEGIN). The
-SPI backend no longer needs it; the direct backend still does
-(and additionally needs the UAF fix above). `skip_trx=on` remains
-useful as a measurement axis to isolate explicit-transaction
-overhead from per-statement work.
-
-**³ sysbench race: `delete_inserts` is not idempotent across threads.**
+**¹ sysbench race: `delete_inserts` is not idempotent across threads.**
 `oltp_read_write` / `oltp_delete` / `oltp_insert` pick random row
 IDs without coordination: thread A's `DELETE WHERE id=X; INSERT id=X;`
 can interleave with thread B's same pair on the same X, causing
@@ -421,6 +401,14 @@ can interleave with thread B's same pair on the same X, causing
 constraint of sysbench's per-thread workload generator. The same
 race happens against vanilla PG at threads > 1; sysbench's docs
 recommend `threads=1` for those workloads.
+
+**² `skip_trx=on` measurement axis (legacy).**
+Originally a hard requirement because both extended backends
+lacked the xact-control sniff (`SPI_ERROR_TRANSACTION` /
+`0x7f7f7f7f` WIPE_MEM UAF on first BEGIN). Both fixes have
+landed, so it's no longer required for any workload. Still
+useful as a measurement axis to isolate explicit-transaction
+overhead from per-statement work.
 
 ### 3.3 Initialization
 
@@ -521,18 +509,24 @@ work is justified by the early numbers.
 
 > **Status: shipped 2026-05-23.** User-facing docs in [§3](#3-just-sysbench--diverse-oltp-workloads-via-sysbench);
 > implementation: [`just/sysbench.just`](../../just/sysbench.just).
-> Surfaced two findings worth pursuing separately:
-> 1. **pg_transport bug (SPI backend fixed 2026-05-23; direct backend still broken).**
+> Surfaced two findings:
+> 1. **pg_transport bug (both backends fixed 2026-05-23).**
 >    The extended-query path didn't sniff `BEGIN`/`COMMIT` the way
->    `spi_bridge.rs::parse_and_classify` does for simple-query. The
->    SPI backend now shares the sniff via
->    `spi_bridge::classify_single_statement` +
->    `handle_xact_control_one` (see the short-circuit at the top of
->    `extended::spi::prepare`). The direct backend still forwards
->    xact-control into its `Portal*` path and crashes with a
->    `0x7f7f7f7f` WIPE_MEM use-after-free symptom — pinned by
->    `xact_control_begin_via_extended_query_direct_backend_pins_bug`.
->    See [§3.2](#32-workload-matrix-on-v0-pg_transport).
+>    `spi_bridge.rs::parse_and_classify` does for simple-query.
+>    Both backends now share a single classifier
+>    (`spi_bridge::classify_raw_stmt` — pure pointer inspection
+>    of the `RawStmt` each backend already parses) plus the
+>    shared `extended::XactControlBackendPlan`. SPI backend
+>    folds the check into its existing `pg_analyze_and_rewrite_varparams`
+>    parse; direct backend folds it into its existing
+>    `pg_parse_query` call inside `with_xact`. Neither path adds
+>    an additional parser pass for the non-xact-control hot
+>    path. SPI was originally failing with `SPI_ERROR_TRANSACTION`
+>    on first BEGIN; direct was tripping a `0x7f7f7f7f` WIPE_MEM
+>    use-after-free on its `Portal*` path. Both behaviours
+>    pinned (and now validated) by the
+>    `xact_control_begin_commit_via_extended_query_*_backend`
+>    tests in `crates/e2e/tests/basic.rs`.
 > 2. **sysbench design constraint** — `oltp_read_write` /
 >    `oltp_delete` / `oltp_insert` race on `delete_inserts` at
 >    threads > 1, both against vanilla PG and pg_transport. Not a
@@ -645,7 +639,7 @@ tps. Worth landing alongside Phase A or B.
 | Step              | Effort  | Decision after                                                                                       |
 | ----------------- | ------- | ---------------------------------------------------------------------------------------------------- |
 | Showcase 1        | ~1 day  | **Shipped 2026-05-23.** Predicted 5–15×; measured 7.78× / 10.22× / 11.80× at clients = 4 / 16 / 32. This is the headline benchmark. |
-| Phase A (sysbench)| ~2 days | **Shipped 2026-05-23.** Harness works; smoke at clients=4 shows ~0.81× (point_select) and ~0.88× (read_only). Surfaced an extended-query xact-control bug — the SPI backend's side was [fixed 2026-05-23](#32-workload-matrix-on-v0-pg_transport) (so `oltp_read_*` / `oltp_update_*` now run with default explicit BEGIN/COMMIT); direct backend still UAFs. Proper sweep belongs in [performance.md](performance.md). |
+| Phase A (sysbench)| ~2 days | **Shipped 2026-05-23.** Harness works; smoke at clients=4 shows ~0.81× (point_select) and ~0.88× (read_only). Surfaced an extended-query xact-control bug — both the SPI and direct backends were [fixed 2026-05-23](#32-workload-matrix-on-v0-pg_transport) (SPI: SPI_ERROR_TRANSACTION on first BEGIN; direct: `0x7f7f7f7f` WIPE_MEM UAF on the Portal path). Both run all sysbench workloads with default explicit BEGIN/COMMIT now. Proper sweep belongs in [performance.md](performance.md). |
 | Sidecar (RSS)     | ~½ day  | Combine with Phase A; without it the "memory win" story is hand-waved.                              |
 | Phase B (pgbouncer)| ~3 days | The point at which we have publishable 4-way numbers.                                              |
 | Phase C (HammerDB)| ~1 week | Only if external audience asks for a formal TPC-C tpmC number.                                     |
