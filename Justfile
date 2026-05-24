@@ -12,6 +12,7 @@ set dotenv-load := true
 import 'just/doctor.just'
 import 'just/bench.just'
 import 'just/pgbench.just'
+import 'just/sysbench.just'
 import 'just/e2e.just'
 
 # Pin every cargo-pgrx invocation to a user-global Postgres install at

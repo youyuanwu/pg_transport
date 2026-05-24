@@ -325,7 +325,143 @@ confounder.
 
 ---
 
-## 3. Planned showcase work
+## 3. `just sysbench` — diverse OLTP workloads via sysbench
+
+```sh
+just sysbench [pg] [workload] [tables] [table_size] [duration] [threads] [pool] [backend] [skip_trx]
+```
+
+[sysbench](https://github.com/akopytov/sysbench) is **opt-in** — the
+recipe gates on `which sysbench` and exits with an install hint if
+missing. On Debian/Ubuntu: `sudo apt install sysbench`; on macOS:
+`brew install sysbench`.
+
+Same dual-listener pattern as `just pgbench` (§2): spin up a fresh
+cluster, run sysbench against both ports side-by-side, tear down.
+
+Positional arguments:
+
+| Position | Name         | Default              | Meaning                                                                                                  |
+| -------- | ------------ | -------------------- | -------------------------------------------------------------------------------------------------------- |
+| 1        | `pg`         | `pg18`               | Postgres major.                                                                                          |
+| 2        | `workload`   | `oltp_read_write`    | sysbench test name: `oltp_read_only` \| `oltp_read_write` \| `oltp_point_select` \| `oltp_insert` \| `oltp_update_index` \| `oltp_update_non_index` \| `oltp_delete`. See §3.2 for which work on v0 pg_transport. |
+| 3        | `tables`     | `16`                 | Number of bench tables.                                                                                  |
+| 4        | `table_size` | `100000`             | Rows per table. Default (~16 MB total) fits in default `shared_buffers` (128 MB) — cache-hot bench. Bump to `1000000` (~1.6 GB, ~12× `shared_buffers`) for real disk traffic. Prepare time: ~5 s at 100k, ~60 s at 1M. |
+| 5        | `duration`   | `30`                 | Seconds (`--time`).                                                                                      |
+| 6        | `threads`    | `16`                 | Concurrent worker threads per side (`--threads`); bound by `max_backend_pool_size` against pg_transport. |
+| 7        | `pool`       | `""`                 | Override `max_backend_pool_size`. Empty ⇒ ceiling stays at the default.                                  |
+| 8        | `backend`    | `spi`                | pg_transport execution backend: `spi` ([`extended/spi.rs`](../../crates/core/src/backend/extended/spi.rs)) or `direct` ([`extended/direct.rs`](../../crates/core/src/backend/extended/direct.rs)). Passed via `PGOPTIONS=-c pg_transport.execution_backend=...`. |
+| 9        | `skip_trx`   | `off`                | `on` appends `--skip_trx=on`, making sysbench run every query in libpq AUTOCOMMIT mode. **Required for `oltp_read_*` / `oltp_update_*` workloads on v0 pg_transport** — see §3.2. Also a real measurement axis: with/without explicit-transaction overhead. |
+
+### 3.1 Why sysbench (complement to `just pgbench`)
+
+`pgbench -M simple` exercises the simple-query (`'Q'` message)
+path; `sysbench` uses libpq's extended-query / prepared-statement
+path by default. The two recipes therefore exercise different code
+paths in pg_transport:
+
+| Recipe        | Wire-protocol path                                                                                | pg_transport backend code                                                                          |
+| ------------- | ------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `just pgbench`| Simple-query (`'Q'`)                                                                              | [`spi_bridge.rs`](../../crates/core/src/backend/spi_bridge.rs) / [`simple_direct.rs`](../../crates/core/src/backend/simple_direct.rs) |
+| `just sysbench`| Extended-query: `Parse` / `Bind` / `Execute` per `PQprepare` / `PQexecPrepared`                  | [`extended/spi.rs`](../../crates/core/src/backend/extended/spi.rs) / [`extended/direct.rs`](../../crates/core/src/backend/extended/direct.rs) |
+
+sysbench also exercises **diverse query shapes** that pgbench's
+TPC-B-like script does not: range scans (`simple_ranges`),
+ordered-range, sum/distinct aggregations, point selects in batches
+of 10, plus mixed read-write patterns with explicit `BEGIN/COMMIT`
+around the per-transaction query group.
+
+### 3.2 Workload matrix on v0 pg_transport
+
+Two limitations gate which sysbench workloads currently run
+end-to-end:
+
+| Workload                | Without `skip_trx=on` | With `skip_trx=on` | Notes                                                                                  |
+| ----------------------- | --------------------- | ------------------ | -------------------------------------------------------------------------------------- |
+| `oltp_point_select`     | ✅ works               | ✅ works            | No transactions to skip; runs natively.                                                |
+| `oltp_read_only`        | ❌ pg_transport bug ¹  | ✅ works            | Need `skip_trx=on` until the xact-control bug is fixed.                                |
+| `oltp_read_write`       | ❌ pg_transport bug ¹  | ⚠️ threads=1 only ² | Bug + sysbench race require both `skip_trx=on` AND `threads=1`.                        |
+| `oltp_update_index`     | ❌ pg_transport bug ¹  | ⚠️ threads=1 only ² | Same as `oltp_read_write`.                                                             |
+| `oltp_update_non_index` | ❌ pg_transport bug ¹  | ⚠️ threads=1 only ² | Same as `oltp_read_write`.                                                             |
+| `oltp_delete`           | ❌ pg_transport bug ¹  | ⚠️ threads=1 only ² | Same as `oltp_read_write`.                                                             |
+| `oltp_insert`           | ❌ pg_transport bug ¹  | ⚠️ threads=1 only ² | Same as `oltp_read_write`.                                                             |
+
+**¹ pg_transport bug: extended-query xact-control not sniffed.**
+sysbench wraps each transaction in explicit `BEGIN` / `COMMIT`
+statements that are sent through libpq's `PQprepare` / `PQexecPrepared`
+(i.e. extended-query Parse + Execute, not simple-query `'Q'`). The
+simple-query SPI bridge has a sniff (`spi_bridge.rs::parse_xact_control`)
+that intercepts these before SPI sees them; the extended-query
+paths ([`extended/spi.rs`](../../crates/core/src/backend/extended/spi.rs),
+[`extended/direct.rs`](../../crates/core/src/backend/extended/direct.rs))
+do not. The result: `SPI_execute_plan` returns `SPI_ERROR_TRANSACTION`
+on the first `BEGIN`. Filing the equivalent sniff for the extended
+path is the unblock; not done as part of this recipe.
+
+**² sysbench race: `delete_inserts` is not idempotent under AUTOCOMMIT.**
+`oltp_read_write` (and any workload with INSERT/DELETE pairs picking
+random IDs) races across threads when `--skip_trx=on`: thread A's
+`DELETE WHERE id=X; INSERT id=X;` can interleave with thread B's
+same pair on the same X, causing `ERRCODE_UNIQUE_VIOLATION`. Not a
+pg_transport bug — design constraint of sysbench's
+"skip transactions" mode at threads > 1.
+
+### 3.3 Initialization
+
+`sysbench prepare` runs against the **vanilla port** (54329), in
+the `postgres` database (not the sysbench default `sbtest`) —
+v0 slots hard-code the SPI database to `postgres`, per [§2.5](#25-known-limitations-v0).
+pg_transport reads/writes the same data files via SPI/direct.
+
+Bench tables live in the throwaway cluster and are dropped with
+the cluster in `cleanup()`, so each invocation is deterministic.
+
+### 3.4 Sample invocations
+
+```sh
+# Cache-hot point-select at moderate concurrency
+just sysbench pg18 oltp_point_select 16 100000  30 16
+
+# Read-only with the workaround required by §3.2
+just sysbench pg18 oltp_read_only    16 100000  30 16 "" spi on
+
+# Read-write with both workarounds required by §3.2
+just sysbench pg18 oltp_read_write   16 100000  30  1 "" spi on
+
+# Larger-than-cache working set (real disk traffic)
+just sysbench pg18 oltp_point_select 16 1000000 60 16
+```
+
+### 3.5 Smoke-test numbers (2026-05-23)
+
+These are **smoke-test quality** (single run, 10 s, 4 threads, tiny
+4-table × 10k-row dataset), captured during recipe bring-up to
+validate the harness wires up. They are **not** publishable
+benchmark numbers — a proper sweep belongs in [performance.md](performance.md)
+and is a follow-up.
+
+| Workload + flags                            | Vanilla tps | pg_transport tps | Ratio | Vanilla p95 | pg_transport p95 |
+| ------------------------------------------- | ----------: | ---------------: | ----: | ----------: | ---------------: |
+| `oltp_point_select` (no skip_trx)           |      21 210 |           17 275 | 0.81x |     0.28 ms |          0.31 ms |
+| `oltp_read_only` (skip_trx=on)              |       1 067 (tps) / 14 940 (qps) |  941 (tps) / 13 173 (qps) | 0.88x |     4.41 ms |          4.91 ms |
+
+Mechanical reading (one run, treat as directional only):
+
+- The extended-query/prepared-statement path runs at ~80–90% of
+  vanilla on these workloads. That gap is bigger than the ~95%
+  steady-state parity the simple-query path achieves on `pgbench -S`
+  (see [performance.md §2 — pgbench, 15 s, 8 clients](performance.md#pgbench-15-s-8-clients));
+  it suggests there is meaningful work to do on the extended-query
+  hot path, but the smoke-test sample is too small to attribute the
+  delta to specific causes.
+- Phase A's deliverable is the **harness**, not the numbers. Drawing
+  conclusions from these requires a proper sweep with longer runs,
+  3-run means, multiple thread counts, and probably both backend
+  modes.
+
+---
+
+## 4. Planned showcase work
 
 The §1 and §2 recipes cover **steady-state same-connection** workloads.
 At fixed concurrency with long-lived connections, the framework hop is
@@ -351,55 +487,12 @@ This section captures the planned work to surface both regimes
 honestly in the harness. The full ecosystem positioning that motivates
 the comparison set lives in [comparison.md §1](comparison.md#1-pgbouncer).
 
-### 3.1 Showcase 1 — connection churn (`pgbench -C`)
+### 3.1 Showcase 1 — connection churn (`pgbench -C`) — shipped
 
-> **Status: shipped.** User-facing docs in §2.7; this subsection is
-> kept as the historical planning record. Implementation:
-> [`just/pgbench.just`](../../just/pgbench.just) `connect` + `script`
-> parameters; probe script
-> [`bench/scripts/select_one.sql`](../../bench/scripts/select_one.sql).
-
-Extend [`just/pgbench.just`](../../just/pgbench.just) with two new
-positional parameters:
-
-| Position | Name      | Default | Meaning                                                                                          |
-| -------- | --------- | ------- | ------------------------------------------------------------------------------------------------ |
-| 7        | `connect` | `0`     | When `1`, appends `-C` to `pgbench` invocations (reconnect per transaction). Triggers the win.   |
-| 8        | `script`  | `""`    | When non-empty, appends `-f <path>` (overrides built-in `-S`/`-N`/tpcb). For minimal probes.     |
-
-Supporting deliverables:
-
-- **`bench/scripts/select_one.sql`** — `SELECT 1;`. The cleanest probe
-  for "what is the round-trip floor when execution cost is zero" —
-  isolates the handoff win from any query work.
-- **`bench/scripts/noop.sql`** — empty (or `;`). Optional; pure protocol
-  round-trip floor.
-- **`max_connections` auto-bump** in the generated `postgresql.conf`
-  when `connect=1`: set to `max(100, clients * 4)`. Default 100 chokes
-  under `-C` at `clients ≥ 32` because of `TIME_WAIT`-equivalent
-  backend lifecycle states during the reconnect burst. Document the
-  caveat in §3.4 below.
-
-Sample invocations after the change:
-
-```sh
-just pgbench pg18 select 30 32 "" spi 1                      # -C with built-in -S
-just pgbench pg18 select 30 32 "" spi 1 bench/scripts/select_one.sql
-just pgbench pg18 select 30 32 "" spi 0                      # baseline (no -C)
-```
-
-The `connect=0` / `connect=1` pair on the same hardware in the same
-harness run is the chart that tells the connection-churn story.
-
-**Effort:** ~30 LOC justfile + 2 trivial `.sql` files + ~40 lines of
-doc here in §3.4 once landed.
-
-**Risks:**
-
-- `pgbench -C` saturates the kernel's loopback ephemeral port range
-  at very high `-c`. Keep `clients ≤ 64` for `-C` mode and document
-  the ceiling.
-- Vanilla's `max_connections` ceiling needs bumping (above).
+- **Mechanism + how-to:** [§2.7 Connection-churn mode](#27-connection-churn-mode-connect1).
+- **Measured numbers:** [performance.md §2 — "pgbench, connection-churn (`-C`)"](performance.md#pgbench-connection-churn--c-20-s-3-runs-each-2026-05-23).
+- **Outcome vs. predicted 5–15×:** 7.78× / 10.22× / 11.80× at clients = 4 / 16 / 32. Ratio grows with concurrency because vanilla bottlenecks on the single-threaded postmaster `fork()` loop while our `SCM_RIGHTS` handoff stays parallel.
+- **Implementation:** [`just/pgbench.just`](../../just/pgbench.just) `connect` + `script` params; [`bench/scripts/select_one.sql`](../../bench/scripts/select_one.sql) minimal-execution probe.
 
 ### 3.2 Showcase 2 — high-concurrency OLTP (sysbench → pgbouncer comparison)
 
@@ -408,7 +501,23 @@ vs `pg_transport`, not bare vanilla. Phased so we can land the
 sysbench harness alone first and decide whether the pgbouncer/HammerDB
 work is justified by the early numbers.
 
-#### Phase A — sysbench harness
+#### Phase A — sysbench harness — shipped
+
+> **Status: shipped 2026-05-23.** User-facing docs in [§3](#3-just-sysbench--diverse-oltp-workloads-via-sysbench);
+> implementation: [`just/sysbench.just`](../../just/sysbench.just).
+> Surfaced two findings worth pursuing separately:
+> 1. **pg_transport bug** — the extended-query path doesn't sniff
+>    `BEGIN`/`COMMIT` the way `spi_bridge.rs::parse_xact_control`
+>    does for simple-query. Blocks `oltp_read_*` /
+>    `oltp_update_*` / `oltp_delete` / `oltp_insert` workloads
+>    without `skip_trx=on`. See [§3.2](#32-workload-matrix-on-v0-pg_transport).
+> 2. **sysbench design constraint** — `oltp_read_write` with
+>    `--skip_trx=on` races on `delete_inserts` at threads > 1.
+>    Not a pg_transport bug; documented as a `threads=1` ceiling
+>    in the workload matrix.
+>
+> The original Phase A description (intent, scope, effort
+> estimate) is kept below as the historical planning record.
 
 [`sysbench`](https://github.com/akopytov/sysbench) is the cheapest
 third-party OLTP driver to plumb (apt/brew install, clean CLI, no TCL
@@ -512,8 +621,8 @@ tps. Worth landing alongside Phase A or B.
 
 | Step              | Effort  | Decision after                                                                                       |
 | ----------------- | ------- | ---------------------------------------------------------------------------------------------------- |
-| Showcase 1        | ~1 day  | If `connect=1` shows the predicted 5–15× ratio, this becomes the headline benchmark.                |
-| Phase A (sysbench)| ~2 days | If `oltp_read_write` numbers track the predicted "~1.05–1.15× vs vanilla" story, proceed to Phase B. |
+| Showcase 1        | ~1 day  | **Shipped 2026-05-23.** Predicted 5–15×; measured 7.78× / 10.22× / 11.80× at clients = 4 / 16 / 32. This is the headline benchmark. |
+| Phase A (sysbench)| ~2 days | **Shipped 2026-05-23.** Harness works; smoke at clients=4 shows ~0.81× (point_select) and ~0.88× (read_only). Surfaced an extended-query xact-control bug (`oltp_read_*` needs `skip_trx=on`) — see [§3.2](#32-workload-matrix-on-v0-pg_transport). Proper sweep belongs in [performance.md](performance.md). |
 | Sidecar (RSS)     | ~½ day  | Combine with Phase A; without it the "memory win" story is hand-waved.                              |
 | Phase B (pgbouncer)| ~3 days | The point at which we have publishable 4-way numbers.                                              |
 | Phase C (HammerDB)| ~1 week | Only if external audience asks for a formal TPC-C tpmC number.                                     |
@@ -534,12 +643,14 @@ tps. Worth landing alongside Phase A or B.
 
 ---
 
-## 4. Source-of-truth pointers
+## 5. Source-of-truth pointers
 
 - Custom harness: [`crates/bench/src/main.rs`](../../crates/bench/src/main.rs)
 - `just bench` recipe: [`just/bench.just`](../../just/bench.just)
 - `just pgbench` recipe: [`just/pgbench.just`](../../just/pgbench.just)
-- SPI bridge (the thing both harnesses ultimately stress on the
-  pg_transport side): [`crates/core/src/backend/spi_bridge.rs`](../../crates/core/src/backend/spi_bridge.rs)
+- `just sysbench` recipe: [`just/sysbench.just`](../../just/sysbench.just)
+- Connection-churn probe script: [`bench/scripts/select_one.sql`](../../bench/scripts/select_one.sql)
+- SPI bridge (simple-query path, both harnesses stress this for `-M simple` workloads): [`crates/core/src/backend/spi_bridge.rs`](../../crates/core/src/backend/spi_bridge.rs)
+- Extended-query paths (sysbench's default protocol path): [`crates/core/src/backend/extended/spi.rs`](../../crates/core/src/backend/extended/spi.rs), [`crates/core/src/backend/extended/direct.rs`](../../crates/core/src/backend/extended/direct.rs)
 - Pool sizing GUC: [`crates/core/src/guc.rs`](../../crates/core/src/guc.rs)
 - Capacity caveats (`max_worker_processes`): [`crates/core/src/lib.rs`](../../crates/core/src/lib.rs) `_PG_init`
