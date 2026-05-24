@@ -1,0 +1,504 @@
+=========================================================
+=== [1/24] connections=1 be=spi iters=2000 run=1 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+    Finished `release` profile [optimized] target(s) in 0.08s
+bench: connections=1 iters=2000 mode=spi pool_ceiling=
+bench compare: pt=127.0.0.1:5454 pg=127.0.0.1:54329 iterations=2000 warmup=100 connections=1 mode=Spi
+
+connections=1
+stat        vanilla µs  pg_transport µs         diff µs       pt/pg
+----------  ----------  --------------  --------------  ----------
+min              137.2           122.4             0.0       0.89x
+p50              147.1           138.5             0.0       0.94x
+p95              159.8           161.0             1.2       1.01x
+p99              169.3           281.5           112.2       1.66x
+max              563.4          3114.2          2550.8       5.53x
+mean             149.2           147.0             0.0       0.98x
+qps            6695.7          6798.3                       1.02x
+=========================================================
+=== [2/24] connections=1 be=spi iters=2000 run=2 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+    Finished `release` profile [optimized] target(s) in 0.07s
+bench: connections=1 iters=2000 mode=spi pool_ceiling=
+bench compare: pt=127.0.0.1:5454 pg=127.0.0.1:54329 iterations=2000 warmup=100 connections=1 mode=Spi
+
+connections=1
+stat        vanilla µs  pg_transport µs         diff µs       pt/pg
+----------  ----------  --------------  --------------  ----------
+min              136.4           125.3             0.0       0.92x
+p50              149.2           178.5            29.3       1.20x
+p95              164.2           226.5            62.3       1.38x
+p99              177.9           327.3           149.4       1.84x
+max              613.6          2793.8          2180.2       4.55x
+mean             151.6           182.8            31.2       1.21x
+qps            6590.5          5467.2                       0.83x
+=========================================================
+=== [3/24] connections=1 be=spi iters=2000 run=3 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+    Finished `release` profile [optimized] target(s) in 0.09s
+bench: connections=1 iters=2000 mode=spi pool_ceiling=
+bench compare: pt=127.0.0.1:5454 pg=127.0.0.1:54329 iterations=2000 warmup=100 connections=1 mode=Spi
+
+connections=1
+stat        vanilla µs  pg_transport µs         diff µs       pt/pg
+----------  ----------  --------------  --------------  ----------
+min              137.6           124.2             0.0       0.90x
+p50              148.3           139.4             0.0       0.94x
+p95              162.3           153.9             0.0       0.95x
+p99              274.6           166.2             0.0       0.61x
+max             2414.7           413.1             0.0       0.17x
+mean             155.5           141.0             0.0       0.91x
+qps            6424.8          7085.3                       1.10x
+=========================================================
+=== [4/24] connections=1 be=direct iters=2000 run=1 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+    Finished `release` profile [optimized] target(s) in 0.07s
+bench: connections=1 iters=2000 mode=direct pool_ceiling=
+bench compare: pt=127.0.0.1:5454 pg=127.0.0.1:54329 iterations=2000 warmup=100 connections=1 mode=Direct
+
+connections=1
+stat        vanilla µs  pg_transport µs         diff µs       pt/pg
+----------  ----------  --------------  --------------  ----------
+min              139.7           118.8             0.0       0.85x
+p50              150.2           137.4             0.0       0.91x
+p95              164.3           162.8             0.0       0.99x
+p99              171.1           199.2            28.1       1.16x
+max              548.5           726.5           178.0       1.32x
+mean             152.3           141.7             0.0       0.93x
+qps            6563.2          7054.2                       1.07x
+=========================================================
+=== [5/24] connections=1 be=direct iters=2000 run=2 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.13s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+    Finished `release` profile [optimized] target(s) in 0.08s
+bench: connections=1 iters=2000 mode=direct pool_ceiling=
+bench compare: pt=127.0.0.1:5454 pg=127.0.0.1:54329 iterations=2000 warmup=100 connections=1 mode=Direct
+
+connections=1
+stat        vanilla µs  pg_transport µs         diff µs       pt/pg
+----------  ----------  --------------  --------------  ----------
+min              136.8           124.3             0.0       0.91x
+p50              148.1           139.7             0.0       0.94x
+p95              161.7           161.4             0.0       1.00x
+p99              196.3           181.3             0.0       0.92x
+max              622.7           301.4             0.0       0.48x
+mean             151.4           141.9             0.0       0.94x
+qps            6600.2          7043.3                       1.07x
+=========================================================
+=== [6/24] connections=1 be=direct iters=2000 run=3 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+    Finished `release` profile [optimized] target(s) in 0.08s
+bench: connections=1 iters=2000 mode=direct pool_ceiling=
+bench compare: pt=127.0.0.1:5454 pg=127.0.0.1:54329 iterations=2000 warmup=100 connections=1 mode=Direct
+
+connections=1
+stat        vanilla µs  pg_transport µs         diff µs       pt/pg
+----------  ----------  --------------  --------------  ----------
+min              137.0           118.4             0.0       0.86x
+p50              154.4           136.1             0.0       0.88x
+p95              236.0           170.8             0.0       0.72x
+p99              287.2           205.0             0.0       0.71x
+max              852.2           529.3             0.0       0.62x
+mean             171.6           140.7             0.0       0.82x
+qps            5820.3          7103.2                       1.22x
+=========================================================
+=== [7/24] connections=4 be=spi iters=4000 run=1 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.13s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+    Finished `release` profile [optimized] target(s) in 0.08s
+bench: connections=4 iters=4000 mode=spi pool_ceiling=
+bench compare: pt=127.0.0.1:5454 pg=127.0.0.1:54329 iterations=4000 warmup=100 connections=4 mode=Spi
+
+connections=4
+stat        vanilla µs  pg_transport µs         diff µs       pt/pg
+----------  ----------  --------------  --------------  ----------
+min              134.5           131.5             0.0       0.98x
+p50              227.6           205.9             0.0       0.90x
+p95              283.7           262.2             0.0       0.92x
+p99              311.1           309.5             0.0       0.99x
+max             1694.1           418.6             0.0       0.25x
+mean             225.8           208.7             0.0       0.92x
+qps           16968.4         19080.0                       1.12x
+=========================================================
+=== [8/24] connections=4 be=spi iters=4000 run=2 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+    Finished `release` profile [optimized] target(s) in 0.08s
+bench: connections=4 iters=4000 mode=spi pool_ceiling=
+bench compare: pt=127.0.0.1:5454 pg=127.0.0.1:54329 iterations=4000 warmup=100 connections=4 mode=Spi
+
+connections=4
+stat        vanilla µs  pg_transport µs         diff µs       pt/pg
+----------  ----------  --------------  --------------  ----------
+min              136.1           128.5             0.0       0.94x
+p50              234.1           208.5             0.0       0.89x
+p95              288.0           269.4             0.0       0.94x
+p99              323.1           310.4             0.0       0.96x
+max             1249.8           534.7             0.0       0.43x
+mean             231.7           211.6             0.0       0.91x
+qps           15527.9         18760.3                       1.21x
+=========================================================
+=== [9/24] connections=4 be=spi iters=4000 run=3 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+    Finished `release` profile [optimized] target(s) in 0.08s
+bench: connections=4 iters=4000 mode=spi pool_ceiling=
+bench compare: pt=127.0.0.1:5454 pg=127.0.0.1:54329 iterations=4000 warmup=100 connections=4 mode=Spi
+
+connections=4
+stat        vanilla µs  pg_transport µs         diff µs       pt/pg
+----------  ----------  --------------  --------------  ----------
+min              133.5           124.0             0.0       0.93x
+p50              227.1           201.9             0.0       0.89x
+p95              294.7           233.4             0.0       0.79x
+p99              329.3           248.7             0.0       0.76x
+max              470.7           545.5            74.8       1.16x
+mean             227.6           201.3             0.0       0.88x
+qps           16798.0         19594.6                       1.17x
+=========================================================
+=== [10/24] connections=4 be=direct iters=4000 run=1 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.13s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+    Finished `release` profile [optimized] target(s) in 0.08s
+bench: connections=4 iters=4000 mode=direct pool_ceiling=
+bench compare: pt=127.0.0.1:5454 pg=127.0.0.1:54329 iterations=4000 warmup=100 connections=4 mode=Direct
+
+connections=4
+stat        vanilla µs  pg_transport µs         diff µs       pt/pg
+----------  ----------  --------------  --------------  ----------
+min              134.3           134.1             0.0       1.00x
+p50              234.9           194.7             0.0       0.83x
+p95              301.7           230.7             0.0       0.76x
+p99              355.3           249.0             0.0       0.70x
+max              696.7           850.0           153.2       1.22x
+mean             234.3           195.0             0.0       0.83x
+qps           16198.6         20423.8                       1.26x
+=========================================================
+=== [11/24] connections=4 be=direct iters=4000 run=2 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+    Finished `release` profile [optimized] target(s) in 0.08s
+bench: connections=4 iters=4000 mode=direct pool_ceiling=
+bench compare: pt=127.0.0.1:5454 pg=127.0.0.1:54329 iterations=4000 warmup=100 connections=4 mode=Direct
+
+connections=4
+stat        vanilla µs  pg_transport µs         diff µs       pt/pg
+----------  ----------  --------------  --------------  ----------
+min              130.4           128.3             0.0       0.98x
+p50              220.8           192.7             0.0       0.87x
+p95              291.6           230.0             0.0       0.79x
+p99              350.8           245.2             0.0       0.70x
+max             1418.2           664.1             0.0       0.47x
+mean             224.4           192.9             0.0       0.86x
+qps           16824.6         20486.4                       1.22x
+=========================================================
+=== [12/24] connections=4 be=direct iters=4000 run=3 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+    Finished `release` profile [optimized] target(s) in 0.08s
+bench: connections=4 iters=4000 mode=direct pool_ceiling=
+bench compare: pt=127.0.0.1:5454 pg=127.0.0.1:54329 iterations=4000 warmup=100 connections=4 mode=Direct
+
+connections=4
+stat        vanilla µs  pg_transport µs         diff µs       pt/pg
+----------  ----------  --------------  --------------  ----------
+min              133.9           120.4             0.0       0.90x
+p50              228.3           190.2             0.0       0.83x
+p95              270.3           227.6             0.0       0.84x
+p99              286.8           243.3             0.0       0.85x
+max              751.1           336.6             0.0       0.45x
+mean             223.6           190.5             0.0       0.85x
+qps           17581.4         20835.4                       1.19x
+=========================================================
+=== [13/24] connections=8 be=spi iters=8000 run=1 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+    Finished `release` profile [optimized] target(s) in 0.07s
+bench: connections=8 iters=8000 mode=spi pool_ceiling=
+bench compare: pt=127.0.0.1:5454 pg=127.0.0.1:54329 iterations=8000 warmup=100 connections=8 mode=Spi
+
+connections=8
+stat        vanilla µs  pg_transport µs         diff µs       pt/pg
+----------  ----------  --------------  --------------  ----------
+min              139.4           123.9             0.0       0.89x
+p50              332.2           281.2             0.0       0.85x
+p95              508.6           416.8             0.0       0.82x
+p99              622.4           513.3             0.0       0.82x
+max             1275.3          3130.0          1854.8       2.45x
+mean             348.1           291.7             0.0       0.84x
+qps           22493.2         27205.7                       1.21x
+=========================================================
+=== [14/24] connections=8 be=spi iters=8000 run=2 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+    Finished `release` profile [optimized] target(s) in 0.08s
+bench: connections=8 iters=8000 mode=spi pool_ceiling=
+bench compare: pt=127.0.0.1:5454 pg=127.0.0.1:54329 iterations=8000 warmup=100 connections=8 mode=Spi
+
+connections=8
+stat        vanilla µs  pg_transport µs         diff µs       pt/pg
+----------  ----------  --------------  --------------  ----------
+min              154.1           129.4             0.0       0.84x
+p50              356.3           289.2             0.0       0.81x
+p95              575.0           426.9             0.0       0.74x
+p99              751.4           504.0             0.0       0.67x
+max             4207.4          1589.9             0.0       0.38x
+mean             378.7           297.3             0.0       0.79x
+qps           20442.7         26618.3                       1.30x
+=========================================================
+=== [15/24] connections=8 be=spi iters=8000 run=3 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+    Finished `release` profile [optimized] target(s) in 0.07s
+bench: connections=8 iters=8000 mode=spi pool_ceiling=
+bench compare: pt=127.0.0.1:5454 pg=127.0.0.1:54329 iterations=8000 warmup=100 connections=8 mode=Spi
+
+connections=8
+stat        vanilla µs  pg_transport µs         diff µs       pt/pg
+----------  ----------  --------------  --------------  ----------
+min              165.2           125.7             0.0       0.76x
+p50              336.0           281.6             0.0       0.84x
+p95              484.9           415.3             0.0       0.86x
+p99              559.3           501.3             0.0       0.90x
+max             2042.1          2241.7           199.6       1.10x
+mean             346.0           291.1             0.0       0.84x
+qps           22884.0         27140.5                       1.19x
+=========================================================
+=== [16/24] connections=8 be=direct iters=8000 run=1 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+    Finished `release` profile [optimized] target(s) in 0.08s
+bench: connections=8 iters=8000 mode=direct pool_ceiling=
+bench compare: pt=127.0.0.1:5454 pg=127.0.0.1:54329 iterations=8000 warmup=100 connections=8 mode=Direct
+
+connections=8
+stat        vanilla µs  pg_transport µs         diff µs       pt/pg
+----------  ----------  --------------  --------------  ----------
+min              160.9           126.2             0.0       0.78x
+p50              336.6           270.2             0.0       0.80x
+p95              501.3           397.5             0.0       0.79x
+p99              586.8           473.1             0.0       0.81x
+max              852.0          1274.1           422.1       1.50x
+mean             349.9           278.9             0.0       0.80x
+qps           22685.9         28357.5                       1.25x
+=========================================================
+=== [17/24] connections=8 be=direct iters=8000 run=2 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+    Finished `release` profile [optimized] target(s) in 0.07s
+bench: connections=8 iters=8000 mode=direct pool_ceiling=
+bench compare: pt=127.0.0.1:5454 pg=127.0.0.1:54329 iterations=8000 warmup=100 connections=8 mode=Direct
+
+connections=8
+stat        vanilla µs  pg_transport µs         diff µs       pt/pg
+----------  ----------  --------------  --------------  ----------
+min              160.0           121.1             0.0       0.76x
+p50              357.6           275.3             0.0       0.77x
+p95              578.7           460.2             0.0       0.80x
+p99              854.3           729.9             0.0       0.85x
+max             5418.2          3893.2             0.0       0.72x
+mean             387.0           304.2             0.0       0.79x
+qps           20321.7         25850.5                       1.27x
+=========================================================
+=== [18/24] connections=8 be=direct iters=8000 run=3 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+    Finished `release` profile [optimized] target(s) in 0.07s
+bench: connections=8 iters=8000 mode=direct pool_ceiling=
+bench compare: pt=127.0.0.1:5454 pg=127.0.0.1:54329 iterations=8000 warmup=100 connections=8 mode=Direct
+
+connections=8
+stat        vanilla µs  pg_transport µs         diff µs       pt/pg
+----------  ----------  --------------  --------------  ----------
+min              165.6           126.9             0.0       0.77x
+p50              335.6           273.1             0.0       0.81x
+p95              490.1           404.2             0.0       0.82x
+p99              568.3           500.1             0.0       0.88x
+max              749.2          1784.1          1035.0       2.38x
+mean             346.5           283.6             0.0       0.82x
+qps           22801.5         28000.4                       1.23x
+=========================================================
+=== [19/24] connections=16 be=spi iters=16000 run=1 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+    Finished `release` profile [optimized] target(s) in 0.08s
+bench: connections=16 iters=16000 mode=spi pool_ceiling=
+bench compare: pt=127.0.0.1:5454 pg=127.0.0.1:54329 iterations=16000 warmup=100 connections=16 mode=Spi
+
+connections=16
+stat        vanilla µs  pg_transport µs         diff µs       pt/pg
+----------  ----------  --------------  --------------  ----------
+min              136.9           119.9             0.0       0.88x
+p50              484.3           428.4             0.0       0.88x
+p95              777.0           719.5             0.0       0.93x
+p99             1092.0           995.3             0.0       0.91x
+max             5310.7          3818.8             0.0       0.72x
+mean             516.5           452.9             0.0       0.88x
+qps           29978.3         34564.1                       1.15x
+=========================================================
+=== [20/24] connections=16 be=spi iters=16000 run=2 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+    Finished `release` profile [optimized] target(s) in 0.08s
+bench: connections=16 iters=16000 mode=spi pool_ceiling=
+bench compare: pt=127.0.0.1:5454 pg=127.0.0.1:54329 iterations=16000 warmup=100 connections=16 mode=Spi
+
+connections=16
+stat        vanilla µs  pg_transport µs         diff µs       pt/pg
+----------  ----------  --------------  --------------  ----------
+min              137.7           120.7             0.0       0.88x
+p50              492.0           423.6             0.0       0.86x
+p95              810.5           697.8             0.0       0.86x
+p99             1219.0          1050.9             0.0       0.86x
+max             6886.0          5741.3             0.0       0.83x
+mean             528.7           451.0             0.0       0.85x
+qps           29124.4         34621.5                       1.19x
+=========================================================
+=== [21/24] connections=16 be=spi iters=16000 run=3 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+    Finished `release` profile [optimized] target(s) in 0.08s
+bench: connections=16 iters=16000 mode=spi pool_ceiling=
+bench compare: pt=127.0.0.1:5454 pg=127.0.0.1:54329 iterations=16000 warmup=100 connections=16 mode=Spi
+
+connections=16
+stat        vanilla µs  pg_transport µs         diff µs       pt/pg
+----------  ----------  --------------  --------------  ----------
+min              181.7           122.7             0.0       0.68x
+p50              466.0           406.3             0.0       0.87x
+p95              797.2           649.4             0.0       0.81x
+p99             1180.6           982.7             0.0       0.83x
+max             9341.8          4205.3             0.0       0.45x
+mean             512.9           426.5             0.0       0.83x
+qps           29532.4         36213.7                       1.23x
+=========================================================
+=== [22/24] connections=16 be=direct iters=16000 run=1 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+    Finished `release` profile [optimized] target(s) in 0.07s
+bench: connections=16 iters=16000 mode=direct pool_ceiling=
+bench compare: pt=127.0.0.1:5454 pg=127.0.0.1:54329 iterations=16000 warmup=100 connections=16 mode=Direct
+
+connections=16
+stat        vanilla µs  pg_transport µs         diff µs       pt/pg
+----------  ----------  --------------  --------------  ----------
+min              138.0           121.0             0.0       0.88x
+p50              462.7           421.5             0.0       0.91x
+p95              805.6           717.4             0.0       0.89x
+p99             1422.1          1185.4             0.0       0.83x
+max             4507.5          6958.3          2450.8       1.54x
+mean             518.6           450.7             0.0       0.87x
+qps           29262.8         34859.2                       1.19x
+=========================================================
+=== [23/24] connections=16 be=direct iters=16000 run=2 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+    Finished `release` profile [optimized] target(s) in 0.08s
+bench: connections=16 iters=16000 mode=direct pool_ceiling=
+bench compare: pt=127.0.0.1:5454 pg=127.0.0.1:54329 iterations=16000 warmup=100 connections=16 mode=Direct
+
+connections=16
+stat        vanilla µs  pg_transport µs         diff µs       pt/pg
+----------  ----------  --------------  --------------  ----------
+min              138.1           116.2             0.0       0.84x
+p50              488.9           399.8             0.0       0.82x
+p95              825.8           681.6             0.0       0.83x
+p99             1297.8          1015.9             0.0       0.78x
+max             6300.1          3350.5             0.0       0.53x
+mean             528.5           423.7             0.0       0.80x
+qps           28863.2         36738.4                       1.27x
+=========================================================
+=== [24/24] connections=16 be=direct iters=16000 run=3 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+    Finished `release` profile [optimized] target(s) in 0.08s
+bench: connections=16 iters=16000 mode=direct pool_ceiling=
+bench compare: pt=127.0.0.1:5454 pg=127.0.0.1:54329 iterations=16000 warmup=100 connections=16 mode=Direct
+
+connections=16
+stat        vanilla µs  pg_transport µs         diff µs       pt/pg
+----------  ----------  --------------  --------------  ----------
+min              130.5           120.1             0.0       0.92x
+p50              507.9           414.7             0.0       0.82x
+p95              878.9           720.5             0.0       0.82x
+p99             1215.7          1101.1             0.0       0.91x
+max             3908.0          4746.1           838.1       1.21x
+mean             545.7           443.5             0.0       0.81x
+qps           26846.1         35419.2                       1.32x

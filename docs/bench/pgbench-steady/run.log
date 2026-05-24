@@ -1,0 +1,828 @@
+=========================================================
+=== [1/18] mode=select be=spi clients=8 run=1 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+pgbench: initialising via vanilla port (54329) ...
+creating primary keys...
+done in 0.33 s (drop tables 0.00 s, create tables 0.01 s, client-side generate 0.17 s, vacuum 0.10 s, primary keys 0.06 s).
+
+pgbench: clients=8 duration=15s mode=select backend=spi pool_ceiling= connect=0
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+pgbench (18.4)
+transaction type: <builtin: select only>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 528570
+number of failed transactions: 0 (0.000%)
+latency average = 0.227 ms
+initial connection time = 8.272 ms
+tps = 35256.869477 (without initial connection time)
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+pgbench (18.4, server 16.6-pgwire-0.40.0)
+transaction type: <builtin: select only>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 536490
+number of failed transactions: 0 (0.000%)
+latency average = 0.224 ms
+initial connection time = 7.747 ms
+tps = 35783.619854 (without initial connection time)
+=========================================================
+=== [2/18] mode=select be=spi clients=8 run=2 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+pgbench: initialising via vanilla port (54329) ...
+creating primary keys...
+done in 0.33 s (drop tables 0.00 s, create tables 0.01 s, client-side generate 0.17 s, vacuum 0.10 s, primary keys 0.05 s).
+
+pgbench: clients=8 duration=15s mode=select backend=spi pool_ceiling= connect=0
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+pgbench (18.4)
+transaction type: <builtin: select only>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 537743
+number of failed transactions: 0 (0.000%)
+latency average = 0.223 ms
+initial connection time = 5.847 ms
+tps = 35862.682984 (without initial connection time)
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+pgbench (18.4, server 16.6-pgwire-0.40.0)
+transaction type: <builtin: select only>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 541399
+number of failed transactions: 0 (0.000%)
+latency average = 0.222 ms
+initial connection time = 7.670 ms
+tps = 36110.850243 (without initial connection time)
+=========================================================
+=== [3/18] mode=select be=spi clients=8 run=3 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+pgbench: initialising via vanilla port (54329) ...
+creating primary keys...
+done in 0.34 s (drop tables 0.00 s, create tables 0.01 s, client-side generate 0.17 s, vacuum 0.11 s, primary keys 0.05 s).
+
+pgbench: clients=8 duration=15s mode=select backend=spi pool_ceiling= connect=0
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+pgbench (18.4)
+transaction type: <builtin: select only>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 532714
+number of failed transactions: 0 (0.000%)
+latency average = 0.225 ms
+initial connection time = 6.367 ms
+tps = 35528.542035 (without initial connection time)
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+pgbench (18.4, server 16.6-pgwire-0.40.0)
+transaction type: <builtin: select only>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 541387
+number of failed transactions: 0 (0.000%)
+latency average = 0.222 ms
+initial connection time = 8.483 ms
+tps = 36112.000852 (without initial connection time)
+=========================================================
+=== [4/18] mode=select be=direct clients=8 run=1 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+pgbench: initialising via vanilla port (54329) ...
+creating primary keys...
+done in 0.35 s (drop tables 0.00 s, create tables 0.01 s, client-side generate 0.20 s, vacuum 0.09 s, primary keys 0.05 s).
+
+pgbench: clients=8 duration=15s mode=select backend=direct pool_ceiling= connect=0
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+pgbench (18.4)
+transaction type: <builtin: select only>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 540286
+number of failed transactions: 0 (0.000%)
+latency average = 0.222 ms
+initial connection time = 6.172 ms
+tps = 36033.018651 (without initial connection time)
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+pgbench (18.4, server 16.6-pgwire-0.40.0)
+transaction type: <builtin: select only>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 538831
+number of failed transactions: 0 (0.000%)
+latency average = 0.223 ms
+initial connection time = 7.711 ms
+tps = 35938.768610 (without initial connection time)
+=========================================================
+=== [5/18] mode=select be=direct clients=8 run=2 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+pgbench: initialising via vanilla port (54329) ...
+creating primary keys...
+done in 0.33 s (drop tables 0.00 s, create tables 0.01 s, client-side generate 0.15 s, vacuum 0.11 s, primary keys 0.05 s).
+
+pgbench: clients=8 duration=15s mode=select backend=direct pool_ceiling= connect=0
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+pgbench (18.4)
+transaction type: <builtin: select only>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 534559
+number of failed transactions: 0 (0.000%)
+latency average = 0.224 ms
+initial connection time = 6.299 ms
+tps = 35651.548677 (without initial connection time)
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+pgbench (18.4, server 16.6-pgwire-0.40.0)
+transaction type: <builtin: select only>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 538898
+number of failed transactions: 0 (0.000%)
+latency average = 0.223 ms
+initial connection time = 7.599 ms
+tps = 35943.930196 (without initial connection time)
+=========================================================
+=== [6/18] mode=select be=direct clients=8 run=3 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.13s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+pgbench: initialising via vanilla port (54329) ...
+creating primary keys...
+done in 0.34 s (drop tables 0.00 s, create tables 0.01 s, client-side generate 0.16 s, vacuum 0.12 s, primary keys 0.05 s).
+
+pgbench: clients=8 duration=15s mode=select backend=direct pool_ceiling= connect=0
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+pgbench (18.4)
+transaction type: <builtin: select only>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 536723
+number of failed transactions: 0 (0.000%)
+latency average = 0.223 ms
+initial connection time = 9.536 ms
+tps = 35803.490421 (without initial connection time)
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+pgbench (18.4, server 16.6-pgwire-0.40.0)
+transaction type: <builtin: select only>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 539741
+number of failed transactions: 0 (0.000%)
+latency average = 0.222 ms
+initial connection time = 7.687 ms
+tps = 36000.198230 (without initial connection time)
+=========================================================
+=== [7/18] mode=nupdate be=spi clients=8 run=1 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+pgbench: initialising via vanilla port (54329) ...
+creating primary keys...
+done in 0.31 s (drop tables 0.00 s, create tables 0.01 s, client-side generate 0.15 s, vacuum 0.10 s, primary keys 0.05 s).
+
+pgbench: clients=8 duration=15s mode=nupdate backend=spi pool_ceiling= connect=0
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+pgbench (18.4)
+transaction type: <builtin: simple update>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 43172
+number of failed transactions: 0 (0.000%)
+latency average = 2.779 ms
+initial connection time = 5.819 ms
+tps = 2878.371471 (without initial connection time)
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+pgbench (18.4, server 16.6-pgwire-0.40.0)
+transaction type: <builtin: simple update>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 44190
+number of failed transactions: 0 (0.000%)
+latency average = 2.715 ms
+initial connection time = 7.695 ms
+tps = 2946.998247 (without initial connection time)
+=========================================================
+=== [8/18] mode=nupdate be=spi clients=8 run=2 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+pgbench: initialising via vanilla port (54329) ...
+creating primary keys...
+done in 0.33 s (drop tables 0.00 s, create tables 0.01 s, client-side generate 0.17 s, vacuum 0.10 s, primary keys 0.05 s).
+
+pgbench: clients=8 duration=15s mode=nupdate backend=spi pool_ceiling= connect=0
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+pgbench (18.4)
+transaction type: <builtin: simple update>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 44768
+number of failed transactions: 0 (0.000%)
+latency average = 2.680 ms
+initial connection time = 6.052 ms
+tps = 2984.875002 (without initial connection time)
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+pgbench (18.4, server 16.6-pgwire-0.40.0)
+transaction type: <builtin: simple update>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 42912
+number of failed transactions: 0 (0.000%)
+latency average = 2.795 ms
+initial connection time = 7.713 ms
+tps = 2861.964629 (without initial connection time)
+=========================================================
+=== [9/18] mode=nupdate be=spi clients=8 run=3 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+pgbench: initialising via vanilla port (54329) ...
+creating primary keys...
+done in 0.33 s (drop tables 0.00 s, create tables 0.02 s, client-side generate 0.15 s, vacuum 0.09 s, primary keys 0.08 s).
+
+pgbench: clients=8 duration=15s mode=nupdate backend=spi pool_ceiling= connect=0
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+pgbench (18.4)
+transaction type: <builtin: simple update>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 45242
+number of failed transactions: 0 (0.000%)
+latency average = 2.652 ms
+initial connection time = 5.897 ms
+tps = 3016.300436 (without initial connection time)
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+pgbench (18.4, server 16.6-pgwire-0.40.0)
+transaction type: <builtin: simple update>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 46080
+number of failed transactions: 0 (0.000%)
+latency average = 2.603 ms
+initial connection time = 7.656 ms
+tps = 3073.014505 (without initial connection time)
+=========================================================
+=== [10/18] mode=nupdate be=direct clients=8 run=1 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+pgbench: initialising via vanilla port (54329) ...
+creating primary keys...
+done in 0.30 s (drop tables 0.00 s, create tables 0.01 s, client-side generate 0.15 s, vacuum 0.08 s, primary keys 0.05 s).
+
+pgbench: clients=8 duration=15s mode=nupdate backend=direct pool_ceiling= connect=0
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+pgbench (18.4)
+transaction type: <builtin: simple update>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 45379
+number of failed transactions: 0 (0.000%)
+latency average = 2.644 ms
+initial connection time = 5.907 ms
+tps = 3025.641645 (without initial connection time)
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+pgbench (18.4, server 16.6-pgwire-0.40.0)
+transaction type: <builtin: simple update>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 43611
+number of failed transactions: 0 (0.000%)
+latency average = 2.751 ms
+initial connection time = 7.758 ms
+tps = 2908.473809 (without initial connection time)
+=========================================================
+=== [11/18] mode=nupdate be=direct clients=8 run=2 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+pgbench: initialising via vanilla port (54329) ...
+creating primary keys...
+done in 0.39 s (drop tables 0.00 s, create tables 0.01 s, client-side generate 0.25 s, vacuum 0.07 s, primary keys 0.05 s).
+
+pgbench: clients=8 duration=15s mode=nupdate backend=direct pool_ceiling= connect=0
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+pgbench (18.4)
+transaction type: <builtin: simple update>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 43698
+number of failed transactions: 0 (0.000%)
+latency average = 2.746 ms
+initial connection time = 6.012 ms
+tps = 2913.437737 (without initial connection time)
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+pgbench (18.4, server 16.6-pgwire-0.40.0)
+transaction type: <builtin: simple update>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 44782
+number of failed transactions: 0 (0.000%)
+latency average = 2.679 ms
+initial connection time = 7.884 ms
+tps = 2986.505373 (without initial connection time)
+=========================================================
+=== [12/18] mode=nupdate be=direct clients=8 run=3 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+pgbench: initialising via vanilla port (54329) ...
+creating primary keys...
+done in 0.32 s (drop tables 0.00 s, create tables 0.01 s, client-side generate 0.16 s, vacuum 0.09 s, primary keys 0.05 s).
+
+pgbench: clients=8 duration=15s mode=nupdate backend=direct pool_ceiling= connect=0
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+pgbench (18.4)
+transaction type: <builtin: simple update>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 44323
+number of failed transactions: 0 (0.000%)
+latency average = 2.707 ms
+initial connection time = 5.862 ms
+tps = 2954.982699 (without initial connection time)
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+pgbench (18.4, server 16.6-pgwire-0.40.0)
+transaction type: <builtin: simple update>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 44325
+number of failed transactions: 0 (0.000%)
+latency average = 2.706 ms
+initial connection time = 7.778 ms
+tps = 2956.157631 (without initial connection time)
+=========================================================
+=== [13/18] mode=tpcb be=spi clients=8 run=1 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+pgbench: initialising via vanilla port (54329) ...
+creating primary keys...
+done in 0.30 s (drop tables 0.00 s, create tables 0.01 s, client-side generate 0.17 s, vacuum 0.07 s, primary keys 0.05 s).
+
+pgbench: clients=8 duration=15s mode=tpcb backend=spi pool_ceiling= connect=0
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+pgbench (18.4)
+transaction type: <builtin: TPC-B (sort of)>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 8484
+number of failed transactions: 0 (0.000%)
+latency average = 14.155 ms
+initial connection time = 5.908 ms
+tps = 565.164823 (without initial connection time)
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+pgbench (18.4, server 16.6-pgwire-0.40.0)
+transaction type: <builtin: TPC-B (sort of)>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 9409
+number of failed transactions: 0 (0.000%)
+latency average = 12.758 ms
+initial connection time = 7.857 ms
+tps = 627.071271 (without initial connection time)
+=========================================================
+=== [14/18] mode=tpcb be=spi clients=8 run=2 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+pgbench: initialising via vanilla port (54329) ...
+creating primary keys...
+done in 0.31 s (drop tables 0.00 s, create tables 0.01 s, client-side generate 0.18 s, vacuum 0.07 s, primary keys 0.05 s).
+
+pgbench: clients=8 duration=15s mode=tpcb backend=spi pool_ceiling= connect=0
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+pgbench (18.4)
+transaction type: <builtin: TPC-B (sort of)>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 8757
+number of failed transactions: 0 (0.000%)
+latency average = 13.714 ms
+initial connection time = 5.953 ms
+tps = 583.366325 (without initial connection time)
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+pgbench (18.4, server 16.6-pgwire-0.40.0)
+transaction type: <builtin: TPC-B (sort of)>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 9404
+number of failed transactions: 0 (0.000%)
+latency average = 12.765 ms
+initial connection time = 7.709 ms
+tps = 626.722212 (without initial connection time)
+=========================================================
+=== [15/18] mode=tpcb be=spi clients=8 run=3 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+pgbench: initialising via vanilla port (54329) ...
+creating primary keys...
+done in 0.33 s (drop tables 0.00 s, create tables 0.02 s, client-side generate 0.17 s, vacuum 0.10 s, primary keys 0.05 s).
+
+pgbench: clients=8 duration=15s mode=tpcb backend=spi pool_ceiling= connect=0
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+pgbench (18.4)
+transaction type: <builtin: TPC-B (sort of)>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 8596
+number of failed transactions: 0 (0.000%)
+latency average = 13.968 ms
+initial connection time = 5.870 ms
+tps = 572.727268 (without initial connection time)
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+pgbench (18.4, server 16.6-pgwire-0.40.0)
+transaction type: <builtin: TPC-B (sort of)>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 9526
+number of failed transactions: 0 (0.000%)
+latency average = 12.600 ms
+initial connection time = 7.900 ms
+tps = 634.900619 (without initial connection time)
+=========================================================
+=== [16/18] mode=tpcb be=direct clients=8 run=1 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+pgbench: initialising via vanilla port (54329) ...
+creating primary keys...
+done in 0.30 s (drop tables 0.00 s, create tables 0.01 s, client-side generate 0.14 s, vacuum 0.09 s, primary keys 0.05 s).
+
+pgbench: clients=8 duration=15s mode=tpcb backend=direct pool_ceiling= connect=0
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+pgbench (18.4)
+transaction type: <builtin: TPC-B (sort of)>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 8674
+number of failed transactions: 0 (0.000%)
+latency average = 13.840 ms
+initial connection time = 5.987 ms
+tps = 578.029867 (without initial connection time)
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+pgbench (18.4, server 16.6-pgwire-0.40.0)
+transaction type: <builtin: TPC-B (sort of)>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 9359
+number of failed transactions: 0 (0.000%)
+latency average = 12.826 ms
+initial connection time = 7.811 ms
+tps = 623.718109 (without initial connection time)
+=========================================================
+=== [17/18] mode=tpcb be=direct clients=8 run=2 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+pgbench: initialising via vanilla port (54329) ...
+creating primary keys...
+done in 0.31 s (drop tables 0.00 s, create tables 0.01 s, client-side generate 0.17 s, vacuum 0.08 s, primary keys 0.05 s).
+
+pgbench: clients=8 duration=15s mode=tpcb backend=direct pool_ceiling= connect=0
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+pgbench (18.4)
+transaction type: <builtin: TPC-B (sort of)>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 8685
+number of failed transactions: 0 (0.000%)
+latency average = 13.824 ms
+initial connection time = 6.038 ms
+tps = 578.711802 (without initial connection time)
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+pgbench (18.4, server 16.6-pgwire-0.40.0)
+transaction type: <builtin: TPC-B (sort of)>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 9266
+number of failed transactions: 0 (0.000%)
+latency average = 12.956 ms
+initial connection time = 7.732 ms
+tps = 617.483705 (without initial connection time)
+=========================================================
+=== [18/18] mode=tpcb be=direct clients=8 run=3 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+pgbench: initialising via vanilla port (54329) ...
+creating primary keys...
+done in 0.30 s (drop tables 0.00 s, create tables 0.01 s, client-side generate 0.17 s, vacuum 0.07 s, primary keys 0.05 s).
+
+pgbench: clients=8 duration=15s mode=tpcb backend=direct pool_ceiling= connect=0
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+pgbench (18.4)
+transaction type: <builtin: TPC-B (sort of)>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 8836
+number of failed transactions: 0 (0.000%)
+latency average = 13.589 ms
+initial connection time = 5.671 ms
+tps = 588.714262 (without initial connection time)
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+pgbench (18.4, server 16.6-pgwire-0.40.0)
+transaction type: <builtin: TPC-B (sort of)>
+scaling factor: 1
+query mode: simple
+number of clients: 8
+number of threads: 8
+maximum number of tries: 1
+duration: 15 s
+number of transactions actually processed: 9353
+number of failed transactions: 0 (0.000%)
+latency average = 12.834 ms
+initial connection time = 7.765 ms
+tps = 623.337896 (without initial connection time)

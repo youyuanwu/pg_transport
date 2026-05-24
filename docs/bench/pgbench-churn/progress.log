@@ -1,0 +1,52 @@
+pgbench sweep — pg_transport vs vanilla PG
+  repo:      /home/azureuser/pg_transport
+  outdir:    /home/azureuser/pg_transport/docs/bench/pgbench-churn
+  pg:        pg18
+  modes:     select
+  backends:  spi
+  clients:   4 16 32
+  duration:  20s
+  connect:   1 (average connection time (per tx, -C))
+  script:    <none>
+  pool:      <default>
+  runs/cell: 3
+  started:   2026-05-24T18:51:11+00:00
+
+[2026-05-24T18:51:11+00:00] START [1/9] mode=select be=spi clients=4 run=1
+[2026-05-24T18:51:55+00:00] DONE  [1/9] mode=select be=spi clients=4 run=1  vanilla_tps=659.527724 pgt_tps=7209.473474 ratio=10.93 44s ok
+[2026-05-24T18:51:55+00:00] START [2/9] mode=select be=spi clients=4 run=2
+[2026-05-24T18:52:39+00:00] DONE  [2/9] mode=select be=spi clients=4 run=2  vanilla_tps=654.423136 pgt_tps=6979.499146 ratio=10.67 44s ok
+[2026-05-24T18:52:39+00:00] START [3/9] mode=select be=spi clients=4 run=3
+[2026-05-24T18:53:23+00:00] DONE  [3/9] mode=select be=spi clients=4 run=3  vanilla_tps=650.565569 pgt_tps=7189.964799 ratio=11.05 44s ok
+[2026-05-24T18:53:23+00:00] START [4/9] mode=select be=spi clients=16 run=1
+[2026-05-24T18:54:07+00:00] DONE  [4/9] mode=select be=spi clients=16 run=1  vanilla_tps=822.507532 pgt_tps=11945.262293 ratio=14.52 44s ok
+[2026-05-24T18:54:07+00:00] START [5/9] mode=select be=spi clients=16 run=2
+[2026-05-24T18:54:51+00:00] DONE  [5/9] mode=select be=spi clients=16 run=2  vanilla_tps=831.699955 pgt_tps=11921.869405 ratio=14.33 44s ok
+[2026-05-24T18:54:51+00:00] START [6/9] mode=select be=spi clients=16 run=3
+[2026-05-24T18:55:35+00:00] DONE  [6/9] mode=select be=spi clients=16 run=3  vanilla_tps=829.600050 pgt_tps=11985.708926 ratio=14.45 44s ok
+[2026-05-24T18:55:35+00:00] START [7/9] mode=select be=spi clients=32 run=1
+[2026-05-24T18:56:19+00:00] DONE  [7/9] mode=select be=spi clients=32 run=1  vanilla_tps=824.762408 pgt_tps=12147.324158 ratio=14.73 44s ok
+[2026-05-24T18:56:19+00:00] START [8/9] mode=select be=spi clients=32 run=2
+[2026-05-24T18:57:03+00:00] DONE  [8/9] mode=select be=spi clients=32 run=2  vanilla_tps=821.589802 pgt_tps=12011.979883 ratio=14.62 44s ok
+[2026-05-24T18:57:03+00:00] START [9/9] mode=select be=spi clients=32 run=3
+[2026-05-24T18:57:48+00:00] DONE  [9/9] mode=select be=spi clients=32 run=3  vanilla_tps=826.263607 pgt_tps=12227.201866 ratio=14.80 45s ok
+
+[2026-05-24T18:57:48+00:00] SWEEP COMPLETE in 397s
+
+results.tsv:
+mode    backend  clients  run  vanilla_tps  pgt_tps       vanilla_lat_ms  pgt_lat_ms  vanilla_conn_ms  pgt_conn_ms  vanilla_failed  pgt_failed
+select  spi      4        1    659.527724   7209.473474   6.065           0.555       3.514            0.343        0               0
+select  spi      4        2    654.423136   6979.499146   6.112           0.573       3.548            0.356        0               0
+select  spi      4        3    650.565569   7189.964799   6.148           0.556       3.564            0.344        0               0
+select  spi      16       1    822.507532   11945.262293  19.453          1.339       11.622           0.813        0               0
+select  spi      16       2    831.699955   11921.869405  19.238          1.342       11.595           0.814        0               0
+select  spi      16       3    829.600050   11985.708926  19.286          1.335       11.580           0.809        0               0
+select  spi      32       1    824.762408   12147.324158  38.799          2.634       24.619           1.771        0               0
+select  spi      32       2    821.589802   12011.979883  38.949          2.664       24.857           1.790        0               0
+select  spi      32       3    826.263607   12227.201866  38.729          2.617       24.584           1.753        0               0
+
+Outputs:
+  /home/azureuser/pg_transport/docs/bench/pgbench-churn/results.tsv
+  /home/azureuser/pg_transport/docs/bench/pgbench-churn/results.md
+  /home/azureuser/pg_transport/docs/bench/pgbench-churn/run.log
+  /home/azureuser/pg_transport/docs/bench/pgbench-churn/progress.log

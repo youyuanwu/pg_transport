@@ -1,0 +1,49 @@
+=== uname ===
+Linux test-rg1 6.17.0-1015-azure #15~24.04.1-Ubuntu SMP Wed May  6 22:37:49 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+
+=== /etc/os-release ===
+PRETTY_NAME="Ubuntu 24.04.4 LTS"
+NAME="Ubuntu"
+VERSION="24.04.4 LTS (Noble Numbat)"
+
+=== lscpu (compact) ===
+  Architecture:                            x86_64
+  CPU(s):                                  8
+  Vendor ID:                               GenuineIntel
+  Model name:                              Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz
+  Thread(s) per core:                      2
+  Core(s) per socket:                      4
+  Socket(s):                               1
+  CPU max MHz:                             2800.0000
+  CPU min MHz:                             800.0000
+  Virtualization:                          VT-x
+  Hypervisor vendor:                       Microsoft
+  Virtualization type:                     full
+
+=== free -h ===
+               total        used        free      shared  buff/cache   available
+Mem:            31Gi       1.9Gi        19Gi       5.1Mi        10Gi        29Gi
+Swap:             0B          0B          0B
+
+=== df -h /tmp ===
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/root        29G   12G   17G  40% /
+
+=== git ===
+61f7e16dbeb386550cafa7f7f4065da5433a9c97
+fix(extended): sniff xact-control on direct backend Parse path + sysbench sweep
+2026-05-24 08:33:42 -0700
+M  .github/workflows/ci.yml
+M  docs/design/bench.md
+M  docs/design/performance.md
+M  just/bench.just
+A  scripts/bench_sweep.sh
+A  scripts/pgbench_sweep.sh
+?? docs/bench/
+
+=== tool versions ===
+rustc 1.95.0 (59807616e 2026-04-14)
+psql (PostgreSQL) 18.4
+pgbench (PostgreSQL) 18.4
+sysbench 1.0.20
+just 1.21.0

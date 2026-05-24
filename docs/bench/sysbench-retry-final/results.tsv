@@ -1,0 +1,2 @@
+workload	backend	threads	vanilla_tps	pgt_tps	ratio
+oltp_update_index	direct	32	6872.39	6110.97	0.889
