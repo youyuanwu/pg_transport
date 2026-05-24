@@ -148,7 +148,7 @@ captured runs.
 ## 2. `just pgbench` — TPC-B-like workload via pgbench
 
 ```sh
-just pgbench [pg] [mode] [duration] [clients] [pool] [backend]
+just pgbench [pg] [mode] [duration] [clients] [pool] [backend] [connect] [script]
 ```
 
 Positional arguments:
@@ -156,11 +156,13 @@ Positional arguments:
 | Position | Name       | Default | Meaning                                                                                                  |
 | -------- | ---------- | ------- | -------------------------------------------------------------------------------------------------------- |
 | 1        | `pg`       | `pg18`  | Postgres major.                                                                                          |
-| 2        | `mode`     | `select`| `select` runs `pgbench -S` (read-only), `nupdate` runs `pgbench -N` (simple update), and `tpcb` / `tpcb-rw` run default TPC-B-like mode. |
+| 2        | `mode`     | `select`| `select` runs `pgbench -S` (read-only), `nupdate` runs `pgbench -N` (simple update), and `tpcb` / `tpcb-rw` run default TPC-B-like mode. Ignored when `script` is set. |
 | 3        | `duration` | `10`    | Seconds (`pgbench -T`).                                                                                   |
 | 4        | `clients`  | `4`     | Concurrent clients per side (`pgbench -c -j`); bound by `max_backend_pool_size` against pg_transport.   |
 | 5        | `pool`     | `""`    | Override `max_backend_pool_size`. Empty ⇒ `pool = clients`.                                            |
 | 6        | `backend`  | `spi`   | pg_transport execution backend (`spi` or `direct`) passed via `PGOPTIONS=-c pg_transport.execution_backend=...` on the pg_transport-side run. |
+| 7        | `connect`  | `0`     | `1` appends `-C` (reconnect per transaction) to pgbench. Triggers the connection-churn showcase — see §2.7. Also auto-bumps `max_connections` to `max(100, clients * 4)` to survive the reconnect burst. |
+| 8        | `script`   | `""`    | Custom pgbench script path (`-f`). Overrides `mode`. Use [`bench/scripts/select_one.sql`](../../bench/scripts/select_one.sql) for the minimal-execution probe that pairs with `connect=1`. |
 
 ### 2.1 Initialisation
 
@@ -248,9 +250,291 @@ Mechanism:
 
 Concrete numbers from recent runs live in [`reviews/`](reviews/); design decisions that change the SPI bridge or wire layer should re-run and update.
 
+### 2.7 Connection-churn mode (`connect=1`)
+
+The steady-state numbers in §2.6 measure the framework cost when
+connections are long-lived and the per-connection fork/init is
+amortised to zero — the regime where `pg_transport` is, by design,
+at parity with vanilla. The connection-churn mode is where the
+architecture *wins*.
+
+**What it does:** appends pgbench's `-C` flag, which opens a fresh
+TCP connection per transaction. Vanilla PG pays the full
+per-connection cost on every transaction; `pg_transport` hands the
+fd to an already-warm slot bgworker via `SCM_RIGHTS` and pays
+essentially nothing (see [frontend-handoff.md](frontend-handoff.md)).
+
+**Per-transaction cost decomposition:**
+
+| Component                                | Vanilla PG          | pg_transport (handoff)    |
+| ---------------------------------------- | ------------------- | ------------------------- |
+| `fork()` postmaster → backend            | ~1–2 ms             | **0** (slot already alive)|
+| Backend init (RelCache / CatCache warm)  | ~0.5–1 ms (warm)    | **0** (slot is hot)       |
+| Authentication round-trip                | ~0.2 ms             | ~0.2 ms                   |
+| TCP handshake (loopback)                 | ~0.1 ms             | ~0.1 ms                   |
+| `SELECT 1` execution                     | ~0.05 ms            | ~0.05 ms                  |
+| Backend exit + cleanup                   | ~0.5 ms             | **0** (slot returns to pool)|
+| **Per-tx total**                         | **~2–4 ms**         | **~0.4 ms**               |
+
+Expected ratio: **5–15×** depending on whether vanilla's catalog
+caches are warm and on hardware. Published pgbouncer-vs-vanilla
+numbers in the same regime stabilise around 4–8× for the same
+reason — we're solving the same problem.
+
+**Sample invocations:**
+
+```sh
+just pgbench pg18 select 30 32 "" spi 1                                # -C with built-in -S
+just pgbench pg18 select 30 32 "" spi 1 bench/scripts/select_one.sql   # -C with minimal probe
+just pgbench pg18 select 30 32 "" spi 0                                # baseline (no -C)
+```
+
+Run the `connect=0` / `connect=1` pair on the same hardware in the
+same harness invocation — the ratio between them is the
+connection-churn story we publish.
+
+**Custom-script probe ([`bench/scripts/select_one.sql`](../../bench/scripts/select_one.sql)):**
+A bare `SELECT 1;` rather than pgbench's built-in select-only
+(`SELECT abalance FROM pgbench_accounts WHERE aid = :aid`). The
+built-in does a real index lookup that adds ~50 µs of execution per
+tx; the custom probe drops that to near zero so the `connect=1`
+ratio reflects pure connection-setup overhead with no query-cost
+confounder.
+
+**Caveats:**
+
+- **`max_connections` auto-bump.** The recipe sets
+  `max_connections = max(100, clients * 4)` whenever `connect=1`.
+  Default 100 chokes under burst at `clients ≥ 32` because backends
+  linger briefly in lifecycle states after disconnect, and pgbench's
+  `-C` reconnect rate outpaces that drain. The bump is in the
+  generated cluster config only — it does not affect any other
+  recipe.
+- **Ephemeral-port pressure.** At very high `clients` (≥64) on
+  loopback, the kernel's ephemeral port range (default ~28k) plus
+  `TIME_WAIT` (60 s default) can exhaust source ports during the
+  reconnect burst. Symptom: `pgbench` reports connection failures
+  partway through the run. Mitigation: lower `clients` or shorten
+  `duration`. We don't ship sysctl tuning in the recipe.
+- **Vanilla side does most of the work.** Because vanilla is the
+  one paying the cost, the per-side runtime is asymmetric: the
+  vanilla run takes meaningfully longer wall-clock than the
+  pg_transport run at the same `-T`, because vanilla completes
+  fewer transactions per second. This is the point of the
+  benchmark, not a bug.
+
 ---
 
-## 3. Source-of-truth pointers
+## 3. Planned showcase work
+
+The §1 and §2 recipes cover **steady-state same-connection** workloads.
+At fixed concurrency with long-lived connections, the framework hop is
+a meaningful fraction of cost but the *absolute* win is small (within
+~10%, often within measurement noise) because vanilla PG amortises its
+per-connection cost over thousands of queries.
+
+The architectural wins that motivate `pg_transport` show up in two
+regimes neither recipe currently exercises:
+
+1. **Connection churn** — workloads that open a fresh TCP connection
+   per transaction. Vanilla PG pays `fork()` + RelCache/CatCache
+   warm-up per connection (~1–10 ms); `pg_transport` hands the fd to
+   an already-warm slot bgworker (~0 ms). Expected ratio: **5–15×**
+   on `pgbench -S -C` at moderate concurrency.
+2. **TPC-C-class OLTP at high concurrency** — many simultaneous
+   sessions issuing parameterised multi-statement transactions. The
+   tps delta vs `vanilla + pgbouncer` (the realistic production
+   alternative) is modest (~1.05–1.15×), but the resident-memory and
+   scheduler-pressure deltas can be 3–5×.
+
+This section captures the planned work to surface both regimes
+honestly in the harness. The full ecosystem positioning that motivates
+the comparison set lives in [comparison.md §1](comparison.md#1-pgbouncer).
+
+### 3.1 Showcase 1 — connection churn (`pgbench -C`)
+
+> **Status: shipped.** User-facing docs in §2.7; this subsection is
+> kept as the historical planning record. Implementation:
+> [`just/pgbench.just`](../../just/pgbench.just) `connect` + `script`
+> parameters; probe script
+> [`bench/scripts/select_one.sql`](../../bench/scripts/select_one.sql).
+
+Extend [`just/pgbench.just`](../../just/pgbench.just) with two new
+positional parameters:
+
+| Position | Name      | Default | Meaning                                                                                          |
+| -------- | --------- | ------- | ------------------------------------------------------------------------------------------------ |
+| 7        | `connect` | `0`     | When `1`, appends `-C` to `pgbench` invocations (reconnect per transaction). Triggers the win.   |
+| 8        | `script`  | `""`    | When non-empty, appends `-f <path>` (overrides built-in `-S`/`-N`/tpcb). For minimal probes.     |
+
+Supporting deliverables:
+
+- **`bench/scripts/select_one.sql`** — `SELECT 1;`. The cleanest probe
+  for "what is the round-trip floor when execution cost is zero" —
+  isolates the handoff win from any query work.
+- **`bench/scripts/noop.sql`** — empty (or `;`). Optional; pure protocol
+  round-trip floor.
+- **`max_connections` auto-bump** in the generated `postgresql.conf`
+  when `connect=1`: set to `max(100, clients * 4)`. Default 100 chokes
+  under `-C` at `clients ≥ 32` because of `TIME_WAIT`-equivalent
+  backend lifecycle states during the reconnect burst. Document the
+  caveat in §3.4 below.
+
+Sample invocations after the change:
+
+```sh
+just pgbench pg18 select 30 32 "" spi 1                      # -C with built-in -S
+just pgbench pg18 select 30 32 "" spi 1 bench/scripts/select_one.sql
+just pgbench pg18 select 30 32 "" spi 0                      # baseline (no -C)
+```
+
+The `connect=0` / `connect=1` pair on the same hardware in the same
+harness run is the chart that tells the connection-churn story.
+
+**Effort:** ~30 LOC justfile + 2 trivial `.sql` files + ~40 lines of
+doc here in §3.4 once landed.
+
+**Risks:**
+
+- `pgbench -C` saturates the kernel's loopback ephemeral port range
+  at very high `-c`. Keep `clients ≤ 64` for `-C` mode and document
+  the ceiling.
+- Vanilla's `max_connections` ceiling needs bumping (above).
+
+### 3.2 Showcase 2 — high-concurrency OLTP (sysbench → pgbouncer comparison)
+
+The honest comparison for steady-state OLTP is `vanilla + pgbouncer`
+vs `pg_transport`, not bare vanilla. Phased so we can land the
+sysbench harness alone first and decide whether the pgbouncer/HammerDB
+work is justified by the early numbers.
+
+#### Phase A — sysbench harness
+
+[`sysbench`](https://github.com/akopytov/sysbench) is the cheapest
+third-party OLTP driver to plumb (apt/brew install, clean CLI, no TCL
+runtime). `oltp_read_write` is roughly TPC-C-shaped in transaction
+mix; `oltp_point_select` mirrors `pgbench -S` with more diverse query
+shapes.
+
+New file **`just/sysbench.just`** modelled on `pgbench.just`:
+
+```
+just sysbench [pg=pg18] [workload=oltp_read_write] \
+              [tables=16] [table_size=1000000] \
+              [duration=60] [threads=64] [reconnect=0] \
+              [pool=""] [backend=spi]
+```
+
+Same cluster-spin-up pattern (install extension, fresh `initdb`,
+`shared_preload_libraries = 'pg_transport'`, dual-port). Initialises
+via `sysbench --table-size=… prepare` against the vanilla port (same
+shared-heap argument as `pgbench -i` in §2.1), runs the workload
+against both ports side-by-side, `--cleanup` between runs.
+
+**Effort:** ~150 LOC justfile + a new §4 here in this doc. 1–2 days
+including bench-and-tune.
+
+**Risks:** small. The one knob that matters is `--table-size`: too
+small and the working set fits in buffer cache, making execution
+near-free and over-stating our protocol win. Size to ~10× cluster
+`shared_buffers` to ensure real disk traffic in the mix.
+
+#### Phase B — pgbouncer comparison target
+
+Additive on top of Phase A. Pgbouncer is the production deployment
+we're competing with; including it in the harness is what turns the
+numbers from "pg_transport vs vanilla" (interesting but unrealistic)
+into "pg_transport vs the realistic alternative" (publishable).
+
+New file **`just/_pgbouncer.just`** with helpers:
+
+| Helper             | Purpose                                                                                |
+| ------------------ | -------------------------------------------------------------------------------------- |
+| `_pgbouncer-install` | Check `which pgbouncer`; print install hint if missing. Not auto-installed.          |
+| `_pgbouncer-start` | Generate `pgbouncer.ini` + `userlist.txt` for given `pool_mode`, `max_client_conn`, `default_pool_size`; start daemon on `127.0.0.1:6432` pointing at vanilla `127.0.0.1:54329`. |
+| `_pgbouncer-stop`  | Clean shutdown + remove generated configs.                                             |
+
+Extend **`just/sysbench.just`** (and optionally `just/pgbench.just`)
+with a `target` parameter:
+
+| Value          | Listener                                                            |
+| -------------- | ------------------------------------------------------------------- |
+| `direct`       | `127.0.0.1:5454` — pg_transport                                     |
+| `vanilla`      | `127.0.0.1:54329` — bare vanilla PG                                 |
+| `bouncer-sess` | `127.0.0.1:6432` → vanilla, pgbouncer in **session** mode           |
+| `bouncer-tx`   | `127.0.0.1:6432` → vanilla, pgbouncer in **transaction** mode       |
+
+Run the same workload against all four for an honest 4-way comparison.
+The expected ordering matches [comparison.md §1.2](comparison.md#12-pooling-mode-equivalence):
+
+- `bare vanilla`: loses on connection establishment, OK on steady-state
+- `pg_transport`: replaces pgbouncer-session-mode role; matches it on
+  steady-state, beats it on connection establishment
+- `pgbouncer-session`: ≈ pg_transport on steady-state
+- `pgbouncer-transaction`: beats pg_transport for many-client/
+  few-backend workloads (the [known gap](comparison.md#15-known-gap-transaction-pooling))
+
+**Effort:** ~120 LOC justfile + pgbouncer config templates + ~100
+lines of doc. 2–3 days.
+
+**Risks:** pgbouncer install path varies by distro; CI may not have
+it. Make the target opt-in with a clear "install pgbouncer" error.
+
+#### Phase C — HammerDB TPC-C (deferred, decision-gated)
+
+[HammerDB](https://www.hammerdb.com/) gives a formal TPC-C tpmC
+number (publishable) at the cost of a TCL toolchain, manual download,
+and ~300 LOC of harness to drive `hammerdbcli` headless.
+
+**Decision gate:** run Phase A+B first. If sysbench
+`oltp_read_write` shows the predicted "~1.05–1.15× vs
+pgbouncer-session" steady-state delta, HammerDB is unlikely to
+surprise. Skip it. If sysbench shows something unexpected (much
+better or much worse than predicted), HammerDB becomes the
+corroborating tool.
+
+Effort estimate (only if pursued): ~300 LOC harness + per-run TCL
+config templates + ~1 week bench-and-tune for clean numbers.
+
+### 3.3 Sidecar — RSS / memory capture
+
+For Showcase 2, the steady-state tps delta is small but the
+**resident-memory** delta is the more compelling story (often 3–5×
+less RSS than the equivalent vanilla + 200-backend setup).
+
+A small sidecar — `ps -o rss,vsz --ppid <postmaster_pid> --no-headers`
+snapshots at fixed intervals during the run — turns this from a
+narrative claim into a measurable axis. Roughly ~30 LOC of shell
+inside the existing recipes, output as a second CSV column alongside
+tps. Worth landing alongside Phase A or B.
+
+### 3.4 Suggested order and decision points
+
+| Step              | Effort  | Decision after                                                                                       |
+| ----------------- | ------- | ---------------------------------------------------------------------------------------------------- |
+| Showcase 1        | ~1 day  | If `connect=1` shows the predicted 5–15× ratio, this becomes the headline benchmark.                |
+| Phase A (sysbench)| ~2 days | If `oltp_read_write` numbers track the predicted "~1.05–1.15× vs vanilla" story, proceed to Phase B. |
+| Sidecar (RSS)     | ~½ day  | Combine with Phase A; without it the "memory win" story is hand-waved.                              |
+| Phase B (pgbouncer)| ~3 days | The point at which we have publishable 4-way numbers.                                              |
+| Phase C (HammerDB)| ~1 week | Only if external audience asks for a formal TPC-C tpmC number.                                     |
+
+### 3.5 Open policy questions (decide before Phase A)
+
+- **Are sysbench/HammerDB required dev-machine prereqs, or always
+  opt-in / gated behind a `which` check?** Recommendation: gate them.
+  Keeps `just init` and CI lean; bench tooling is opt-in for the
+  developer doing the bench.
+- **CSV-out parity?** `just bench` has `csv=`; `just pgbench` does
+  not. If we want cross-run regression detection (and we should, for
+  a published benchmark page), align both. ~20 LOC.
+- **A formal "is the new harness broken?" smoke test in CI** — run a
+  single short `just sysbench pg18 oltp_point_select … threads=2 duration=5`
+  on PR builds to catch harness regressions. No throughput assertion,
+  just exit code. Avoids the harness rotting between publications.
+
+---
+
+## 4. Source-of-truth pointers
 
 - Custom harness: [`crates/bench/src/main.rs`](../../crates/bench/src/main.rs)
 - `just bench` recipe: [`just/bench.just`](../../just/bench.just)

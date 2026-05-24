@@ -49,6 +49,21 @@ PGBENCH_SOCKETS := "/tmp/pg_transport_sockets"
 #                                    exercise the saturation path.
 #   6. backend     (default spi)   — pg_transport execution backend:
 #                                    `spi` or `direct`.
+#   7. connect     (default 0)     — `1` appends `-C` (reconnect per
+#                                    transaction) to pgbench. The
+#                                    "connection-churn" showcase: vanilla
+#                                    pays fork+catalog warm-up per tx,
+#                                    pg_transport's slot pool eats the
+#                                    same handoff cost regardless. Auto-
+#                                    bumps `max_connections` to
+#                                    `max(100, clients * 4)` to avoid
+#                                    backend-lifecycle wall under burst.
+#                                    See bench.md §2.7.
+#   8. script      (default "")    — custom pgbench script path (`-f`).
+#                                    Overrides `mode` (no `-S`/`-N` set).
+#                                    Use `bench/scripts/select_one.sql`
+#                                    for the minimal-execution probe that
+#                                    pairs with `connect=1`.
 #
 # Examples:
 #   just pgbench                              # 10s select, 4 clients, default pool
@@ -57,7 +72,9 @@ PGBENCH_SOCKETS := "/tmp/pg_transport_sockets"
 #   just pgbench pg18 tpcb 30 8               # 30s tpcb-like, 8 clients
 #   just pgbench pg18 select 10 16 1          # 16 clients, pool ceiling=1 (saturation)
 #   just pgbench pg18 select 10 4 "" direct   # force direct backend on pg_transport
-pgbench pg=default_pg mode="select" duration="10" clients="4" pool="" backend="spi":
+#   just pgbench pg18 select 30 32 "" spi 1   # connection-churn (-C) showcase
+#   just pgbench pg18 select 30 32 "" spi 1 bench/scripts/select_one.sql
+pgbench pg=default_pg mode="select" duration="10" clients="4" pool="" backend="spi" connect="0" script="":
     #!/usr/bin/env bash
     set -euo pipefail
 
@@ -76,6 +93,19 @@ pgbench pg=default_pg mode="select" duration="10" clients="4" pool="" backend="s
             exit 2
             ;;
     esac
+
+    case "{{connect}}" in
+        0|1) ;;
+        *)
+            echo "pgbench: connect must be 0 or 1 (got '{{connect}}')" >&2
+            exit 2
+            ;;
+    esac
+
+    if [[ -n "{{script}}" && ! -r "{{script}}" ]]; then
+        echo "pgbench: script '{{script}}' does not exist or is not readable" >&2
+        exit 2
+    fi
 
     pgcfg="$(just _pg-config {{pg}})"
     if [[ -z "$pgcfg" || ! -x "$pgcfg" ]]; then
@@ -117,6 +147,18 @@ pgbench pg=default_pg mode="select" duration="10" clients="4" pool="" backend="s
         pool_clause="# (pool ceiling left at default; autoscaler grows on demand)"
     fi
 
+    # When `connect=1`, pgbench opens a fresh connection per transaction.
+    # Vanilla PG defaults to max_connections=100 which chokes under burst
+    # at clients ≥ 32 due to backend-lifecycle states (PG is not as forgiving
+    # as it could be about reconnect-rate). Bump to a safe ceiling.
+    if [[ "{{connect}}" == "1" ]]; then
+        mc_target=$(( {{clients}} * 4 ))
+        if (( mc_target < 100 )); then mc_target=100; fi
+        mc_clause="max_connections = $mc_target"
+    else
+        mc_clause="# (max_connections left at PG default)"
+    fi
+
     cat >>{{PGBENCH_PGDATA}}/postgresql.conf <<EOF
     shared_preload_libraries = 'pg_transport'
     port = 54329
@@ -125,6 +167,7 @@ pgbench pg=default_pg mode="select" duration="10" clients="4" pool="" backend="s
     logging_collector = off
     log_min_messages = warning
     $pool_clause
+    $mc_clause
     # auth_source is required by _PG_init() since phase 7.
     pg_transport.auth_source = 'pg_hba'
     max_worker_processes = $mwp
@@ -159,14 +202,26 @@ pgbench pg=default_pg mode="select" duration="10" clients="4" pool="" backend="s
     "$pg_bin/pgbench" -i -h 127.0.0.1 -p 54329 -U postgres -d postgres 2>&1 | tail -2
 
     common_args=(-T {{duration}} -c {{clients}} -j {{clients}} --no-vacuum -M simple)
-    case "{{mode}}" in
-        select) common_args+=(-S) ;;
-        nupdate) common_args+=(-N) ;;
-        tpcb|tpcb-rw) ;;
-    esac
+    if [[ -n "{{script}}" ]]; then
+        # Custom script overrides built-in workloads; pgbench's `-f` is
+        # mutually exclusive with `-S` / `-N` at the conventional usage
+        # level, so skip those flags entirely.
+        common_args+=(-f "{{script}}")
+        workload_desc="script={{script}}"
+    else
+        case "{{mode}}" in
+            select) common_args+=(-S) ;;
+            nupdate) common_args+=(-N) ;;
+            tpcb|tpcb-rw) ;;
+        esac
+        workload_desc="mode={{mode}}"
+    fi
+    if [[ "{{connect}}" == "1" ]]; then
+        common_args+=(-C)
+    fi
 
     echo ""
-    echo "pgbench: clients={{clients}} duration={{duration}}s mode={{mode}} backend={{backend}} pool_ceiling={{pool}}"
+    echo "pgbench: clients={{clients}} duration={{duration}}s $workload_desc backend={{backend}} pool_ceiling={{pool}} connect={{connect}}"
 
     # Step 4 — run vanilla first as the baseline.
     echo ""

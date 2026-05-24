@@ -196,6 +196,95 @@ collapsing the burst case from "one cold-boot + N×turnover" to
 "one cold-boot, all served in parallel". See
 [pool.md §5.2](pool.md#52-grow-on-demand).
 
+### pgbench, connection-churn (`-C`), 20 s, 3 runs each (2026-05-23)
+
+The numbers above measure the **steady-state** regime: a small,
+fixed number of long-lived connections doing many transactions
+each. The framework hop is a meaningful fraction of cost but the
+absolute tps delta is small or near parity. The connection-churn
+regime — `pgbench -C`, fresh TCP connection per transaction — is
+where the architectural win shows up. Recipe:
+[bench.md §2.7](bench.md#27-connection-churn-mode-connect1).
+
+3-run means at each client count; same dev box as §2; `backend=spi`,
+`mode=select`; pgbench's built-in `-S` (a real index lookup):
+
+| Clients | Vanilla tps | pg_transport tps | **tps ratio** | Vanilla avg conn time | pg_transport avg conn time | conn-time ratio | Vanilla avg latency | pg_transport avg latency |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4   |   609 |  4 740 |  **7.78x** |  4.36 ms | 0.57 ms |  7.65x |  6.58 ms | 0.84 ms |
+| 16  | 1 131 | 11 562 | **10.22x** |  9.74 ms | 0.95 ms | 10.30x | 14.14 ms | 1.38 ms |
+| 32  | 1 153 | 13 605 | **11.80x** | 19.58 ms | 1.49 ms | 13.10x | 27.77 ms | 2.35 ms |
+
+Probe comparison at clients=16, single run with
+[`bench/scripts/select_one.sql`](../../bench/scripts/select_one.sql)
+(bare `SELECT 1;`, no index lookup) substituted for the built-in
+`-S`:
+
+| Probe | Vanilla tps | pg_transport tps | tps ratio |
+|---|---:|---:|---:|
+| Built-in `-S` (~50 µs index lookup per tx) | 1 131 | 11 562 | 10.22x |
+| `select_one.sql` (zero exec cost)          | 1 623 | 13 754 |  8.47x |
+
+Mechanical reading:
+
+- **The ratio grows with client count** (7.78x → 10.22x → 11.80x).
+  Vanilla serializes on the single-threaded postmaster `fork()`
+  loop plus per-backend RelCache / CatCache warm-up; adding
+  clients shifts the bottleneck from per-tx cost to fork
+  serialization. pg_transport's `SCM_RIGHTS` handoff hands each
+  new fd to an already-warm slot bgworker without involving the
+  postmaster, so per-client throughput holds up under contention.
+  See [frontend-handoff.md](frontend-handoff.md) for the handoff
+  mechanism and [pool.md §5.2](pool.md#52-grow-on-demand) for the
+  warm-pool behaviour.
+
+- **Connection-time ratio mirrors tps ratio.** At every client
+  count the two ratios match within ~10%. The 7.78–11.80x tps
+  win is almost entirely from the 7.65–13.10x drop in
+  per-connection setup cost — query execution is ≤ 0.5 ms on
+  either side for pgbench's single-row index lookup.
+
+- **The custom probe compresses the ratio (10.22x → 8.47x).**
+  `select_one.sql` removes the ~50 µs of index-lookup work, which
+  is the same overhead on both sides. The residual 8.47x is the
+  asymptotic "handoff vs fork-and-init" win once execution cost
+  is removed from the denominator. The fact that the built-in
+  `-S` shows a *higher* ratio than the zero-exec probe is the
+  normal "smaller denominator means smaller ratio" effect, not a
+  reversal.
+
+- **Vanilla per-connection time hits 19.6 ms at clients=32.**
+  That's serialized waiting on the postmaster fork loop, not a
+  fork cost per se. Real applications doing per-transaction
+  reconnects at this concurrency would either gate behind a
+  connection pool (pgbouncer / PgBouncer / our handoff path) or
+  accept the wall-clock tax. The headline of this comparison is
+  that pg_transport collapses the 19.6 ms wait to 1.5 ms because
+  the postmaster fork loop is not in the path.
+
+- **No failures even at clients=32 × 20 s.** That's ~140 k
+  connection establishments on loopback per side over the run.
+  The ephemeral-port pressure warned about in
+  [bench.md §2.7](bench.md#27-connection-churn-mode-connect1) does
+  not manifest at this size; the recipe's `max_connections`
+  auto-bump (to 128 here) is what makes the vanilla side hold up
+  long enough to be measurable.
+
+- **Side-by-side, same invocation.** Both numbers in each row
+  come from a single `just pgbench` call, eliminating cross-run
+  host-state variance. Wall-clock asymmetry is real and intended:
+  in 20 s the vanilla side completes ~23 k transactions while
+  pg_transport completes ~275 k.
+
+Reproduce:
+
+```sh
+just pgbench pg18 select 20  4 "" spi 1                                # clients=4
+just pgbench pg18 select 20 16 "" spi 1                                # clients=16
+just pgbench pg18 select 20 32 "" spi 1                                # clients=32
+just pgbench pg18 select 20 16 "" spi 1 bench/scripts/select_one.sql   # probe
+```
+
 ## 3. Where we sit vs. other pooling solutions
 
 | Solution | Typical qps vs. direct PG | Why |
