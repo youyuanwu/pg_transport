@@ -139,9 +139,8 @@ just bench pg18 8000 16
 
 Read `p50` (median latency) and `max` (tail latency). A healthy v0
 result looks like: `p50` within ±10% of vanilla across the sweep,
-`max` consistently better at `connections ≥ 8`. As of phase 5+
-that is roughly what we observe; see [`reviews/`](reviews/) for
-captured runs.
+`max` consistently better at `connections ≥ 8`. Current captured
+numbers live in [performance.md](performance.md).
 
 ---
 
@@ -248,7 +247,7 @@ Mechanism:
 - `tpcb` per transaction does ~4 statements + `BEGIN` + `END`. The 6 round-trips amortise the per-message framework cost, including the per-query parse; pg_transport's pre-warmed bgworker pool absorbs jitter that vanilla eats fresh per connection.
 - **Q25 resolution path**: an earlier attempt at sqlparser-rs cost ~15 µs/query (~5% throughput regression). Replaced with PG's in-process `raw_parser` (3-5× faster, perfect grammar fidelity, zero new deps); see [roadmap.md §2.3 Q25](roadmap.md). We still parse twice (once in our classifier, once inside SPI) but both are PG's own ~5 µs parser. Getting to "parse once" requires bypassing SPI with a direct `Portal`/`pg_analyze_and_rewrite_fixedparams`/`pg_plan_queries` path; deferred to phase 9.
 
-Concrete numbers from recent runs live in [`reviews/`](reviews/); design decisions that change the SPI bridge or wire layer should re-run and update.
+Current captured numbers live in [performance.md](performance.md); design decisions that change the SPI bridge or wire layer should re-run and update.
 
 ### 2.7 Connection-churn mode (`connect=1`)
 
@@ -383,15 +382,15 @@ pointer inspection of the node tag, so neither backend pays an
 additional parser pass on the hot path. The only remaining
 caveats are inherent to sysbench's per-thread workload generator.
 
-| Workload                | SPI backend (default) | direct backend     | `skip_trx=on` measurement axis ² | Notes                                                              |
-| ----------------------- | --------------------- | ------------------ | -------------------------------- | ------------------------------------------------------------------ |
-| `oltp_point_select`     | ✅ works               | ✅ works            | n/a                              | No transactions; runs natively on both backends.                   |
-| `oltp_read_only`        | ✅ works               | ✅ works            | optional                         | BEGIN/COMMIT-wrapped reads via shared xact-control sniff.          |
-| `oltp_read_write`       | ⚠️ sysbench race ¹    | ⚠️ sysbench race ¹  | optional                         | Backends work; sysbench's INSERT/DELETE pair races on dup IDs across threads. |
-| `oltp_update_index`     | ✅ works               | ✅ works            | optional                         | BEGIN/COMMIT-wrapped UPDATEs.                                      |
-| `oltp_update_non_index` | ✅ works               | ✅ works            | optional                         | Same as `oltp_update_index`.                                       |
-| `oltp_delete`           | ⚠️ sysbench race ¹    | ⚠️ sysbench race ¹  | optional                         | Delete-then-insert pattern races across threads.                   |
-| `oltp_insert`           | ⚠️ sysbench race ¹    | ⚠️ sysbench race ¹  | optional                         | INSERTs of monotonically-similar IDs across threads can collide.   |
+| Workload                | SPI backend (default) | direct backend     | Notes                                                              |
+| ----------------------- | --------------------- | ------------------ | ------------------------------------------------------------------ |
+| `oltp_point_select`     | ✅ works               | ✅ works            | No transactions; runs natively on both backends.                   |
+| `oltp_read_only`        | ✅ works               | ✅ works            | BEGIN/COMMIT-wrapped reads via shared xact-control sniff.          |
+| `oltp_read_write`       | ⚠️ sysbench race ¹    | ⚠️ sysbench race ¹  | Backends work; sysbench's INSERT/DELETE pair races on dup IDs across threads. |
+| `oltp_update_index`     | ✅ works               | ✅ works            | BEGIN/COMMIT-wrapped UPDATEs.                                      |
+| `oltp_update_non_index` | ✅ works               | ✅ works            | Same as `oltp_update_index`.                                       |
+| `oltp_delete`           | ⚠️ sysbench race ¹    | ⚠️ sysbench race ¹  | Delete-then-insert pattern races across threads.                   |
+| `oltp_insert`           | ⚠️ sysbench race ¹    | ⚠️ sysbench race ¹  | INSERTs of monotonically-similar IDs across threads can collide.   |
 
 **¹ sysbench race: `delete_inserts` is not idempotent across threads.**
 `oltp_read_write` / `oltp_delete` / `oltp_insert` pick random row
@@ -402,13 +401,13 @@ constraint of sysbench's per-thread workload generator. The same
 race happens against vanilla PG at threads > 1; sysbench's docs
 recommend `threads=1` for those workloads.
 
-**² `skip_trx=on` measurement axis (legacy).**
-Originally a hard requirement because both extended backends
-lacked the xact-control sniff (`SPI_ERROR_TRANSACTION` /
-`0x7f7f7f7f` WIPE_MEM UAF on first BEGIN). Both fixes have
-landed, so it's no longer required for any workload. Still
-useful as a measurement axis to isolate explicit-transaction
-overhead from per-statement work.
+**`skip_trx=on` as a measurement axis.** Originally a hard
+requirement because both extended backends lacked the
+xact-control sniff (`SPI_ERROR_TRANSACTION` / `0x7f7f7f7f`
+WIPE_MEM UAF on first BEGIN). Both fixes have landed, so it is
+no longer required for any workload. Still useful as a
+measurement axis to isolate explicit-transaction overhead from
+per-statement work.
 
 ### 3.3 Initialization
 
@@ -426,11 +425,13 @@ the cluster in `cleanup()`, so each invocation is deterministic.
 # Cache-hot point-select at moderate concurrency
 just sysbench pg18 oltp_point_select 16 100000  30 16
 
-# Read-only with the workaround required by §3.2
+# Read-only with skip_trx=on (isolates per-statement overhead
+# from explicit-transaction overhead)
 just sysbench pg18 oltp_read_only    16 100000  30 16 "" spi on
 
-# Read-write with both workarounds required by §3.2
-just sysbench pg18 oltp_read_write   16 100000  30  1 "" spi on
+# Read-write at threads=1 to avoid the sysbench delete_inserts
+# race documented in §3.2 ¹
+just sysbench pg18 oltp_read_write   16 100000  30  1 "" spi off
 
 # Larger-than-cache working set (real disk traffic)
 just sysbench pg18 oltp_point_select 16 1000000 60 16
@@ -465,40 +466,45 @@ Mechanical reading (one run, treat as directional only):
 
 ---
 
-## 4. Planned showcase work
+## 4. Showcase work — status
 
-The §1 and §2 recipes cover **steady-state same-connection** workloads.
-At fixed concurrency with long-lived connections, the framework hop is
-a meaningful fraction of cost but the *absolute* win is small (within
-~10%, often within measurement noise) because vanilla PG amortises its
-per-connection cost over thousands of queries.
+The §1 and §2 same-connection recipes cover **steady-state**
+workloads. At fixed concurrency with long-lived connections, the
+framework hop is a meaningful fraction of cost but the *absolute*
+win is small (within ~10%, often within measurement noise) because
+vanilla PG amortises its per-connection cost over thousands of
+queries.
 
 The architectural wins that motivate `pg_transport` show up in two
-regimes neither recipe currently exercises:
+regimes the steady-state recipes do not exercise. Both are now
+covered by shipped recipes:
 
 1. **Connection churn** — workloads that open a fresh TCP connection
    per transaction. Vanilla PG pays `fork()` + RelCache/CatCache
    warm-up per connection (~1–10 ms); `pg_transport` hands the fd to
-   an already-warm slot bgworker (~0 ms). Expected ratio: **5–15×**
-   on `pgbench -S -C` at moderate concurrency.
+   an already-warm slot bgworker (~0 ms). Predicted ratio: **5–15×**
+   on `pgbench -S -C` at moderate concurrency; measured ratio:
+   **7.78× / 10.22× / 11.80×** at clients = 4 / 16 / 32 (see §4.1).
 2. **TPC-C-class OLTP at high concurrency** — many simultaneous
    sessions issuing parameterised multi-statement transactions. The
    tps delta vs `vanilla + pgbouncer` (the realistic production
    alternative) is modest (~1.05–1.15×), but the resident-memory and
-   scheduler-pressure deltas can be 3–5×.
+   scheduler-pressure deltas can be 3–5×. sysbench harness covers
+   this (see §4.2 Phase A); pgbouncer / HammerDB comparison targets
+   remain planned (§4.2 Phase B/C).
 
-This section captures the planned work to surface both regimes
-honestly in the harness. The full ecosystem positioning that motivates
+This section captures the status of each showcase and the planned
+work that remains. The full ecosystem positioning that motivates
 the comparison set lives in [comparison.md §1](comparison.md#1-pgbouncer).
 
-### 3.1 Showcase 1 — connection churn (`pgbench -C`) — shipped
+### 4.1 Showcase 1 — connection churn (`pgbench -C`) — shipped
 
 - **Mechanism + how-to:** [§2.7 Connection-churn mode](#27-connection-churn-mode-connect1).
 - **Measured numbers:** [performance.md §2 — "pgbench, connection-churn (`-C`)"](performance.md#pgbench-connection-churn--c-20-s-3-runs-each-2026-05-23).
 - **Outcome vs. predicted 5–15×:** 7.78× / 10.22× / 11.80× at clients = 4 / 16 / 32. Ratio grows with concurrency because vanilla bottlenecks on the single-threaded postmaster `fork()` loop while our `SCM_RIGHTS` handoff stays parallel.
 - **Implementation:** [`just/pgbench.just`](../../just/pgbench.just) `connect` + `script` params; [`bench/scripts/select_one.sql`](../../bench/scripts/select_one.sql) minimal-execution probe.
 
-### 3.2 Showcase 2 — high-concurrency OLTP (sysbench → pgbouncer comparison)
+### 4.2 Showcase 2 — high-concurrency OLTP (sysbench → pgbouncer comparison)
 
 The honest comparison for steady-state OLTP is `vanilla + pgbouncer`
 vs `pg_transport`, not bare vanilla. Phased so we can land the
@@ -622,7 +628,7 @@ corroborating tool.
 Effort estimate (only if pursued): ~300 LOC harness + per-run TCL
 config templates + ~1 week bench-and-tune for clean numbers.
 
-### 3.3 Sidecar — RSS / memory capture
+### 4.3 Sidecar — RSS / memory capture
 
 For Showcase 2, the steady-state tps delta is small but the
 **resident-memory** delta is the more compelling story (often 3–5×
@@ -634,7 +640,7 @@ narrative claim into a measurable axis. Roughly ~30 LOC of shell
 inside the existing recipes, output as a second CSV column alongside
 tps. Worth landing alongside Phase A or B.
 
-### 3.4 Suggested order and decision points
+### 4.4 Suggested order and decision points
 
 | Step              | Effort  | Decision after                                                                                       |
 | ----------------- | ------- | ---------------------------------------------------------------------------------------------------- |
@@ -644,7 +650,7 @@ tps. Worth landing alongside Phase A or B.
 | Phase B (pgbouncer)| ~3 days | The point at which we have publishable 4-way numbers.                                              |
 | Phase C (HammerDB)| ~1 week | Only if external audience asks for a formal TPC-C tpmC number.                                     |
 
-### 3.5 Open policy questions (decide before Phase A)
+### 4.5 Open policy questions (decide before Phase A)
 
 - **Are sysbench/HammerDB required dev-machine prereqs, or always
   opt-in / gated behind a `which` check?** Recommendation: gate them.

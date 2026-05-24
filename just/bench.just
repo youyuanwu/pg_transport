@@ -145,4 +145,9 @@ bench pg=default_pg iters="1000" connections="1" pool="" csv="" mode="spi":
     if [[ -n "{{csv}}" ]]; then
         args+=(--csv "{{csv}}")
     fi
-    target/release/bench "${args[@]}"
+    # Use {{justfile_directory()}} (top-level Justfile dir) rather
+    # than a CWD-relative path: on just <= 1.26 the shebang recipe's
+    # CWD is the .just file's own directory (here: just/), not the
+    # project root, so a bare `target/release/bench` would resolve
+    # to `just/target/release/bench` and fail to execute.
+    "{{justfile_directory()}}/target/release/bench" "${args[@]}"

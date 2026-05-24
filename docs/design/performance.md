@@ -14,7 +14,8 @@ the trace in §4.
 
 ## 1. Workloads
 
-Two harnesses; six benchmark configurations across both.
+Three harnesses (custom bench, pgbench, sysbench); configurations
+enumerated below.
 
 ### Custom bench (`just bench`)
 

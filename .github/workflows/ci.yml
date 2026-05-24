@@ -40,7 +40,9 @@ jobs:
         uses: actions/checkout@v6
 
       # Build deps for compiling Postgres from source under `cargo pgrx init`.
-      # Mirrors the apt list `just doctor` recommends.
+      # Mirrors the apt list `just doctor` recommends. `sysbench` is
+      # appended here for the sysbench-sweep smoke step below; it
+      # ships in Ubuntu's main repo so the install is cheap.
       - name: Install Postgres build dependencies (apt)
         run: |
           sudo apt-get update
@@ -48,7 +50,8 @@ jobs:
             build-essential pkg-config bison flex perl \
             libclang-dev clang \
             libicu-dev libssl-dev zlib1g-dev libreadline-dev \
-            curl tar
+            curl tar \
+            sysbench
 
       - name: Install just
         uses: extractions/setup-just@v4
@@ -128,8 +131,45 @@ jobs:
       # noisy on shared CI hardware and would either flap or be too
       # loose to catch real regressions (see Q&A on perf-in-CI).
       # Minimal parameters keep runtime in the ~10–20 s range each.
-      - name: just bench (smoke — 200 iters × 2 conns)
-        run: just bench pg${{ matrix.pg-major }} 200 2
+      #
+      # All three steps are routed through the sweep scripts (rather
+      # than calling `just bench` / `just pgbench` / `just sysbench`
+      # directly) so the CI also exercises the sweep glue — TSV
+      # write, Markdown render, output parsing. The parameter knobs
+      # are the smallest viable workload size that still exercises
+      # the end-to-end path.
+      - name: bench sweep (smoke — 200 iters × 2 conns, spi)
+        env:
+          PG: pg${{ matrix.pg-major }}
+          CONNECTIONS: "2"
+          BACKENDS: spi
+          ITERS: "200"
+          RUNS: "1"
+        run: ./scripts/bench_sweep.sh
 
-      - name: just pgbench (smoke — 3 s × 2 clients, select mode)
-        run: just pgbench pg${{ matrix.pg-major }} select 3 2
+      - name: pgbench sweep (smoke — 3 s × 2 clients, select, spi)
+        env:
+          PG: pg${{ matrix.pg-major }}
+          MODES: select
+          BACKENDS: spi
+          CLIENTS: "2"
+          DURATION: "3"
+          RUNS: "1"
+        run: ./scripts/pgbench_sweep.sh
+
+      # `oltp_point_select` is the v0-safest sysbench workload: no
+      # BEGIN/COMMIT wrapping (so no xact-control path), no random
+      # DELETE+INSERT (so no `delete_inserts` race documented in
+      # bench.md §3.2 footnote ¹). Tiny dataset (2 tables × 1 000
+      # rows) keeps `sysbench prepare` under a second; 3 s run
+      # mirrors the pgbench smoke step's runtime budget.
+      - name: sysbench sweep (smoke — 3 s × 2 threads, oltp_point_select, spi)
+        env:
+          PG: pg${{ matrix.pg-major }}
+          WORKLOADS: oltp_point_select
+          BACKENDS: spi
+          THREADS: "2"
+          TABLES: "2"
+          TABLE_SIZE: "1000"
+          DURATION: "3"
+        run: ./scripts/sysbench_sweep.sh
