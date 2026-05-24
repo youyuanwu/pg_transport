@@ -351,7 +351,7 @@ Positional arguments:
 | 6        | `threads`    | `16`                 | Concurrent worker threads per side (`--threads`); bound by `max_backend_pool_size` against pg_transport. |
 | 7        | `pool`       | `""`                 | Override `max_backend_pool_size`. Empty ⇒ ceiling stays at the default.                                  |
 | 8        | `backend`    | `spi`                | pg_transport execution backend: `spi` ([`extended/spi.rs`](../../crates/core/src/backend/extended/spi.rs)) or `direct` ([`extended/direct.rs`](../../crates/core/src/backend/extended/direct.rs)). Passed via `PGOPTIONS=-c pg_transport.execution_backend=...`. |
-| 9        | `skip_trx`   | `off`                | `on` appends `--skip_trx=on`, making sysbench run every query in libpq AUTOCOMMIT mode. **Required for `oltp_read_*` / `oltp_update_*` workloads on v0 pg_transport** — see §3.2. Also a real measurement axis: with/without explicit-transaction overhead. |
+| 9        | `skip_trx`   | `off`                | `on` appends `--skip_trx=on`, making sysbench run every query in libpq AUTOCOMMIT mode. The SPI backend now handles explicit BEGIN/COMMIT natively on the extended-query path (`extended::spi::prepare` sniff), so this is no longer required for the SPI workloads — see §3.2. Still required for the `direct` backend (extended-query xact-control UAF still pinned), and useful as a measurement axis: with/without explicit-transaction overhead. |
 
 ### 3.1 Why sysbench (complement to `just pgbench`)
 
@@ -373,38 +373,54 @@ around the per-transaction query group.
 
 ### 3.2 Workload matrix on v0 pg_transport
 
-Two limitations gate which sysbench workloads currently run
-end-to-end:
+The SPI backend (default — [`extended/spi.rs`](../../crates/core/src/backend/extended/spi.rs))
+now sniffs `BEGIN` / `COMMIT` / `ROLLBACK` at Parse time via
+[`spi_bridge::classify_single_statement`](../../crates/core/src/backend/spi_bridge.rs),
+so every sysbench workload runs end-to-end with sysbench's default
+explicit-transaction wrapping. The direct backend
+([`extended/direct.rs`](../../crates/core/src/backend/extended/direct.rs))
+does NOT yet have the sniff and crashes on `BEGIN` with a
+use-after-free symptom — see [crates/e2e/tests/basic.rs](../../crates/e2e/tests/basic.rs)
+`xact_control_begin_via_extended_query_direct_backend_pins_bug`.
 
-| Workload                | Without `skip_trx=on` | With `skip_trx=on` | Notes                                                                                  |
-| ----------------------- | --------------------- | ------------------ | -------------------------------------------------------------------------------------- |
-| `oltp_point_select`     | ✅ works               | ✅ works            | No transactions to skip; runs natively.                                                |
-| `oltp_read_only`        | ❌ pg_transport bug ¹  | ✅ works            | Need `skip_trx=on` until the xact-control bug is fixed.                                |
-| `oltp_read_write`       | ❌ pg_transport bug ¹  | ⚠️ threads=1 only ² | Bug + sysbench race require both `skip_trx=on` AND `threads=1`.                        |
-| `oltp_update_index`     | ❌ pg_transport bug ¹  | ⚠️ threads=1 only ² | Same as `oltp_read_write`.                                                             |
-| `oltp_update_non_index` | ❌ pg_transport bug ¹  | ⚠️ threads=1 only ² | Same as `oltp_read_write`.                                                             |
-| `oltp_delete`           | ❌ pg_transport bug ¹  | ⚠️ threads=1 only ² | Same as `oltp_read_write`.                                                             |
-| `oltp_insert`           | ❌ pg_transport bug ¹  | ⚠️ threads=1 only ² | Same as `oltp_read_write`.                                                             |
+| Workload                | SPI backend (default) | direct backend ¹      | `skip_trx=on` workaround ² | Notes                                                              |
+| ----------------------- | --------------------- | --------------------- | -------------------------- | ------------------------------------------------------------------ |
+| `oltp_point_select`     | ✅ works               | ✅ works               | n/a                        | No transactions; runs natively on both backends.                   |
+| `oltp_read_only`        | ✅ works               | ❌ direct bug ¹        | ⚠️ workload-dep            | SPI backend handles native BEGIN/COMMIT.                           |
+| `oltp_read_write`       | ⚠️ sysbench race ³    | ❌ direct bug ¹        | ⚠️ threads=1 only ²        | Even with our BEGIN/COMMIT working, sysbench's INSERT/DELETE pair races on dup IDs across threads. |
+| `oltp_update_index`     | ✅ works               | ❌ direct bug ¹        | n/a                        | BEGIN/COMMIT-wrapped UPDATEs through SPI extended path.            |
+| `oltp_update_non_index` | ✅ works               | ❌ direct bug ¹        | n/a                        | Same as `oltp_update_index`.                                       |
+| `oltp_delete`           | ⚠️ sysbench race ³    | ❌ direct bug ¹        | ⚠️ threads=1 only ²        | Delete-then-insert pattern races across threads.                   |
+| `oltp_insert`           | ⚠️ sysbench race ³    | ❌ direct bug ¹        | ⚠️ threads=1 only ²        | INSERTs of monotonically-similar IDs across threads can collide.   |
 
-**¹ pg_transport bug: extended-query xact-control not sniffed.**
-sysbench wraps each transaction in explicit `BEGIN` / `COMMIT`
-statements that are sent through libpq's `PQprepare` / `PQexecPrepared`
-(i.e. extended-query Parse + Execute, not simple-query `'Q'`). The
-simple-query SPI bridge has a sniff (`spi_bridge.rs::parse_xact_control`)
-that intercepts these before SPI sees them; the extended-query
-paths ([`extended/spi.rs`](../../crates/core/src/backend/extended/spi.rs),
-[`extended/direct.rs`](../../crates/core/src/backend/extended/direct.rs))
-do not. The result: `SPI_execute_plan` returns `SPI_ERROR_TRANSACTION`
-on the first `BEGIN`. Filing the equivalent sniff for the extended
-path is the unblock; not done as part of this recipe.
+**¹ direct-backend bug: extended-query xact-control crashes with UAF.**
+The direct backend forwards xact-control statements straight into
+its `Portal*` path, which is not designed to dispatch utility
+statements (`TransactionStmt`). The symptom is PG's
+`unrecognized node type: 2139062143` — the `0x7f7f7f7f` WIPE_MEM
+clobber pattern, i.e. a use-after-free. Fix: lift the same
+[`classify_single_statement`](../../crates/core/src/backend/spi_bridge.rs) +
+[`handle_xact_control_one`](../../crates/core/src/backend/spi_bridge.rs)
+short-circuit that the SPI backend uses into
+[`extended::direct::prepare`](../../crates/core/src/backend/extended/direct.rs).
+Pinned by `xact_control_begin_via_extended_query_direct_backend_pins_bug`.
 
-**² sysbench race: `delete_inserts` is not idempotent under AUTOCOMMIT.**
-`oltp_read_write` (and any workload with INSERT/DELETE pairs picking
-random IDs) races across threads when `--skip_trx=on`: thread A's
-`DELETE WHERE id=X; INSERT id=X;` can interleave with thread B's
-same pair on the same X, causing `ERRCODE_UNIQUE_VIOLATION`. Not a
-pg_transport bug — design constraint of sysbench's
-"skip transactions" mode at threads > 1.
+**² `skip_trx=on` workaround (legacy axis).**
+Originally needed because both extended backends lacked the
+xact-control sniff (`SPI_ERROR_TRANSACTION` on first BEGIN). The
+SPI backend no longer needs it; the direct backend still does
+(and additionally needs the UAF fix above). `skip_trx=on` remains
+useful as a measurement axis to isolate explicit-transaction
+overhead from per-statement work.
+
+**³ sysbench race: `delete_inserts` is not idempotent across threads.**
+`oltp_read_write` / `oltp_delete` / `oltp_insert` pick random row
+IDs without coordination: thread A's `DELETE WHERE id=X; INSERT id=X;`
+can interleave with thread B's same pair on the same X, causing
+`ERRCODE_UNIQUE_VIOLATION`. Not a pg_transport bug — design
+constraint of sysbench's per-thread workload generator. The same
+race happens against vanilla PG at threads > 1; sysbench's docs
+recommend `threads=1` for those workloads.
 
 ### 3.3 Initialization
 
@@ -506,15 +522,22 @@ work is justified by the early numbers.
 > **Status: shipped 2026-05-23.** User-facing docs in [§3](#3-just-sysbench--diverse-oltp-workloads-via-sysbench);
 > implementation: [`just/sysbench.just`](../../just/sysbench.just).
 > Surfaced two findings worth pursuing separately:
-> 1. **pg_transport bug** — the extended-query path doesn't sniff
->    `BEGIN`/`COMMIT` the way `spi_bridge.rs::parse_xact_control`
->    does for simple-query. Blocks `oltp_read_*` /
->    `oltp_update_*` / `oltp_delete` / `oltp_insert` workloads
->    without `skip_trx=on`. See [§3.2](#32-workload-matrix-on-v0-pg_transport).
-> 2. **sysbench design constraint** — `oltp_read_write` with
->    `--skip_trx=on` races on `delete_inserts` at threads > 1.
->    Not a pg_transport bug; documented as a `threads=1` ceiling
->    in the workload matrix.
+> 1. **pg_transport bug (SPI backend fixed 2026-05-23; direct backend still broken).**
+>    The extended-query path didn't sniff `BEGIN`/`COMMIT` the way
+>    `spi_bridge.rs::parse_and_classify` does for simple-query. The
+>    SPI backend now shares the sniff via
+>    `spi_bridge::classify_single_statement` +
+>    `handle_xact_control_one` (see the short-circuit at the top of
+>    `extended::spi::prepare`). The direct backend still forwards
+>    xact-control into its `Portal*` path and crashes with a
+>    `0x7f7f7f7f` WIPE_MEM use-after-free symptom — pinned by
+>    `xact_control_begin_via_extended_query_direct_backend_pins_bug`.
+>    See [§3.2](#32-workload-matrix-on-v0-pg_transport).
+> 2. **sysbench design constraint** — `oltp_read_write` /
+>    `oltp_delete` / `oltp_insert` race on `delete_inserts` at
+>    threads > 1, both against vanilla PG and pg_transport. Not a
+>    pg_transport bug; documented as a `threads=1` ceiling in the
+>    workload matrix.
 >
 > The original Phase A description (intent, scope, effort
 > estimate) is kept below as the historical planning record.
@@ -622,7 +645,7 @@ tps. Worth landing alongside Phase A or B.
 | Step              | Effort  | Decision after                                                                                       |
 | ----------------- | ------- | ---------------------------------------------------------------------------------------------------- |
 | Showcase 1        | ~1 day  | **Shipped 2026-05-23.** Predicted 5–15×; measured 7.78× / 10.22× / 11.80× at clients = 4 / 16 / 32. This is the headline benchmark. |
-| Phase A (sysbench)| ~2 days | **Shipped 2026-05-23.** Harness works; smoke at clients=4 shows ~0.81× (point_select) and ~0.88× (read_only). Surfaced an extended-query xact-control bug (`oltp_read_*` needs `skip_trx=on`) — see [§3.2](#32-workload-matrix-on-v0-pg_transport). Proper sweep belongs in [performance.md](performance.md). |
+| Phase A (sysbench)| ~2 days | **Shipped 2026-05-23.** Harness works; smoke at clients=4 shows ~0.81× (point_select) and ~0.88× (read_only). Surfaced an extended-query xact-control bug — the SPI backend's side was [fixed 2026-05-23](#32-workload-matrix-on-v0-pg_transport) (so `oltp_read_*` / `oltp_update_*` now run with default explicit BEGIN/COMMIT); direct backend still UAFs. Proper sweep belongs in [performance.md](performance.md). |
 | Sidecar (RSS)     | ~½ day  | Combine with Phase A; without it the "memory win" story is hand-waved.                              |
 | Phase B (pgbouncer)| ~3 days | The point at which we have publishable 4-way numbers.                                              |
 | Phase C (HammerDB)| ~1 week | Only if external audience asks for a formal TPC-C tpmC number.                                     |

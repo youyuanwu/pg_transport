@@ -203,6 +203,25 @@ pub fn prepare(sql: &str, param_hints: &[Option<u32>]) -> PgWireResult<super::Pr
     let sql_owned = sql.to_string();
     let any_hint_present = param_hints.iter().any(|o| o.is_some());
 
+    // Short-circuit: xact-control (BEGIN / COMMIT / ROLLBACK and
+    // their mode-list variants) must NOT reach SPI_prepare —
+    // `SPI_execute_plan` in atomic mode rejects them with
+    // SPI_ERROR_TRANSACTION (surfaced as the
+    // `xact_control_begin_via_extended_query_spi_backend_*` bug
+    // pin in `crates/e2e/tests/basic.rs`). Route them through
+    // the same xact-block API the simple-query bridge uses by
+    // returning a `PreparedStatement` whose plan is an
+    // `XactControlBackendPlan` that calls
+    // `spi_bridge::handle_xact_control_one` on each Execute.
+    if let Some(cmd) = super::super::spi_bridge::classify_single_statement(sql)? {
+        return Ok(super::PreparedStatement {
+            sql: sql_owned,
+            param_types: Vec::new(),
+            result_schema: Vec::new(),
+            plan: Box::new(XactControlBackendPlan { cmd }),
+        });
+    }
+
     with_spi(|ctx: &SpiCtx| -> PgWireResult<super::PreparedStatement> {
         // Resolve types (either echo client hints, or run
         // varparams inference).
@@ -281,6 +300,47 @@ pub fn prepare(sql: &str, param_hints: &[Option<u32>]) -> PgWireResult<super::Pr
 // ---------------------------------------------------------------------------
 // execute — Bind+Execute path (PreparedPlan trait impl)
 // ---------------------------------------------------------------------------
+
+/// Backend plan for transaction-control statements (BEGIN / COMMIT
+/// / ROLLBACK and their mode-list variants) routed through Parse +
+/// Bind + Execute.
+///
+/// SPI's atomic mode rejects xact-control with
+/// `SPI_ERROR_TRANSACTION`, so the wire layer must intercept them
+/// before they reach `SPI_execute_plan`. The simple-query bridge
+/// does the same sniff at the top of
+/// [`super::super::spi_bridge::execute_simple_query`]; this plan
+/// is the extended-query equivalent. Selected by
+/// [`prepare`]'s [`super::super::spi_bridge::classify_single_statement`]
+/// short-circuit.
+///
+/// Carries no per-Execute state beyond the classified [`XactCmd`];
+/// parameter binding is rejected at Execute time (xact-control has
+/// no `$n` placeholders).
+struct XactControlBackendPlan {
+    cmd: super::super::spi_bridge::XactCmd,
+}
+
+impl PreparedPlan for XactControlBackendPlan {
+    fn execute(
+        &self,
+        parameters: &[Option<Bytes>],
+        _parameter_format: &Format,
+        _result_format: &Format,
+        _max_rows: usize,
+    ) -> PgWireResult<Response> {
+        if !parameters.is_empty() {
+            return Err(generic_error(
+                "pg_transport extended",
+                &format!(
+                    "transaction-control statement takes no parameters; got {}",
+                    parameters.len()
+                ),
+            ));
+        }
+        super::super::spi_bridge::handle_xact_control_one(self.cmd)
+    }
+}
 
 impl PreparedPlan for SpiBackendPlan {
     /// Execute the SPI plan with bound parameters. `max_rows` of

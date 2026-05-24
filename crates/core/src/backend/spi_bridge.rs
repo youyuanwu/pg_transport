@@ -122,8 +122,16 @@ fn run_spi_statement(query: &str) -> PgWireResult<Vec<Response>> {
 /// don't intercept them — they flow through SPI and get the
 /// `SPI_ERROR_TRANSACTION` rejection with a clear message. Phase ≥9
 /// may revisit savepoints if a real workload needs them.
+///
+/// Visibility note: `pub(super)` so [`super::extended::spi`] can
+/// reuse the same classification + [`handle_xact_control`]
+/// dispatch when a client sends BEGIN / COMMIT / ROLLBACK via
+/// Parse + Bind + Execute (the shape sysbench's libpq driver
+/// uses by default). Without sharing, the extended path would
+/// forward xact-control to `SPI_execute_plan`, which raises
+/// `SPI_ERROR_TRANSACTION` from atomic mode.
 #[derive(Debug, Clone, Copy)]
-enum XactCmd {
+pub(super) enum XactCmd {
     Begin,
     Commit,
     Rollback,
@@ -266,6 +274,19 @@ unsafe fn classify_raw_stmt(raw_stmt: *mut pg_sys::RawStmt) -> Option<XactCmd> {
 }
 
 fn handle_xact_control(cmd: XactCmd) -> PgWireResult<Vec<Response>> {
+    handle_xact_control_one(cmd).map(|r| vec![r])
+}
+
+/// Single-`Response` variant of [`handle_xact_control`] reused by
+/// the extended-query SPI path (which dispatches one statement per
+/// Execute message, not a `Vec` like the simple-query batch).
+///
+/// Visibility: `pub(super)` so [`super::extended::spi`] can call
+/// it from its xact-control short-circuit. Both callers funnel
+/// through here so the xact-block API sequence (Start /
+/// BeginTransactionBlock / Commit and friends) lives in exactly
+/// one place.
+pub(super) fn handle_xact_control_one(cmd: XactCmd) -> PgWireResult<Response> {
     // Pre-check state. `IsTransactionBlock()` returns false from both
     // TBLOCK_DEFAULT (between auto-commit queries) and TBLOCK_STARTED
     // (mid-implicit-xact, which shouldn't be reachable between simple
@@ -325,7 +346,7 @@ fn handle_xact_control(cmd: XactCmd) -> PgWireResult<Vec<Response>> {
     }));
 
     match outcome {
-        Ok(tag) => Ok(vec![Response::Execution(tag)]),
+        Ok(tag) => Ok(Response::Execution(tag)),
         Err(panic_payload) => {
             unsafe {
                 pg_sys::AbortCurrentTransaction();
@@ -333,6 +354,34 @@ fn handle_xact_control(cmd: XactCmd) -> PgWireResult<Vec<Response>> {
             Err(panic_to_pgwire(panic_payload))
         }
     }
+}
+
+/// Classify a single SQL string the way the extended-query path
+/// needs it: parse it (`pg_parse_query` via [`parse_and_classify`])
+/// and, if it parses to exactly one non-empty statement that is a
+/// transaction-control command, return the matching [`XactCmd`].
+/// Returns `Ok(None)` for any other shape (zero / multiple
+/// statements, or a non-xact-control single statement) so the
+/// caller falls back to its existing SPI plan path.
+///
+/// `pub(super)` so [`super::extended::spi::prepare`] can call it;
+/// surface kept narrow because the multi-statement
+/// [`parse_and_classify`] is only meaningful for simple-query.
+pub(super) fn classify_single_statement(sql: &str) -> PgWireResult<Option<XactCmd>> {
+    let stmts = parse_and_classify(sql)?;
+    let mut non_empty = stmts
+        .into_iter()
+        .filter(|(text, _)| !text.trim().is_empty());
+    let first = match non_empty.next() {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    // More than one non-empty statement → not an extended-query
+    // xact-control shape; let SPI_prepare raise its own error.
+    if non_empty.next().is_some() {
+        return Ok(None);
+    }
+    Ok(first.1)
 }
 
 /// Body of [`run_spi_statement`]'s `with_spi` closure. Executes one

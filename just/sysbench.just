@@ -76,28 +76,28 @@ SYSBENCH_SOCKETS := "/tmp/pg_transport_sysbench"
 #                                    which makes sysbench skip
 #                                    explicit BEGIN/COMMIT wrapping
 #                                    and run every query in libpq
-#                                    AUTOCOMMIT mode. **Required for
-#                                    `oltp_read_*` / `oltp_update_*`
-#                                    workloads on v0 pg_transport**
-#                                    because the extended-query path
-#                                    does not yet sniff xact-control
-#                                    (BEGIN/COMMIT via Parse+Execute
-#                                    triggers `SPI_ERROR_TRANSACTION`;
-#                                    the simple-query path has the
-#                                    sniff in spi_bridge.rs, the
-#                                    extended path does not). Also a
-#                                    real measurement axis when the
-#                                    bug is fixed: with vs without
-#                                    explicit-transaction overhead.
+#                                    AUTOCOMMIT mode. No longer
+#                                    required on the SPI backend
+#                                    (the extended-query Parse
+#                                    path now sniffs xact-control
+#                                    via spi_bridge::classify_single_statement
+#                                    + handle_xact_control_one). Still
+#                                    required for the `direct`
+#                                    backend (xact-control UAF
+#                                    pinned by
+#                                    `xact_control_begin_via_extended_query_direct_backend_pins_bug`).
+#                                    Also a real measurement axis:
+#                                    with vs without explicit-
+#                                    transaction overhead.
 #                                    `oltp_point_select` doesn't need
 #                                    this (no transactions to skip).
 #
 # Examples:
-#   just sysbench                                                       # 30s read-write — will FAIL until skip_trx works
+#   just sysbench                                                       # 30s read-write — works on SPI backend with default skip_trx=off
 #   just sysbench pg18 oltp_point_select 16 100000  30 16              # works as-is, no skip_trx needed
-#   just sysbench pg18 oltp_read_only    16 100000  30 16 "" spi on    # works with skip_trx=on workaround
-#   just sysbench pg18 oltp_read_write   16 100000  30 16 "" spi on    # works with skip_trx=on workaround
-#   just sysbench pg18 oltp_read_write   16 1000000 60 32 "" spi on    # larger-than-cache, with skip_trx
+#   just sysbench pg18 oltp_read_only    16 100000  30 16 "" spi off   # SPI backend handles native BEGIN/COMMIT
+#   just sysbench pg18 oltp_read_only    16 100000  30 16 "" direct on # direct backend still needs skip_trx=on
+#   just sysbench pg18 oltp_read_write   16 1000000 60 32 "" spi off   # larger-than-cache, native xact-control
 sysbench pg=default_pg workload="oltp_read_write" tables="16" table_size="100000" duration="30" threads="16" pool="" backend="spi" skip_trx="off":
     #!/usr/bin/env bash
     set -euo pipefail
