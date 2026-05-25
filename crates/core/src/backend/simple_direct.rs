@@ -46,11 +46,12 @@ use pgwire::error::PgWireResult;
 use pgwire::messages::data::DataRow;
 
 use super::dest_receiver::{
-    ColumnEncoder, WireDestReceiver, command_tag_name, schema_and_encoders_text,
+    ColumnEncoder, WireDestReceiver, command_tag_name, schema_and_encoders_uniform,
 };
 use super::executor::{ParamList, Portal, ScopedMemoryContext, TupleDescRef, XactCtx, with_xact};
 use super::observability::DebugQueryGuard;
 use super::spi::{caught_error_to_pgwire, generic_error};
+use pgwire::api::results::FieldFormat;
 
 // ---------------------------------------------------------------------------
 // parse_and_keep — single raw_parser pass; keeps parsetrees alive
@@ -207,6 +208,68 @@ unsafe fn extract_raw_stmt_spans(
 // execute_simple_query_direct — top-level entry, mirrors execute_simple_query
 // ---------------------------------------------------------------------------
 
+/// Sniff a raw parsetree for `FETCH … FROM <cursor>` against a
+/// cursor declared `BINARY` and return the matching
+/// [`FieldFormat`].
+///
+/// Mirrors vanilla `exec_simple_query` at
+/// [postgres.c:1259-1273](../../../../../postgres/src/backend/tcop/postgres.c#L1259-L1273):
+///
+/// ```c
+/// format = 0;     /* TEXT is default */
+/// if (IsA(parsetree->stmt, FetchStmt)) {
+///     FetchStmt *stmt = (FetchStmt *) parsetree->stmt;
+///     if (!stmt->ismove) {
+///         Portal fportal = GetPortalByName(stmt->portalname);
+///         if (PortalIsValid(fportal) &&
+///             (fportal->cursorOptions & CURSOR_OPT_BINARY))
+///             format = 1;     /* BINARY */
+///     }
+/// }
+/// ```
+///
+/// Returns [`FieldFormat::Text`] for every non-FETCH-binary case,
+/// including `MOVE` (`ismove=true`, no rows produced), unknown
+/// portal names (`GetPortalByName` returns NULL), and FETCH from
+/// non-binary cursors.
+fn fetch_result_format(raw_stmt: *mut pg_sys::RawStmt) -> FieldFormat {
+    // SAFETY: raw_stmt is a valid `*mut RawStmt` from raw_parser
+    // (parse_and_keep's lifetime invariant). All field reads are
+    // bounded by stmt-node validity.
+    unsafe {
+        let stmt_node = (*raw_stmt).stmt;
+        if stmt_node.is_null() {
+            return FieldFormat::Text;
+        }
+        if (*stmt_node).type_ != pg_sys::NodeTag::T_FetchStmt {
+            return FieldFormat::Text;
+        }
+        let fs = stmt_node as *mut pg_sys::FetchStmt;
+        if (*fs).ismove {
+            // MOVE produces no rows; format is moot. Match
+            // vanilla which keeps format = 0.
+            return FieldFormat::Text;
+        }
+        let portal_name = (*fs).portalname;
+        if portal_name.is_null() {
+            return FieldFormat::Text;
+        }
+        let cursor_portal = pg_sys::GetPortalByName(portal_name);
+        if cursor_portal.is_null() {
+            // Cursor doesn't exist; PortalRun will raise the
+            // canonical "cursor X does not exist" error. Format
+            // is irrelevant.
+            return FieldFormat::Text;
+        }
+        let opts = (*cursor_portal).cursorOptions;
+        if (opts & pg_sys::CURSOR_OPT_BINARY as i32) != 0 {
+            FieldFormat::Binary
+        } else {
+            FieldFormat::Text
+        }
+    }
+}
+
 /// Run a simple-query string through the direct backend and
 /// shape the result into pgwire `Response`s.
 ///
@@ -338,16 +401,26 @@ fn run_one_direct(
         //    backend).
         portal.start(&ParamList::empty(), 0, pg_sys::GetActiveSnapshot());
 
-        // 6. Schema + per-column encoders from the now-populated
+        // 6. Pick the result format. Mirrors vanilla
+        //    `exec_simple_query` at
+        //    [postgres.c:1259-1273](../../../../../postgres/src/backend/tcop/postgres.c#L1259-L1273):
+        //    `FETCH` from a `DECLARE … BINARY CURSOR` promotes
+        //    the *whole* result set to binary; everything else
+        //    stays text (the `'Q'` protocol has no per-column
+        //    format vector). [`fetch_result_format`] returns
+        //    Text in every non-FETCH-binary case.
+        let result_format = fetch_result_format(raw_stmt);
+
+        // 7. Schema + per-column encoders from the now-populated
         //    portal->tupDesc. NULL tupdesc → utility / no-tuple
         //    statement → empty schema, no encoders.
         let tupdesc = TupleDescRef::from_raw((*portal.as_ptr()).tupDesc);
         let (schema, encoders): (Vec<_>, Vec<ColumnEncoder>) = match tupdesc {
-            Some(td) => schema_and_encoders_text(&td),
+            Some(td) => schema_and_encoders_uniform(&td, result_format),
             None => (Vec::new(), Vec::new()),
         };
 
-        // 7. Execute. Per-row encoding happens inside the
+        // 8. Execute. Per-row encoding happens inside the
         //    receiver's receiveSlot callback, which appends to
         //    `data_rows`. Pre-size to a modest default so a typical
         //    multi-row SELECT doesn't pay the 0→4→8→16 geometric
@@ -366,7 +439,7 @@ fn run_one_direct(
             &mut qc,
         );
 
-        // 8. portal drops here (PortalDrop on scope exit),
+        // 9. portal drops here (PortalDrop on scope exit),
         //    tearing down executor state and freeing the portal's
         //    MemoryContext. dest also drops; its rows/encoders
         //    borrow ends.
@@ -374,7 +447,7 @@ fn run_one_direct(
     };
     drop(encoders); // no longer referenced; explicit for clarity
 
-    // 9. Shape into pgwire Response. data_rows holds encoded
+    // 10. Shape into pgwire Response. data_rows holds encoded
     //    wire bytes; no SPI_tuptable step.
     let tag_name = command_tag_name(qc.commandTag);
     if schema.is_empty() {
@@ -558,6 +631,74 @@ mod tests {
             msg.to_ascii_lowercase().contains("syntax")
                 || msg.to_ascii_lowercase().contains("selectt"),
             "expected syntax error, got: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // FETCH-binary cursor format (review 2026-05-24 §6 item 1)
+    // -----------------------------------------------------------------------
+
+    /// Regression guard for [docs/design/reviews/2026-05-24-pg-code-findings.md](../../../../docs/design/reviews/2026-05-24-pg-code-findings.md)
+    /// §6 item 1.
+    ///
+    /// **Downstream property under test.** Vanilla
+    /// `exec_simple_query` checks
+    /// `IsA(parsetree->stmt, FetchStmt)`, looks up the named
+    /// cursor with `GetPortalByName`, and flips `format = 1`
+    /// (binary) for cursors declared `BINARY`
+    /// ([postgres.c:1259-1273](../../../../../postgres/src/backend/tcop/postgres.c#L1259-L1273)).
+    /// `execute_simple_query_direct` does the equivalent via
+    /// [`fetch_result_format`] right after `PortalStart`, then
+    /// builds binary encoders via
+    /// [`schema_and_encoders_uniform`].
+    ///
+    /// Test: `DECLARE bincur BINARY CURSOR FOR SELECT 42::int4`,
+    /// then `FETCH 1 FROM bincur`. Inspect the returned
+    /// `DataRow`'s cell bytes. Vanilla encodes int4 42 as the
+    /// 4-byte big-endian binary `[0x00, 0x00, 0x00, 0x2A]`; the
+    /// direct path must produce the same bytes.
+    ///
+    /// If this regresses (assertion sees `b"42"` = 2 bytes text
+    /// instead of 4 bytes binary), `fetch_result_format` is no
+    /// longer being consulted in `run_one_direct`, or
+    /// `schema_and_encoders_uniform` was passed `FieldFormat::Text`
+    /// instead of the sniffed value.
+    #[pg_test]
+    fn pg_simple_direct_fetch_binary_cursor_returns_binary() {
+        // DECLARE is a utility statement; runs through PortalRun
+        // → ProcessUtility and persists the cursor for the
+        // duration of the outer pg_test transaction.
+        execute_simple_query_direct("DECLARE bincur BINARY CURSOR FOR SELECT 42::int4")
+            .expect("DECLARE BINARY CURSOR should succeed");
+
+        // FETCH runs through the same path. fetch_result_format
+        // sniffs the FetchStmt, calls GetPortalByName("bincur"),
+        // observes CURSOR_OPT_BINARY, and returns Binary.
+        let r = execute_simple_query_direct("FETCH 1 FROM bincur").expect("FETCH should succeed");
+        assert_eq!(r.len(), 1, "expected one Response from FETCH");
+        let mut q = match r.into_iter().next().unwrap() {
+            Response::Query(q) => q,
+            other => panic!("expected Query response from FETCH, got {other:?}"),
+        };
+
+        let row = futures::executor::block_on(async { q.data_rows().next().await })
+            .expect("FETCH should return one row")
+            .expect("row item should be Ok");
+        assert_eq!(row.field_count, 1, "single int4 column");
+
+        let mut data = row.data;
+        let len = data.get_i32();
+        assert_eq!(len, 4, "binary int4 is 4 bytes; got len {len}");
+        let cell = data.split_to(len as usize).to_vec();
+
+        let expected_binary: Vec<u8> = 42i32.to_be_bytes().to_vec();
+        assert_eq!(
+            cell, expected_binary,
+            "REGRESSION on review 2026-05-24 §6 item 1: FETCH from a \
+             BINARY cursor produced {cell:?} instead of the expected \
+             4-byte big-endian int4 encoding {expected_binary:?}. \
+             `fetch_result_format` or `schema_and_encoders_uniform` \
+             was bypassed in `run_one_direct`.",
         );
     }
 

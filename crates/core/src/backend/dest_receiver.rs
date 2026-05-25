@@ -231,19 +231,26 @@ pub(crate) fn command_tag_name(tag: pg_sys::CommandTag::Type) -> &'static str {
     }
 }
 
-/// Build a `(schema, encoders)` pair from a tupdesc, defaulting
-/// every column to text format. Used by the simple-query direct
-/// backend where pgwire's `'Q'` protocol forces text-only result
-/// formats.
+/// Build a `(schema, encoders)` pair from a tupdesc using a
+/// single uniform [`FieldFormat`] for every column. Used by the
+/// simple-query direct backend: the `'Q'` protocol carries no
+/// per-column format vector, but PG's FETCH-from-binary-cursor
+/// shorthand promotes the *whole* result set to binary (see
+/// [postgres.c:1259-1273](../../../../../postgres/src/backend/tcop/postgres.c#L1259-L1273)),
+/// so a single format applies to every column. Caller picks
+/// Text or Binary based on whether the parsetree is a
+/// `FetchStmt` against a `CURSOR_OPT_BINARY` portal.
 ///
 /// Mirrors the per-execute construction in the extended-query
 /// direct backend
 /// ([`super::extended::direct`](../extended/direct.rs)), but
 /// reads the column name + OID directly off the portal's tupdesc
 /// instead of using pre-cached `param_oids` / `column_oids`
-/// vectors.
-pub(crate) fn schema_and_encoders_text(
+/// vectors, and applies a single format instead of an
+/// extended-query per-column format vector.
+pub(crate) fn schema_and_encoders_uniform(
     tupdesc: &TupleDescRef<'_>,
+    format: FieldFormat,
 ) -> (Vec<FieldInfo>, Vec<ColumnEncoder>) {
     let n = tupdesc.len();
     let mut schema = Vec::with_capacity(n);
@@ -258,9 +265,9 @@ pub(crate) fn schema_and_encoders_text(
             None,
             None,
             Type::from_oid(oid.to_u32()).unwrap_or(Type::TEXT),
-            FieldFormat::Text,
+            format,
         ));
-        encoders.push(ColumnEncoder::for_column(oid, FieldFormat::Text));
+        encoders.push(ColumnEncoder::for_column(oid, format));
     }
     (schema, encoders)
 }
