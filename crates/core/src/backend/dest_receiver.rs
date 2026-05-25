@@ -160,13 +160,27 @@ impl ColumnEncoder {
 
     /// Encode `datum` directly into `buf` as a length-prefixed
     /// field, avoiding the intermediate `Vec<u8>` allocation.
+    ///
+    /// Hot path. Dispatches through the cached
+    /// [`pg_sys::FmgrInfo`] held by [`TypeOutput`] / [`TypeSend`]
+    /// so the per-cell cost is one direct function-pointer call
+    /// (`fn_addr`) — no `fmgr_info` / syscache lookup per cell.
+    /// Matches vanilla [`printtup`'s hot loop](../../../../../postgres/src/backend/access/common/printtup.c#L361)
+    /// shape; closes [review §3.1.1](../../../../docs/design/reviews/2026-05-24-pg-code-findings.md).
     pub(crate) fn encode_into(&self, datum: pg_sys::Datum, buf: &mut BytesMut) {
         match self {
             Self::Text(fns) => {
-                // SAFETY: OidOutputFunctionCall returns a palloc'd
-                // NUL-terminated cstring.
+                // SAFETY: `OutputFunctionCall` reads `fn_addr` /
+                // `fn_oid` / etc. from the FmgrInfo to invoke the
+                // type's text-output function — it does not
+                // mutate the FmgrInfo struct itself, despite the
+                // `*mut` in the C signature (PG headers have no
+                // `const` discipline on FmgrInfo). Returns a
+                // palloc'd NUL-terminated cstring owned by the
+                // current MemoryContext.
                 unsafe {
-                    let ptr = pg_sys::OidOutputFunctionCall(fns.typoutput, datum);
+                    let finfo_ptr = &fns.finfo as *const pg_sys::FmgrInfo as *mut pg_sys::FmgrInfo;
+                    let ptr = pg_sys::OutputFunctionCall(finfo_ptr, datum);
                     let slice = CStr::from_ptr(ptr).to_bytes();
                     buf.put_i32(slice.len() as i32);
                     buf.put_slice(slice);
@@ -174,10 +188,11 @@ impl ColumnEncoder {
                 }
             }
             Self::Binary(fns) => {
-                // SAFETY: OidSendFunctionCall returns a palloc'd
-                // bytea (varlena).
+                // SAFETY: as Text branch. `SendFunctionCall`
+                // returns a palloc'd bytea (varlena).
                 unsafe {
-                    let ptr = pg_sys::OidSendFunctionCall(fns.typsend, datum);
+                    let finfo_ptr = &fns.finfo as *const pg_sys::FmgrInfo as *mut pg_sys::FmgrInfo;
+                    let ptr = pg_sys::SendFunctionCall(finfo_ptr, datum);
                     let slice = pgrx::varlena::varlena_to_byte_slice(ptr as *const pg_sys::varlena);
                     buf.put_i32(slice.len() as i32);
                     buf.put_slice(slice);

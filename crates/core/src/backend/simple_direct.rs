@@ -453,6 +453,70 @@ mod tests {
         }
     }
 
+    /// Wide multi-row SELECT — exercises the per-cell encoder
+    /// path repeatedly across rows and columns of different types.
+    /// Regression guard for the [`super::super::spi::TypeOutput`]
+    /// FmgrInfo cache: the hot loop now dispatches via
+    /// `OutputFunctionCall(&cached_finfo, datum)` instead of
+    /// `OidOutputFunctionCall(oid, datum)`. If the cache went
+    /// stale (e.g. `fn_mcxt` dangled) or the FFI shape regressed,
+    /// the per-cell output would be wrong here long before it
+    /// showed up on the wire.
+    ///
+    /// Picks five distinct types so a single broken FmgrInfo is
+    /// caught regardless of which column it cached.
+    #[pg_test]
+    fn pg_simple_direct_wide_multirow_select_uses_cached_finfo() {
+        let r = execute_simple_query_direct(
+            "SELECT g::int4    AS n, \
+                    g::int8    AS big, \
+                    g::float4  AS f4, \
+                    g::text    AS s,  \
+                    (g % 2 = 0) AS even \
+             FROM generate_series(1, 5) g \
+             ORDER BY g",
+        )
+        .expect("wide multi-row SELECT should succeed");
+        assert_eq!(r.len(), 1, "expected exactly one response");
+        let mut q = match r.into_iter().next().unwrap() {
+            Response::Query(q) => q,
+            other => panic!("expected Query, got {other:?}"),
+        };
+
+        // Collect all 5 rows and verify each cell text-encoded
+        // correctly through the cached FmgrInfo path.
+        let rows: Vec<DataRow> = futures::executor::block_on(async {
+            let mut out = Vec::with_capacity(5);
+            while let Some(row) = q.data_rows().next().await {
+                out.push(row.expect("row item should be Ok"));
+            }
+            out
+        });
+        assert_eq!(rows.len(), 5, "expected 5 generate_series rows");
+
+        for (i, row) in rows.into_iter().enumerate() {
+            let expected_n = (i + 1) as i32;
+            assert_eq!(row.field_count, 5);
+            let mut data = row.data;
+            // Per-cell read: length-prefixed text bytes.
+            let read_cell = |data: &mut bytes::BytesMut| -> String {
+                let len = data.get_i32();
+                assert!(len >= 0, "NULL not expected in this query");
+                let cell = data.split_to(len as usize);
+                String::from_utf8(cell.to_vec()).expect("text output is utf-8")
+            };
+            assert_eq!(read_cell(&mut data), expected_n.to_string());
+            assert_eq!(read_cell(&mut data), expected_n.to_string());
+            // float4 output adds no decimal for whole integers — "1", "2", …
+            assert_eq!(read_cell(&mut data), expected_n.to_string());
+            assert_eq!(read_cell(&mut data), expected_n.to_string());
+            assert_eq!(
+                read_cell(&mut data),
+                if expected_n % 2 == 0 { "t" } else { "f" }
+            );
+        }
+    }
+
     /// Utility statement (`SET`) routes through PortalRun →
     /// ProcessUtility and returns an Execution response, not a
     /// Query.

@@ -540,45 +540,76 @@ impl TypeReceive {
     }
 }
 
-/// Bundled `typoutput` OID lookup. The cached OID is consumed by
-/// [`super::dest_receiver::ColumnEncoder::encode_into`], which
-/// runs the type's text-format output function and writes the
-/// length-prefixed cstring straight into a [`bytes::BytesMut`]
-/// (no intermediate `Vec<u8>` allocation).
+/// Cached `typoutput` `FmgrInfo` for a result-column type. Built
+/// once at portal setup; consumed by
+/// [`super::dest_receiver::ColumnEncoder::encode_into`] in the
+/// per-row hot loop.
+///
+/// Holding the resolved [`pg_sys::FmgrInfo`] (rather than just
+/// the `typoutput` Oid) lets the hot loop dispatch through
+/// `OutputFunctionCall(&finfo, datum)` — a direct call through
+/// the cached `fn_addr` function pointer. The `Oid`-only variant
+/// went through `OidOutputFunctionCall`, which does
+/// `fmgr_info(typoutput)` — a `SearchSysCache1(PROCOID, ...)`
+/// lookup — on *every cell*. Matches vanilla
+/// [`printtup_prepare_info`](../../../../../postgres/src/backend/access/common/printtup.c#L251)
+/// and the [`printtup` hot loop](../../../../../postgres/src/backend/access/common/printtup.c#L361);
+/// closes the per-cell syscache cost called out in
+/// [review §3.1.1](../../../../docs/design/reviews/2026-05-24-pg-code-findings.md).
+///
+/// **Lifetime / context invariant.** `fmgr_info` writes
+/// `fn_mcxt = CurrentMemoryContext` into the FmgrInfo at
+/// construction; that pointer must remain valid for the
+/// lifetime of the encoder. Callers therefore build encoders
+/// inside [`with_spi`] / `with_xact`, where the active
+/// MemoryContext (TopTransactionContext) outlives the encoder
+/// Vec.
 pub struct TypeOutput {
-    pub(crate) typoutput: pg_sys::Oid,
+    pub(crate) finfo: pg_sys::FmgrInfo,
 }
 
 impl TypeOutput {
     pub fn for_type(oid: pg_sys::Oid) -> Self {
-        let mut typoutput = pg_sys::Oid::INVALID;
+        let mut typoutput_oid = pg_sys::Oid::INVALID;
         let mut is_varlena = false;
-        // SAFETY: as TypeInput::for_type.
+        let mut finfo = pg_sys::FmgrInfo::default();
+        // SAFETY: getTypeOutputInfo + fmgr_info are PG server-API
+        // entry points; caller is in an active xact context (per
+        // the lifetime invariant above), so CurrentMemoryContext
+        // is the TopTransactionContext that owns this allocation
+        // boundary.
         unsafe {
-            pg_sys::getTypeOutputInfo(oid, &mut typoutput, &mut is_varlena);
+            pg_sys::getTypeOutputInfo(oid, &mut typoutput_oid, &mut is_varlena);
+            pg_sys::fmgr_info(typoutput_oid, &mut finfo);
         }
-        Self { typoutput }
+        Self { finfo }
     }
 }
 
-/// Bundled `typsend` OID lookup. The cached OID is consumed by
-/// [`super::dest_receiver::ColumnEncoder::encode_into`], which
-/// runs the type's binary-format `typsend` function and writes the
-/// resulting `bytea` payload (header stripped) straight into a
+/// Cached `typsend` `FmgrInfo` for a result-column type. Binary-
+/// format counterpart to [`TypeOutput`]; same caching strategy
+/// (resolved FmgrInfo, not just the typsend Oid). Consumed by
+/// [`super::dest_receiver::ColumnEncoder::encode_into`] which
+/// dispatches via `SendFunctionCall(&finfo, datum)` and writes
+/// the resulting `bytea` payload (header stripped) into a
 /// [`bytes::BytesMut`].
+///
+/// Same context-lifetime invariant as `TypeOutput`.
 pub struct TypeSend {
-    pub(crate) typsend: pg_sys::Oid,
+    pub(crate) finfo: pg_sys::FmgrInfo,
 }
 
 impl TypeSend {
     pub fn for_type(oid: pg_sys::Oid) -> Self {
-        let mut typsend = pg_sys::Oid::INVALID;
+        let mut typsend_oid = pg_sys::Oid::INVALID;
         let mut is_varlena = false;
-        // SAFETY: as TypeInput::for_type.
+        let mut finfo = pg_sys::FmgrInfo::default();
+        // SAFETY: see TypeOutput::for_type.
         unsafe {
-            pg_sys::getTypeBinaryOutputInfo(oid, &mut typsend, &mut is_varlena);
+            pg_sys::getTypeBinaryOutputInfo(oid, &mut typsend_oid, &mut is_varlena);
+            pg_sys::fmgr_info(typsend_oid, &mut finfo);
         }
-        Self { typsend }
+        Self { finfo }
     }
 }
 
