@@ -85,7 +85,21 @@ pub struct SpiCtx {
 }
 
 impl SpiCtx {
-    fn new() -> Self {
+    /// Construct a fresh SPI-session token.
+    ///
+    /// `pub(super)` so callers in the `backend` module that hand-
+    /// roll a `StartTransactionCommand` + `SPI_connect` /
+    /// `SPI_finish` + `CommitTransactionCommand` sandwich (rather
+    /// than using [`with_spi`]) can still mint a `&SpiCtx` to pass
+    /// to SPI-requiring helpers like
+    /// [`super::spi_bridge::run_via_spi`]. The
+    /// [implicit-block multi-statement path in `spi_bridge`](super::spi_bridge)
+    /// needs exactly this: one outer `catch_unwind` over a loop
+    /// that opens and closes an SPI session per iteration, without
+    /// `with_spi`'s nested `catch_unwind` + `AbortCurrentTransaction`
+    /// (which would collapse the outer implicit block on the very
+    /// first ERROR — defeating the §6.2 fix).
+    pub(super) fn new() -> Self {
         Self {
             _marker: PhantomData,
             finished: Cell::new(false),

@@ -63,6 +63,19 @@ use super::spi::{
 /// * Empty / whitespace-only / comment-only bodies return an empty
 ///   `Vec<Response>`; pgwire's SimpleQueryHandler renders that as a
 ///   single `EmptyQueryResponse` + `ReadyForQuery`.
+///
+/// **Multi-statement atomicity.** When the `'Q'` body contains more
+/// than one executable statement and none of them is a recognised
+/// xact-control (BEGIN / COMMIT / ROLLBACK), the batch is wrapped
+/// in `BeginImplicitTransactionBlock` /
+/// `EndImplicitTransactionBlock` so the whole batch commits or
+/// rolls back atomically — matching vanilla `exec_simple_query`
+/// ([postgres.c:1097 + :1167-1170 + :1310](../../../../../postgres/src/backend/tcop/postgres.c#L1097)).
+/// Mixed batches containing xact-control fall back to the per-
+/// statement bracket path so [`handle_xact_control`]'s xact-block
+/// API calls don't fight an outer implicit block. Closes review
+/// 2026-05-24 §6 item 2 for the SPI backend (parity with
+/// [`super::simple_direct::execute_with_implicit_block`]).
 pub fn execute_simple_query(query: &str) -> PgWireResult<Vec<Response>> {
     // Pin per-query observability (debug_query_string + pgstat
     // STATE_RUNNING) for the lifetime of the query body. The
@@ -91,6 +104,24 @@ pub fn execute_simple_query(query: &str) -> PgWireResult<Vec<Response>> {
     let _stmt_timeout = unsafe { StatementTimeoutGuard::install() };
 
     let statements = parse_and_classify(query)?;
+
+    // Decide which dispatch shape to use. Vanilla skips the
+    // implicit block when `list_length(parsetree_list) <= 1`; we
+    // match that. Batches that include xact-control fall back to
+    // the per-statement path: `handle_xact_control` issues its
+    // own `StartTransactionCommand` / `BeginTransactionBlock` /
+    // `CommitTransactionCommand` sequence that doesn't compose
+    // cleanly with an outer implicit block.
+    let non_empty_count = statements
+        .iter()
+        .filter(|(text, _)| !text.trim().is_empty())
+        .count();
+    let has_xact_control = statements.iter().any(|(_, meta)| meta.xact.is_some());
+
+    if non_empty_count > 1 && !has_xact_control {
+        return execute_with_implicit_block_spi(statements);
+    }
+
     let mut responses = Vec::with_capacity(statements.len());
     for (text, classification) in statements {
         if text.trim().is_empty() {
@@ -101,6 +132,161 @@ pub fn execute_simple_query(query: &str) -> PgWireResult<Vec<Response>> {
         responses.extend(execute_one_statement(text, classification)?);
     }
     Ok(responses)
+}
+
+/// Multi-statement implicit-block executor for the SPI bridge —
+/// SPI counterpart to
+/// [`super::simple_direct::execute_with_implicit_block`]. Closes
+/// review 2026-05-24 §6 item 2 for the SPI backend.
+///
+/// Pre-condition (enforced by the caller in
+/// [`execute_simple_query`]): every entry in `statements` has
+/// `meta.xact == None`. Mixed batches stay on the per-statement
+/// path because [`handle_xact_control`]'s xact-block API would
+/// fight an outer implicit block.
+///
+/// Mirrors vanilla `exec_simple_query`'s per-iter pattern
+/// ([postgres.c:1097-1340](../../../../../postgres/src/backend/tcop/postgres.c#L1097-L1340)):
+///
+/// 1. **Per iteration**: `StartTransactionCommand` (idempotent —
+///    no-op when already in xact) + `BeginImplicitTransactionBlock`
+///    (idempotent — no-op when already inside an implicit block) +
+///    `PushActiveSnapshot` + `SPI_connect`.
+/// 2. **Run the statement** via [`run_via_spi`] under a freshly-
+///    minted [`SpiCtx`] (`SpiCtx::new()` is `pub(super)` for
+///    exactly this reason — see [`super::spi::SpiCtx::new`]).
+/// 3. **Tail**: `SPI_finish` + `PopActiveSnapshot` then either
+///    `EndImplicitTransactionBlock` + `CommitTransactionCommand`
+///    (last iter — commits the whole batch atomically) or
+///    `CommandCounterIncrement` (mid-iter — make this stmt's
+///    effects visible to the next without ending the xact).
+/// 4. **PG-ERROR catch**: one outer `catch_unwind` wraps the
+///    whole loop body. A statement raising `ERROR` longjmp's
+///    through pgrx into a Rust panic, unwinds out of the loop,
+///    and lands in the `Err(panic)` arm — which calls
+///    `AbortCurrentTransaction` (collapsing the implicit block
+///    and rolling back every earlier successful sub-statement)
+///    and returns `Err`.
+///
+/// Why this can't reuse [`with_spi`]: that helper has its own
+/// `catch_unwind` + `AbortCurrentTransaction`, so a PG ERROR
+/// raised in iteration N would abort the outer xact before iter
+/// N+1 — but our outer code has already opened the implicit
+/// block, so the abort would collapse it and silently leave the
+/// remaining loop iterations running in a fresh auto-commit
+/// context. The whole batch must abort as one unit, which means
+/// the panic has to escape through `with_spi`'s normal seam and
+/// into the catch_unwind installed here.
+fn execute_with_implicit_block_spi(
+    statements: Vec<(&str, StmtMeta)>,
+) -> PgWireResult<Vec<Response>> {
+    // Strip whitespace-only entries up front; they were tolerated
+    // in single-statement mode (vanilla drops them silently) and
+    // we keep the same shape here.
+    let prepared: Vec<(&str, Option<CString>)> = statements
+        .into_iter()
+        .filter(|(text, _)| !text.trim().is_empty())
+        .map(|(text, meta)| (text, meta.fetch_portalname))
+        .collect();
+    debug_assert!(
+        prepared.len() > 1,
+        "execute_with_implicit_block_spi must only be called for multi-statement bodies"
+    );
+    let last_idx = prepared.len() - 1;
+
+    let body_outcome = catch_unwind(AssertUnwindSafe(|| -> PgWireResult<Vec<Response>> {
+        let mut responses: Vec<Response> = Vec::with_capacity(prepared.len());
+        for (i, (text, fetch_portalname)) in prepared.iter().enumerate() {
+            // SAFETY: all calls are PG server-API entry points
+            // safe from any TBLOCK state. Start +
+            // BeginImplicitTransactionBlock are idempotent for
+            // an already-open implicit block (the second and
+            // later iters take that path).
+            unsafe {
+                pg_sys::SetCurrentStatementStartTimestamp();
+                pg_sys::StartTransactionCommand();
+                pg_sys::BeginImplicitTransactionBlock();
+                pg_sys::PushActiveSnapshot(pg_sys::GetTransactionSnapshot());
+            }
+
+            // Open and close one SPI session per iter, inline
+            // (no `with_spi`). See the function-level comment
+            // above for why nesting `with_spi` here would
+            // defeat the implicit-block atomicity.
+            //
+            // SAFETY: we're inside the xact opened above;
+            // SPI_connect / SPI_finish form a matched pair.
+            let connect_rc = unsafe { pg_sys::SPI_connect() };
+            if connect_rc != pg_sys::SPI_OK_CONNECT as i32 {
+                // Don't try to call SPI_finish on a failed
+                // connect; pop snapshot + propagate via the
+                // outer abort path (return Err — caught
+                // below, AbortCurrentTransaction collapses
+                // the implicit block).
+                unsafe { pg_sys::PopActiveSnapshot() };
+                return Err(spi_rc_error("SPI_connect", connect_rc));
+            }
+            let ctx = SpiCtx::new();
+
+            let body_result = run_via_spi(&ctx, text, fetch_portalname.as_deref());
+
+            // SAFETY: matched with SPI_connect above. Always
+            // close, even on body error — the SPI session
+            // was opened.
+            let finish_rc = unsafe { pg_sys::SPI_finish() };
+            // SAFETY: matched with the Push above.
+            unsafe { pg_sys::PopActiveSnapshot() };
+
+            let resp = body_result?;
+            if finish_rc != pg_sys::SPI_OK_FINISH as i32 {
+                return Err(spi_rc_error("SPI_finish", finish_rc));
+            }
+            responses.extend(resp);
+
+            // SAFETY: each branch matches vanilla's per-iter
+            // tail (postgres.c:1310 / :1340).
+            unsafe {
+                if i == last_idx {
+                    pg_sys::EndImplicitTransactionBlock();
+                    pg_sys::CommitTransactionCommand();
+                } else {
+                    // Mid-batch non-xact-control: make this
+                    // statement's effects visible to the
+                    // next without ending the xact.
+                    pg_sys::CommandCounterIncrement();
+                }
+            }
+        }
+        Ok(responses)
+    }));
+
+    match body_outcome {
+        Ok(Ok(responses)) => Ok(responses),
+        Ok(Err(err)) => {
+            // Typed error from run_via_spi without a PG ERROR
+            // (e.g. NUL-in-query from generic_error, or
+            // SPI_connect rc != OK). Xact is still open; abort
+            // to honour the implicit-block "first error rolls
+            // back the whole batch" rule.
+            //
+            // SAFETY: AbortCurrentTransaction is safe from any
+            // non-DEFAULT TBLOCK_* state.
+            unsafe { pg_sys::AbortCurrentTransaction() };
+            Err(err)
+        }
+        Err(panic_payload) => {
+            // PG ERROR longjmp'd through `run_via_spi`. This is
+            // the load-bearing branch for the §6.2 fix on the
+            // SPI backend: the implicit block plus every
+            // earlier sub-statement's work rolls back here.
+            //
+            // SAFETY: AbortCurrentTransaction handles SPI state
+            // and the snapshot stack itself; we do NOT call
+            // SPI_finish or PopActiveSnapshot here.
+            unsafe { pg_sys::AbortCurrentTransaction() };
+            Err(panic_to_pgwire(panic_payload))
+        }
+    }
 }
 
 /// Per-statement executor. Routes xact-control statements through
