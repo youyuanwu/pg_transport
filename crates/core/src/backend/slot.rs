@@ -247,6 +247,19 @@ fn cleanup_per_slot_state() {
 ///
 /// Current scope:
 ///
+/// * **Pending transactions** — `pg_sys::AbortOutOfAnyTransaction()`
+///   unconditionally rolls back any open xact (TBLOCK_INPROGRESS
+///   from an unclosed `BEGIN`, TBLOCK_ABORT from an error inside
+///   a `BEGIN` block that the client never followed with
+///   `ROLLBACK`, subtransactions from open `SAVEPOINT`s) and
+///   returns the backend to `TBLOCK_DEFAULT`. Without this, a
+///   client that disconnects mid-block leaves the slot's xact
+///   state non-DEFAULT; the next handoff's first statement
+///   would either inherit the explicit block (silent data-
+///   integrity violation) or hit the §6.3 abort-rejection on
+///   every non-exit statement (loud but unrecoverable until the
+///   slot is recycled). Mirrors what `ProcessClientReadInterrupt`
+///   / vanilla's `proc_exit` would do.
 /// * **GUCs** — `pg_sys::ResetAllOptions()` walks the GUC variable
 ///   list and reverts every `SET` (USERSET / SUSET / SIGHUP) to
 ///   its boot-time default. This is the immediate cross-handoff
@@ -260,18 +273,22 @@ fn cleanup_per_slot_state() {
 /// * SQL-level prepared statements (`DropAllPreparedStatements`).
 /// * Temp namespace cleanup.
 /// * Cursors / portals not already torn down by pgwire's drop.
-/// * Reset transaction state if dirty.
 ///
-/// SAFETY: `ResetAllOptions` is callable from any backend with
+/// SAFETY: `AbortOutOfAnyTransaction` and `ResetAllOptions` are
+/// both callable from any backend with the basic transam +
 /// GUC machinery initialised (we are — `connect_worker_to_spi`
-/// ran at slot boot). It may `ereport(ERROR)` if a check_hook
+/// ran at slot boot). They may `ereport(ERROR)` if a check_hook
 /// fails on a default value, which pgrx surfaces as a Rust panic
 /// the slot's `#[pg_guard]` boundary catches; the panic propagates
 /// out of `run_slot`, the bgworker exits, and the FE's reader
 /// observes EOF and removes the slot. No state corruption.
 fn reset_per_handoff_state() {
-    // SAFETY: see fn doc.
+    // SAFETY: see fn doc. Order matters: abort the xact first
+    // (which restores TBLOCK_DEFAULT and frees the per-xact
+    // MemoryContext) so the subsequent GUC reset doesn't run
+    // against a half-collapsed xact context.
     unsafe {
+        pg_sys::AbortOutOfAnyTransaction();
         pg_sys::ResetAllOptions();
     }
 }

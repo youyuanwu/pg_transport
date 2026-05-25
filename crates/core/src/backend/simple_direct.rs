@@ -51,7 +51,9 @@ use super::dest_receiver::{
 };
 use super::executor::{ParamList, Portal, ScopedMemoryContext, TupleDescRef, XactCtx, with_xact};
 use super::observability::{DebugQueryGuard, StatementTimeoutGuard};
-use super::spi::{caught_error_to_pgwire, generic_error, panic_to_pgwire};
+use super::spi::{
+    aborted_transaction_block_error, caught_error_to_pgwire, generic_error, panic_to_pgwire,
+};
 
 // ---------------------------------------------------------------------------
 // parse_and_keep — single raw_parser pass; keeps parsetrees alive
@@ -350,6 +352,27 @@ pub fn execute_simple_query_direct(query: &str) -> PgWireResult<Vec<Response>> {
             continue;
         }
         let raw_stmt = *raw_stmt;
+        // §6.3 — Aborted-block rejection. Must fire BEFORE
+        // `with_xact` because `with_xact`'s prologue does
+        // `PushActiveSnapshot(GetTransactionSnapshot())`, and
+        // `GetTransactionSnapshot` from `TBLOCK_ABORT` walks
+        // into a PG-side assert / SIGABRT (mirrors why vanilla
+        // checks at [postgres.c:1058-1063](../../../../../postgres/src/backend/tcop/postgres.c#L1058-L1063)
+        // *after* `start_xact_command` but *before* any
+        // analyze / push call). Reject every non-exit
+        // parsetree in aborted state with SQLSTATE `25P02`
+        // and leave the block sticky for the client to clean
+        // up via `COMMIT` / `ROLLBACK` / `PREPARE` /
+        // `ROLLBACK TO`.
+        //
+        // SAFETY: `IsAbortedTransactionBlockState` is a pure
+        // read of `CurrentTransactionState->blockState`; safe
+        // from any TBLOCK_* state.
+        if unsafe { pg_sys::IsAbortedTransactionBlockState() }
+            && !is_transaction_exit_stmt(raw_stmt)
+        {
+            return Err(aborted_transaction_block_error());
+        }
         // Borrow sql_cstr for the closure's lifetime; raw_stmt
         // is alive as long as parsed.parse_ctx is, and with_xact
         // runs the closure to completion synchronously.
@@ -378,6 +401,45 @@ fn is_transaction_stmt(raw_stmt: *mut pg_sys::RawStmt) -> bool {
     unsafe {
         let node = (*raw_stmt).stmt;
         !node.is_null() && (*node).type_ == pg_sys::NodeTag::T_TransactionStmt
+    }
+}
+
+/// Returns true iff `raw_stmt` is a `TransactionStmt` of one of
+/// the kinds vanilla's `IsTransactionExitStmt`
+/// ([postgres.c, static helper](../../../../../postgres/src/backend/tcop/postgres.c))
+/// recognises as an "allowed in aborted block" exit:
+///
+///   * `TRANS_STMT_COMMIT` — `COMMIT` / `END`
+///   * `TRANS_STMT_ROLLBACK` — `ROLLBACK` / `ABORT`
+///   * `TRANS_STMT_PREPARE` — `PREPARE TRANSACTION`
+///   * `TRANS_STMT_ROLLBACK_TO` — `ROLLBACK TO SAVEPOINT`
+///
+/// Every other parsetree (including `BEGIN`, `START`,
+/// `SAVEPOINT`, `RELEASE`, `COMMIT PREPARED`, `ROLLBACK PREPARED`
+/// — and of course every non-`TransactionStmt` parsetree) is
+/// rejected with SQLSTATE `25P02` when dispatched in
+/// `TBLOCK_ABORT` / `TBLOCK_SUBABORT`. Used by the per-statement
+/// dispatch loops in [`execute_simple_query_direct`] and
+/// [`execute_with_implicit_block`] to mirror vanilla
+/// `exec_simple_query`'s pre-Push aborted-block check at
+/// [postgres.c:1058-1063](../../../../../postgres/src/backend/tcop/postgres.c#L1058-L1063).
+/// Closes review 2026-05-24 §6 item 3 for the direct backend.
+fn is_transaction_exit_stmt(raw_stmt: *mut pg_sys::RawStmt) -> bool {
+    // SAFETY: raw_stmt is a valid `*mut RawStmt` from raw_parser
+    // (parse_and_keep's lifetime invariant).
+    unsafe {
+        let node = (*raw_stmt).stmt;
+        if node.is_null() || (*node).type_ != pg_sys::NodeTag::T_TransactionStmt {
+            return false;
+        }
+        let txn = node as *mut pg_sys::TransactionStmt;
+        matches!(
+            (*txn).kind,
+            pg_sys::TransactionStmtKind::TRANS_STMT_COMMIT
+                | pg_sys::TransactionStmtKind::TRANS_STMT_ROLLBACK
+                | pg_sys::TransactionStmtKind::TRANS_STMT_PREPARE
+                | pg_sys::TransactionStmtKind::TRANS_STMT_ROLLBACK_TO
+        )
     }
 }
 
@@ -428,6 +490,28 @@ fn execute_with_implicit_block(parsed: &ParsedQuery<'_>) -> PgWireResult<Vec<Res
     let body_outcome = catch_unwind(AssertUnwindSafe(|| {
         let mut responses = Vec::with_capacity(non_empty.len());
         for (i, &raw_stmt) in non_empty.iter().enumerate() {
+            // §6.3 — Aborted-block rejection. Must fire BEFORE
+            // `PushActiveSnapshot(GetTransactionSnapshot())`
+            // below, because `GetTransactionSnapshot` from
+            // `TBLOCK_ABORT` walks into a PG-side assert. The
+            // only way to enter this loop in aborted state is
+            // for a *prior* 'Q' to have aborted an outer
+            // explicit `BEGIN` block; the implicit block opened
+            // here itself cannot become aborted mid-loop
+            // without unwinding straight to the outer
+            // `catch_unwind` and `AbortCurrentTransaction`
+            // arm. Returning `Err` here flows to the
+            // `Ok(Err(err))` arm below, which calls
+            // `AbortCurrentTransaction` and surfaces the
+            // 25P02 to the wire.
+            //
+            // SAFETY: `IsAbortedTransactionBlockState` is a
+            // pure read of `CurrentTransactionState->blockState`.
+            if unsafe { pg_sys::IsAbortedTransactionBlockState() }
+                && !is_transaction_exit_stmt(raw_stmt)
+            {
+                return Err(aborted_transaction_block_error());
+            }
             // SAFETY: all calls are PG server-API entry points;
             // StartTransactionCommand / BeginImplicitTransactionBlock
             // are idempotent on already-open xact / implicit block.

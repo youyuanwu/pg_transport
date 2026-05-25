@@ -37,8 +37,8 @@ use pgwire::messages::data::DataRow;
 use super::dest_receiver::ColumnEncoder;
 use super::observability::{DebugQueryGuard, StatementTimeoutGuard};
 use super::spi::{
-    SpiCtx, SpiTuples, caught_error_to_pgwire, generic_error, panic_to_pgwire, spi_rc_error,
-    with_spi,
+    SpiCtx, SpiTuples, aborted_transaction_block_error, caught_error_to_pgwire, generic_error,
+    panic_to_pgwire, spi_rc_error, with_spi,
 };
 
 /// Run a simple-query string through SPI and shape the result into
@@ -197,6 +197,23 @@ fn execute_with_implicit_block_spi(
     let body_outcome = catch_unwind(AssertUnwindSafe(|| -> PgWireResult<Vec<Response>> {
         let mut responses: Vec<Response> = Vec::with_capacity(prepared.len());
         for (i, (text, fetch_portalname)) in prepared.iter().enumerate() {
+            // §6.3 — Aborted-block rejection. Must fire BEFORE
+            // `PushActiveSnapshot(GetTransactionSnapshot())`
+            // below, because `GetTransactionSnapshot` from
+            // `TBLOCK_ABORT` walks into a PG-side assert. The
+            // pre-condition guarantees no entry is xact-control,
+            // so we don't need the `is_xact_exit_stmt` guard
+            // [`execute_one_statement`] uses — any aborted state
+            // here is unambiguously a reject. Returning `Err`
+            // flows to the `Ok(Err(err))` arm below, which calls
+            // `AbortCurrentTransaction` and surfaces the 25P02
+            // to the wire.
+            //
+            // SAFETY: `IsAbortedTransactionBlockState` is a pure
+            // read of `CurrentTransactionState->blockState`.
+            if unsafe { pg_sys::IsAbortedTransactionBlockState() } {
+                return Err(aborted_transaction_block_error());
+            }
             // SAFETY: all calls are PG server-API entry points
             // safe from any TBLOCK state. Start +
             // BeginImplicitTransactionBlock are idempotent for
@@ -291,11 +308,49 @@ fn execute_with_implicit_block_spi(
 
 /// Per-statement executor. Routes xact-control statements through
 /// the xact-block API; everything else through the SPI wrapper.
+///
+/// Pre-flight: if the xact is currently in `TBLOCK_ABORT` /
+/// `TBLOCK_SUBABORT` (i.e. a previous `'Q'` errored inside an
+/// explicit `BEGIN` block), reject every non-exit statement with
+/// SQLSTATE `25P02`. Mirrors vanilla's pre-Push check at
+/// [postgres.c:1058-1063](../../../../../postgres/src/backend/tcop/postgres.c#L1058-L1063);
+/// closes review 2026-05-24 §6 item 3 for the SPI backend.
+/// `with_spi`'s prologue does
+/// `PushActiveSnapshot(GetTransactionSnapshot())`, and
+/// `GetTransactionSnapshot` from `TBLOCK_ABORT` walks into a
+/// PG-side assert / SIGABRT — so the check must fire before
+/// any dispatch path that would call into `with_spi`.
 fn execute_one_statement(query: &str, meta: StmtMeta) -> PgWireResult<Vec<Response>> {
+    // SAFETY: `IsAbortedTransactionBlockState` is a pure read of
+    // `CurrentTransactionState->blockState`; safe from any
+    // TBLOCK_* state.
+    if unsafe { pg_sys::IsAbortedTransactionBlockState() } && !is_xact_exit_stmt(&meta) {
+        return Err(aborted_transaction_block_error());
+    }
     if let Some(cmd) = meta.xact {
         return handle_xact_control(cmd);
     }
     run_spi_statement(query, meta.fetch_portalname)
+}
+
+/// Returns true iff `meta` represents an "allowed in aborted
+/// block" exit statement per vanilla's `IsTransactionExitStmt`:
+/// `COMMIT` and `ROLLBACK` (in any of their mode-list forms,
+/// since `parse_and_classify` collapses the variants down to
+/// [`XactCmd`]).
+///
+/// Slight over-strictness vs vanilla: `PREPARE TRANSACTION` and
+/// `ROLLBACK TO SAVEPOINT` are also exit statements in PG, but
+/// [`parse_and_classify`] does not currently classify them
+/// (they're `meta.xact == None` and flow into `run_spi_statement`,
+/// where SPI atomic-mode rejects them with `SPI_ERROR_TRANSACTION`
+/// in normal state). With the §6.3 check in place they now get
+/// `25P02` in aborted state instead of being run. Acceptable
+/// trade-off: neither statement appears in pgbench / sysbench
+/// workloads, and the failure mode is a clean wire error rather
+/// than the previous SIGABRT.
+fn is_xact_exit_stmt(meta: &StmtMeta) -> bool {
+    matches!(meta.xact, Some(XactCmd::Commit) | Some(XactCmd::Rollback))
 }
 
 /// Execute one non-xact-control statement via SPI under the shared
@@ -312,12 +367,14 @@ fn execute_one_statement(query: &str, meta: StmtMeta) -> PgWireResult<Vec<Respon
 /// from `TBLOCK_INPROGRESS` does `CommandCounterIncrement` rather
 /// than an actual commit (PG `src/backend/access/transam/xact.c`).
 ///
-/// Deviation from real PG on the panic path: PG would move the xact
-/// state to `TBLOCK_ABORT` (forcing the client to issue `ROLLBACK`
-/// to clean up). `with_spi`'s `AbortCurrentTransaction` collapses
-/// state to `DEFAULT`, so subsequent statements run as if in a fresh
-/// auto-commit context — incorrect in spec terms but harmless for
-/// the pgbench workloads we target.
+/// On PG ERROR inside an explicit `BEGIN` block, `with_spi`'s
+/// `AbortCurrentTransaction` moves the xact state to `TBLOCK_ABORT`
+/// (matching vanilla). The next `'Q'`'s
+/// [`execute_one_statement`] pre-flight then rejects every
+/// non-exit statement with SQLSTATE `25P02` until the client
+/// issues `COMMIT` / `ROLLBACK`, mirroring vanilla
+/// `exec_simple_query` (closes review 2026-05-24 §6 item 3 for
+/// the SPI backend).
 fn run_spi_statement(
     query: &str,
     fetch_portalname: Option<CString>,

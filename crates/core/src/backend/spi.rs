@@ -666,6 +666,32 @@ pub fn generic_error(prefix: &str, message: &str) -> PgWireError {
     )))
 }
 
+/// Build the SQLSTATE `25P02` (`ERRCODE_IN_FAILED_SQL_TRANSACTION`)
+/// `PgWireError` that vanilla raises when a non-exit statement is
+/// dispatched while the xact is in `TBLOCK_ABORT` / `TBLOCK_SUBABORT`.
+///
+/// Wire shape matches `exec_simple_query`'s `ereport` at
+/// [postgres.c:1059-1063](../../../../../postgres/src/backend/tcop/postgres.c#L1059-L1063)
+/// (identical message text, severity, and SQLSTATE). Callers must
+/// gate the call site on
+/// `pg_sys::IsAbortedTransactionBlockState()` **and** a parsetree
+/// inspection (the "not an exit stmt" half of vanilla's
+/// `IsTransactionExitStmt` predicate) — see the per-backend
+/// dispatchers for the shape. Closes review 2026-05-24 §6 item 3.
+///
+/// Why this exists as a shared helper: both backends raise the
+/// same wire frame from per-statement dispatchers that live in
+/// different modules. Keeping the message + SQLSTATE in one place
+/// guarantees they don't drift.
+pub fn aborted_transaction_block_error() -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".to_string(),
+        "25P02".to_string(),
+        "current transaction is aborted, commands ignored until end of transaction block"
+            .to_string(),
+    )))
+}
+
 /// Convert a caught panic payload into a `PgWireError`. pgrx's
 /// `pg_guard` catches PG ERROR longjmps and re-raises them via
 /// `resume_unwind(Box::new(CaughtError::*))`, so the outer
