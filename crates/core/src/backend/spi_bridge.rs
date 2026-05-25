@@ -20,7 +20,7 @@
 //! through PG's xact-block API. Resolves Q25 in
 //! [roadmap.md](../../../../docs/design/roadmap.md).
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
@@ -100,14 +100,11 @@ pub fn execute_simple_query(query: &str) -> PgWireResult<Vec<Response>> {
 
 /// Per-statement executor. Routes xact-control statements through
 /// the xact-block API; everything else through the SPI wrapper.
-fn execute_one_statement(
-    query: &str,
-    classification: Option<XactCmd>,
-) -> PgWireResult<Vec<Response>> {
-    if let Some(cmd) = classification {
+fn execute_one_statement(query: &str, meta: StmtMeta) -> PgWireResult<Vec<Response>> {
+    if let Some(cmd) = meta.xact {
         return handle_xact_control(cmd);
     }
-    run_spi_statement(query)
+    run_spi_statement(query, meta.fetch_portalname)
 }
 
 /// Execute one non-xact-control statement via SPI under the shared
@@ -130,9 +127,14 @@ fn execute_one_statement(
 /// state to `DEFAULT`, so subsequent statements run as if in a fresh
 /// auto-commit context — incorrect in spec terms but harmless for
 /// the pgbench workloads we target.
-fn run_spi_statement(query: &str) -> PgWireResult<Vec<Response>> {
+fn run_spi_statement(
+    query: &str,
+    fetch_portalname: Option<CString>,
+) -> PgWireResult<Vec<Response>> {
     let query_owned = query.to_string();
-    with_spi(|ctx: &SpiCtx| -> PgWireResult<Vec<Response>> { run_via_spi(ctx, &query_owned) })
+    with_spi(|ctx: &SpiCtx| -> PgWireResult<Vec<Response>> {
+        run_via_spi(ctx, &query_owned, fetch_portalname.as_deref())
+    })
 }
 
 /// Subset of PG's `TransactionStmt` (gram.y) we route around SPI.
@@ -159,6 +161,27 @@ pub(super) enum XactCmd {
     Rollback,
 }
 
+/// Per-statement metadata extracted in the single `raw_parser`
+/// pass `parse_and_classify` does.
+///
+/// Bundles every piece of parsetree information run-time callers
+/// need so that **no statement re-parses the same SQL**:
+///
+/// - `xact` — `Some(XactCmd)` for BEGIN/COMMIT/ROLLBACK and their
+///   mode-list variants; routed around SPI via
+///   [`handle_xact_control_one`] (atomic-mode SPI rejects xact
+///   control with `SPI_ERROR_TRANSACTION`).
+/// - `fetch_portalname` — `Some(name)` for `FETCH … FROM <name>`
+///   (not `MOVE`), copied out of the parsetree as a Rust-owned
+///   `CString`. Lets [`run_via_spi`] do `GetPortalByName(name)`
+///   and a `CURSOR_OPT_BINARY` check to pick the result format
+///   without a second `raw_parser` call on the FETCH path.
+#[derive(Debug, Default, Clone)]
+pub(super) struct StmtMeta {
+    pub(super) xact: Option<XactCmd>,
+    pub(super) fetch_portalname: Option<CString>,
+}
+
 /// Parse `query` with PG's in-process `raw_parser` and return one
 /// `(slice, classification)` tuple per top-level statement.
 ///
@@ -181,13 +204,13 @@ pub(super) enum XactCmd {
 /// a wire `ErrorResponse` via [`super::spi::caught_error_to_pgwire`].
 #[allow(clippy::result_large_err)] // CaughtError is 232 B and lives only
 // across this function; boxing would gain nothing.
-fn parse_and_classify(query: &str) -> PgWireResult<Vec<(&str, Option<XactCmd>)>> {
+fn parse_and_classify(query: &str) -> PgWireResult<Vec<(&str, StmtMeta)>> {
     use pgrx::PgTryBuilder;
 
     let cstr = CString::new(query)
         .map_err(|_| generic_error("pg_transport", "query string contains a NUL byte"))?;
 
-    let outcome: Result<Vec<(usize, usize, Option<XactCmd>)>, CaughtError> =
+    let outcome: Result<Vec<(usize, usize, StmtMeta)>, CaughtError> =
         PgTryBuilder::new(AssertUnwindSafe(|| unsafe {
             let saved_ctx = pg_sys::CurrentMemoryContext;
             let scratch = pg_sys::AllocSetContextCreateInternal(
@@ -217,7 +240,7 @@ fn parse_and_classify(query: &str) -> PgWireResult<Vec<(&str, Option<XactCmd>)>>
     // Slice the original query string by the locations PG reported.
     Ok(raw_spans
         .into_iter()
-        .map(|(loc, len, cmd)| (&query[loc..loc + len], cmd))
+        .map(|(loc, len, meta)| (&query[loc..loc + len], meta))
         .collect())
 }
 
@@ -232,7 +255,7 @@ fn parse_and_classify(query: &str) -> PgWireResult<Vec<(&str, Option<XactCmd>)>>
 unsafe fn extract_statement_spans(
     list: *mut pg_sys::List,
     total_len: usize,
-) -> Vec<(usize, usize, Option<XactCmd>)> {
+) -> Vec<(usize, usize, StmtMeta)> {
     if list.is_null() {
         return Vec::new();
     }
@@ -263,8 +286,16 @@ unsafe fn extract_statement_spans(
             (loc.max(0) as usize, len as usize)
         };
 
-        let classification = unsafe { classify_raw_stmt(raw_stmt) };
-        out.push((slice_loc, slice_len, classification));
+        // Single parsetree walk extracts both pieces of metadata
+        // the run-time path may need. The cstring copy in
+        // `extract_fetch_portalname` is Rust-owned, so the
+        // parsetree's scratch MemoryContext is free to die at
+        // end-of-function.
+        let meta = StmtMeta {
+            xact: unsafe { classify_raw_stmt(raw_stmt) },
+            fetch_portalname: unsafe { extract_fetch_portalname(raw_stmt) },
+        };
+        out.push((slice_loc, slice_len, meta));
     }
     out
 }
@@ -299,6 +330,47 @@ pub(super) unsafe fn classify_raw_stmt(raw_stmt: *mut pg_sys::RawStmt) -> Option
         // reject with its own error.
         _ => None,
     }
+}
+
+/// Inspect a `RawStmt`'s inner node; return `Some(portalname)`
+/// (Rust-owned copy) if it's a `FETCH … FROM <name>` against a
+/// named cursor, `None` for `MOVE` and every other parsetree.
+///
+/// Pure pointer inspection — no parsing — called from
+/// [`extract_statement_spans`] inside the same `raw_parser` pass
+/// that produced `raw_stmt`. Copies the portalname out as a Rust
+/// `CString` so it survives the scratch-context teardown at
+/// end-of-`parse_and_classify`. The CString is then handed
+/// through [`run_spi_statement`] → [`run_via_spi`] which does
+/// the `GetPortalByName` + `CURSOR_OPT_BINARY` check **without
+/// any second parse pass**. Closes review 2026-05-24 §6 item 1
+/// for the SPI backend on the same parsetree the existing
+/// statement-splitter already produced.
+///
+/// # Safety
+///
+/// Caller guarantees `raw_stmt` points at a valid `RawStmt`
+/// inside a parse tree returned by `raw_parser`.
+unsafe fn extract_fetch_portalname(raw_stmt: *mut pg_sys::RawStmt) -> Option<CString> {
+    let node = unsafe { (*raw_stmt).stmt };
+    if node.is_null() || unsafe { (*node).type_ } != pg_sys::NodeTag::T_FetchStmt {
+        return None;
+    }
+    let fs = node as *mut pg_sys::FetchStmt;
+    if unsafe { (*fs).ismove } {
+        // MOVE produces no rows; format is moot. Skip the cstring
+        // copy entirely.
+        return None;
+    }
+    let pname = unsafe { (*fs).portalname };
+    if pname.is_null() {
+        return None;
+    }
+    // Copy the portalname out of the scratch context before it gets
+    // deleted by parse_and_classify's epilogue. CString::new
+    // allocates Rust-side and is independent of any PG context.
+    let bytes = unsafe { std::ffi::CStr::from_ptr(pname) }.to_bytes();
+    CString::new(bytes).ok()
 }
 
 fn handle_xact_control(cmd: XactCmd) -> PgWireResult<Vec<Response>> {
@@ -408,9 +480,41 @@ pub(super) fn handle_xact_control_one(cmd: XactCmd) -> PgWireResult<Response> {
 /// PG ERRORs raised by `SPI_execute` (syntax error, type mismatch,
 /// constraint violation, …) longjmp out; [`with_spi`]'s `catch_unwind`
 /// catches and converts them to wire `ErrorResponse` frames.
-fn run_via_spi(ctx: &SpiCtx, query: &str) -> PgWireResult<Vec<Response>> {
+fn run_via_spi(
+    ctx: &SpiCtx,
+    query: &str,
+    fetch_portalname: Option<&CStr>,
+) -> PgWireResult<Vec<Response>> {
     let query_c = CString::new(query)
         .map_err(|_| generic_error("simple-query", "query string contains a NUL byte"))?;
+
+    // Decide the result format BEFORE encoder construction. For
+    // FETCH against a `DECLARE … BINARY CURSOR`,
+    // `parse_and_classify` already extracted the portalname from
+    // the parsetree it made; here we only pay a `GetPortalByName`
+    // lookup + a `CURSOR_OPT_BINARY` bit check — no parse pass.
+    // The cursor's portal was created by an earlier statement
+    // (this Q or a previous one in the same outer xact) and is
+    // visible to `GetPortalByName` now. Mirrors
+    // [`super::simple_direct::fetch_result_format`]; closes
+    // review 2026-05-24 §6 item 1 for the SPI backend.
+    let result_format = match fetch_portalname {
+        Some(name) => unsafe {
+            // SAFETY: `GetPortalByName` is a backend-context lookup;
+            // null means "no such cursor", which we treat as Text
+            // (and let `SPI_execute` later surface the canonical
+            // "cursor X does not exist" error).
+            let cursor_portal = pg_sys::GetPortalByName(name.as_ptr());
+            if cursor_portal.is_null() {
+                FieldFormat::Text
+            } else if ((*cursor_portal).cursorOptions & pg_sys::CURSOR_OPT_BINARY as i32) != 0 {
+                FieldFormat::Binary
+            } else {
+                FieldFormat::Text
+            }
+        },
+        None => FieldFormat::Text,
+    };
 
     // SAFETY: inside an SPI session (proven by &SpiCtx); SPI_execute
     // is the documented entry point. `read_only=false` matches the
@@ -459,14 +563,8 @@ fn run_via_spi(ctx: &SpiCtx, query: &str) -> PgWireResult<Vec<Response>> {
         let name =
             unsafe { crate::backend::executor::pg_ident_to_string(attr.attname.data.as_ptr()) };
         let pgwire_type = Type::from_oid(attr.atttypid.to_u32()).unwrap_or(Type::TEXT);
-        schema_vec.push(FieldInfo::new(
-            name,
-            None,
-            None,
-            pgwire_type,
-            FieldFormat::Text,
-        ));
-        encoders.push(ColumnEncoder::for_column(attr.atttypid, FieldFormat::Text));
+        schema_vec.push(FieldInfo::new(name, None, None, pgwire_type, result_format));
+        encoders.push(ColumnEncoder::for_column(attr.atttypid, result_format));
     }
 
     // Materialise every row up-front into BytesMut. The SPI tupdesc
@@ -525,8 +623,16 @@ mod tests {
     use pgwire::error::PgWireError;
 
     /// Convenience: assert parse succeeded and return the spans.
+    /// Convenience: assert parse succeeded and return the spans,
+    /// projecting `StmtMeta` down to `Option<XactCmd>` so existing
+    /// xact-classification tests don't have to spell out the full
+    /// metadata struct.
     fn parse_ok(query: &str) -> Vec<(&str, Option<XactCmd>)> {
-        parse_and_classify(query).expect("parse should succeed")
+        parse_and_classify(query)
+            .expect("parse should succeed")
+            .into_iter()
+            .map(|(s, meta)| (s, meta.xact))
+            .collect()
     }
 
     #[pg_test]
@@ -688,6 +794,63 @@ mod tests {
              mis-attribute every SPI-backend query. Likely cause: \
              `DebugQueryGuard::install` was moved or dropped in \
              `execute_simple_query`.",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // FETCH-binary cursor format (review 2026-05-24 §6 item 1)
+    // -----------------------------------------------------------------------
+
+    /// Mirror of the simple-direct backend's
+    /// `pg_simple_direct_fetch_binary_cursor_returns_binary`
+    /// test for the SPI bridge. Verifies
+    /// [`super::execute_simple_query`] consults
+    /// [`super::fetch_result_format_for_spi`] and routes FETCH
+    /// against a `BINARY CURSOR` through binary encoders so the
+    /// returned `DataRow` carries the 4-byte big-endian int4
+    /// encoding rather than text.
+    ///
+    /// **Important.** The DECLARE and the FETCH each invoke
+    /// `with_spi`, which opens its own SPI session inside the
+    /// outer pg_test transaction. The cursor declared by the
+    /// first call lives in the outer xact (not in SPI's per-call
+    /// session) and is visible to `GetPortalByName` from the
+    /// second call.
+    #[pg_test]
+    fn pg_spi_bridge_fetch_binary_cursor_returns_binary() {
+        super::execute_simple_query("DECLARE bincur_spi BINARY CURSOR FOR SELECT 42::int4")
+            .expect("DECLARE BINARY CURSOR should succeed");
+
+        let r =
+            super::execute_simple_query("FETCH 1 FROM bincur_spi").expect("FETCH should succeed");
+        assert_eq!(r.len(), 1, "expected one Response from FETCH");
+        let mut q = match r.into_iter().next().unwrap() {
+            pgwire::api::results::Response::Query(q) => q,
+            other => panic!("expected Query response from FETCH, got {other:?}"),
+        };
+
+        let row = futures::executor::block_on(async {
+            use futures::StreamExt;
+            q.data_rows().next().await
+        })
+        .expect("FETCH should return one row")
+        .expect("row item should be Ok");
+        assert_eq!(row.field_count, 1, "single int4 column");
+
+        let mut data = row.data;
+        use bytes::Buf;
+        let len = data.get_i32();
+        assert_eq!(len, 4, "binary int4 is 4 bytes; got len {len}");
+        let cell = data.split_to(len as usize).to_vec();
+
+        let expected_binary: Vec<u8> = 42i32.to_be_bytes().to_vec();
+        assert_eq!(
+            cell, expected_binary,
+            "REGRESSION on review 2026-05-24 §6 item 1: FETCH from a \
+             BINARY cursor through the SPI bridge produced {cell:?} \
+             instead of the expected 4-byte big-endian int4 encoding \
+             {expected_binary:?}. `fetch_result_format_for_spi` was \
+             bypassed or returned Text incorrectly.",
         );
     }
 }
