@@ -206,6 +206,93 @@ unsafe fn extract_raw_stmt_spans(
 // execute_simple_query_direct — top-level entry, mirrors execute_simple_query
 // ---------------------------------------------------------------------------
 
+/// RAII guard that pins `pg_sys::debug_query_string` to the
+/// active query body and reports `STATE_RUNNING` to pgstat for
+/// the lifetime of the guard. Restores both on drop — Ok, Err,
+/// AND PG-ERROR panic paths all run cleanup.
+///
+/// The `'a` lifetime ties the guard to the borrowed `CStr` whose
+/// pointer we install into the global. The borrow checker
+/// enforces that the backing buffer outlives the guard, so the
+/// pointer cannot dangle (e.g. a caller who builds a temporary
+/// `CString` and lets it drop while the guard is alive would be
+/// rejected at compile time).
+///
+/// Mirrors vanilla [`exec_simple_query` at postgres.c:1046-1048](../../../../../postgres/src/backend/tcop/postgres.c#L1046-L1048):
+///
+/// ```c
+/// debug_query_string = query_string;
+/// pgstat_report_activity(STATE_RUNNING, query_string);
+/// ```
+///
+/// and the matching tail at [`postgres.c` end-of-function](../../../../../postgres/src/backend/tcop/postgres.c#L1378)
+/// which sets `debug_query_string = NULL`. We additionally
+/// transition pgstat back to `STATE_IDLE` on drop, since
+/// pg_transport's slot bgworker loop has no equivalent of
+/// `PostgresMain`'s ReadCommand-loop idle reporter.
+///
+/// Without this guard:
+/// - `pg_stat_statements` / `auto_explain` (both keyed on
+///   `debug_query_string` at `ExecutorStart_hook` time)
+///   mis-attribute every direct-path query to whatever SQL the
+///   outer backend frame happened to be running.
+/// - The server-log `STATEMENT:` line for any ERROR raised
+///   during direct-path execution names the wrong SQL.
+/// - `pg_stat_activity.query` for the slot bgworker never
+///   reflects the SQL the worker is actually running.
+///
+/// See [`docs/design/reviews/2026-05-24-pg-code-findings.md`](../../../../docs/design/reviews/2026-05-24-pg-code-findings.md)
+/// §6 item 5 for the audit.
+struct DebugQueryGuard<'a> {
+    prev_debug_query_string: *const std::ffi::c_char,
+    /// Compile-time witness that the `CStr` we installed into
+    /// `pg_sys::debug_query_string` outlives the guard. The
+    /// installed pointer is never dereferenced through this
+    /// field — it's only here to anchor the lifetime.
+    _sql_cstr: std::marker::PhantomData<&'a CStr>,
+}
+
+impl<'a> DebugQueryGuard<'a> {
+    /// Install `sql_cstr` as the active `debug_query_string` and
+    /// report `STATE_RUNNING` to pgstat. The returned guard
+    /// borrows `sql_cstr` for its entire lifetime, so the
+    /// compiler will reject any caller that drops the underlying
+    /// `CString` before the guard.
+    ///
+    /// # Safety
+    ///
+    /// Must be called from a PG backend / bgworker (the only
+    /// place `debug_query_string` and `pgstat_report_activity`
+    /// are meaningful).
+    unsafe fn install(sql_cstr: &'a CStr) -> Self {
+        let ptr = sql_cstr.as_ptr();
+        // SAFETY: caller guarantees a backend context; ptr
+        // lifetime is enforced by `'a`; both calls are PG
+        // server-API entry points.
+        let prev_debug_query_string = unsafe {
+            let prev = pg_sys::debug_query_string;
+            pg_sys::debug_query_string = ptr;
+            pg_sys::pgstat_report_activity(pg_sys::BackendState::STATE_RUNNING, ptr);
+            prev
+        };
+        DebugQueryGuard {
+            prev_debug_query_string,
+            _sql_cstr: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for DebugQueryGuard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: paired with install(); both globals are
+        // writable from any backend.
+        unsafe {
+            pg_sys::debug_query_string = self.prev_debug_query_string;
+            pg_sys::pgstat_report_activity(pg_sys::BackendState::STATE_IDLE, std::ptr::null());
+        }
+    }
+}
+
 /// Run a simple-query string through the direct backend and
 /// shape the result into pgwire `Response`s.
 ///
@@ -218,8 +305,24 @@ unsafe fn extract_raw_stmt_spans(
 /// * Utility statements (`SET`, `CREATE`, xact-control, …)
 ///   route through `PortalRun` → `ProcessUtility`. No special
 ///   xact-control intercept: PG handles them natively.
+///
+/// Pins `debug_query_string` and `pgstat_report_activity` to the
+/// query body via [`DebugQueryGuard`] so `pg_stat_statements`,
+/// `auto_explain`, `pg_stat_activity.query`, and server-log
+/// `STATEMENT:` lines attribute correctly. See the guard's
+/// doc-comment for the full list of consumers.
 pub fn execute_simple_query_direct(query: &str) -> PgWireResult<Vec<Response>> {
     let parsed = parse_and_keep(query)?;
+
+    // Install per-query observability. Guard drops on every exit
+    // path (Ok / Err / PG-ERROR panic via `with_xact`'s
+    // catch_unwind), restoring the previous debug_query_string
+    // and reporting STATE_IDLE to pgstat.
+    //
+    // SAFETY: we're in a backend (the slot bgworker); sql_cstr
+    // is held by `parsed` for the lifetime of this function,
+    // which is also the lifetime of `_guard`.
+    let _guard = unsafe { DebugQueryGuard::install(parsed.sql_cstr.as_c_str()) };
 
     let mut responses = Vec::with_capacity(parsed.statements.len());
     for (text, raw_stmt) in &parsed.statements {
@@ -234,8 +337,9 @@ pub fn execute_simple_query_direct(query: &str) -> PgWireResult<Vec<Response>> {
         let resp = with_xact(|ctx| run_one_direct(ctx, raw_stmt, sql_cstr_ref))?;
         responses.push(resp);
     }
-    // parsed drops here; parse_ctx deletes the MemoryContext that
-    // owned every raw_stmt pointer, and sql_cstr is freed.
+    // _guard drops here, restoring debug_query_string and
+    // reporting STATE_IDLE. `parsed` drops after, freeing the
+    // parsetree and the CString that the guard borrowed from.
     Ok(responses)
 }
 
@@ -476,6 +580,188 @@ mod tests {
             msg.to_ascii_lowercase().contains("syntax")
                 || msg.to_ascii_lowercase().contains("selectt"),
             "expected syntax error, got: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Observability gap — debug_query_string downstream attribution
+    // (review 2026-05-24 §6 item 5)
+    // -----------------------------------------------------------------------
+
+    /// Captured state from the first `ExecutorStart_hook` invocation
+    /// seen during a test. Populated by [`capturing_executor_start_hook`]
+    /// and read by the test after `execute_simple_query_direct`
+    /// returns.
+    static CAPTURED_EXEC_START: std::sync::Mutex<Option<ExecStartCapture>> =
+        std::sync::Mutex::new(None);
+
+    #[derive(Debug, Clone)]
+    struct ExecStartCapture {
+        /// `QueryDesc->sourceText` PG passed to the executor. This
+        /// is the string `PortalDefineQuery` copied onto the
+        /// portal's MemoryContext — pg_transport *does* set this
+        /// correctly to the inner SQL because we pass
+        /// `sql_cstr.as_ptr()` through. Captured as a control
+        /// (proves the hook actually saw our query, not some
+        /// other one).
+        portal_source_text: Option<String>,
+        /// `pg_sys::debug_query_string` value PG presents to the
+        /// executor-start hook. This is the global that
+        /// `pg_stat_statements`'s
+        /// [`pgss_ExecutorStart`](https://github.com/postgres/postgres/blob/REL_18_STABLE/contrib/pg_stat_statements/pg_stat_statements.c#L851)
+        /// and `auto_explain`'s
+        /// [`explain_ExecutorStart`](https://github.com/postgres/postgres/blob/REL_18_STABLE/contrib/auto_explain/auto_explain.c#L274)
+        /// read at this exact hook to bucket the query and to
+        /// format the EXPLAIN heading respectively. If
+        /// `debug_query_string` is wrong here, *every* extension
+        /// on `ExecutorStart_hook` mis-attributes.
+        debug_query_string_at_hook: Option<String>,
+    }
+
+    /// `ExecutorStart_hook` implementation. Captures the first
+    /// hook invocation's `(QueryDesc->sourceText, debug_query_string)`
+    /// pair, then chains to `standard_ExecutorStart` so the
+    /// executor actually starts.
+    ///
+    /// This is the same hook surface used by `pg_stat_statements`
+    /// and `auto_explain`. Reading `debug_query_string` here is
+    /// the *operational* downstream observation: it answers "what
+    /// SQL would those extensions attribute this query to?"
+    unsafe extern "C-unwind" fn capturing_executor_start_hook(
+        query_desc: *mut pg_sys::QueryDesc,
+        eflags: std::ffi::c_int,
+    ) {
+        // Capture only the first hook invocation. Avoids being
+        // clobbered by any executor-start the pg_test harness
+        // may run after our query returns.
+        let mut slot = CAPTURED_EXEC_START.lock().unwrap();
+        if slot.is_none() {
+            // SAFETY: PG guarantees `query_desc` is valid and
+            // `sourceText` is a const C-string for the hook's
+            // lifetime.
+            let portal_source_text = unsafe {
+                let p = (*query_desc).sourceText;
+                if p.is_null() {
+                    None
+                } else {
+                    Some(std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned())
+                }
+            };
+            let debug_query_string_at_hook = unsafe {
+                let p = pg_sys::debug_query_string;
+                if p.is_null() {
+                    None
+                } else {
+                    Some(std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned())
+                }
+            };
+            *slot = Some(ExecStartCapture {
+                portal_source_text,
+                debug_query_string_at_hook,
+            });
+        }
+        drop(slot);
+        // Chain to the default. Failing to do so would break the
+        // executor lifecycle (no ExecutorState, no per-portal
+        // plan instantiation).
+        // SAFETY: standard_ExecutorStart is the exported default
+        // implementation; safe to call from any ExecutorStart_hook
+        // wrapper.
+        unsafe { pg_sys::standard_ExecutorStart(query_desc, eflags) };
+    }
+
+    /// Regression guard for [`docs/design/reviews/2026-05-24-pg-code-findings.md`](../../../../docs/design/reviews/2026-05-24-pg-code-findings.md)
+    /// §6 item 5, asserting the fix against its actual
+    /// downstream consumer surface.
+    ///
+    /// **Downstream property under test.** When the executor
+    /// starts running a query, `pg_stat_statements`,
+    /// `auto_explain`, and every other extension on
+    /// `ExecutorStart_hook` reads `pg_sys::debug_query_string`
+    /// to attribute the query to its SQL text. Vanilla
+    /// `exec_simple_query` sets the global to the originating
+    /// query at [postgres.c:1046](../../../../../postgres/src/backend/tcop/postgres.c#L1046)
+    /// before `PortalRun` (which triggers `ExecutorStart`).
+    /// `execute_simple_query_direct` does the equivalent via
+    /// [`DebugQueryGuard::install`] right after
+    /// [`parse_and_keep`] succeeds; this test verifies the
+    /// global is correctly set at hook time so attribution
+    /// matches vanilla.
+    ///
+    /// Test shape:
+    ///
+    /// 1. Install our own `ExecutorStart_hook` that captures
+    ///    `(QueryDesc->sourceText, debug_query_string)` at the
+    ///    hook entry and then chains to `standard_ExecutorStart`.
+    /// 2. Run a simple SELECT via `execute_simple_query_direct`.
+    /// 3. Restore the hook unconditionally before asserting.
+    /// 4. Sanity-check: `QueryDesc->sourceText` equals the inner
+    ///    SQL (proves the hook fired for our query).
+    /// 5. Assert the downstream property: `debug_query_string`
+    ///    at hook time equals the inner SQL, matching what
+    ///    `pg_stat_statements` / `auto_explain` would see in a
+    ///    real deployment.
+    ///
+    /// If this regresses (assertion fires with `dqs == None` or
+    /// an outer-frame SQL), `DebugQueryGuard::install` is no
+    /// longer running before the executor — most likely because
+    /// it was moved past `with_xact` or the `_guard` binding
+    /// was dropped early.
+    #[pg_test]
+    fn pg_simple_direct_executor_start_hook_sees_inner_query() {
+        const SQL: &str = "SELECT 1 AS only_one";
+
+        *CAPTURED_EXEC_START.lock().unwrap() = None;
+
+        // SAFETY: `ExecutorStart_hook` is a writable function-
+        // pointer global. We install + restore in a strict pair;
+        // the restore runs unconditionally before any assertion.
+        let prev_hook = unsafe { pg_sys::ExecutorStart_hook };
+        unsafe {
+            pg_sys::ExecutorStart_hook = Some(capturing_executor_start_hook);
+        }
+
+        let result = execute_simple_query_direct(SQL);
+
+        unsafe {
+            pg_sys::ExecutorStart_hook = prev_hook;
+        }
+
+        result.expect("SELECT 1 should succeed");
+
+        let captured = CAPTURED_EXEC_START
+            .lock()
+            .unwrap()
+            .take()
+            .expect("ExecutorStart_hook should have fired for the inner SELECT");
+
+        // Sanity: the hook fired for the right query.
+        // pg_transport populates `PortalDefineQuery`'s
+        // query_string arg with the inner SQL, so QueryDesc's
+        // sourceText reflects it. If this fails, the hook
+        // captured a different query and the next assertion is
+        // meaningless.
+        assert_eq!(
+            captured.portal_source_text.as_deref(),
+            Some(SQL),
+            "ExecutorStart_hook fired for a different query than we ran; \
+             captured sourceText: {:?}",
+            captured.portal_source_text,
+        );
+
+        // The fix under test: at ExecutorStart_hook time,
+        // debug_query_string must be the inner SQL so that
+        // pg_stat_statements / auto_explain attribute correctly.
+        assert_eq!(
+            captured.debug_query_string_at_hook.as_deref(),
+            Some(SQL),
+            "REGRESSION on review 2026-05-24 §6 item 5: at \
+             ExecutorStart_hook time, `debug_query_string` is no \
+             longer set to the inner SQL. \
+             `pg_stat_statements` / `auto_explain` will \
+             mis-attribute every direct-path query. Likely \
+             cause: `DebugQueryGuard::install` was moved or \
+             dropped before `with_xact` — check `execute_simple_query_direct`.",
         );
     }
 }
