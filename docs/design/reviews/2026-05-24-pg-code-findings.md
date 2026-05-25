@@ -152,6 +152,33 @@ binary cursors, `log_statement`, `pg_stat_statements`, or
 vanilla. Outside that envelope, both pg_transport backends will
 deviate identically.
 
+## 4.4 Status update — 2026-05-25
+
+Six of the nine §6 punch-list items have landed since the audit
+was written; the verification tables above describe the **pre-fix**
+state. For the post-fix state, see the per-item Status column in
+[§6 Suggested follow-ups](#6-suggested-follow-ups). Summary:
+
+| # | Item | Status | Commits |
+| --- | --- | --- | --- |
+| 1 | FETCH-binary cursor format | **CLOSED** | `b0dae62` (direct) + `a1802ae` (SPI) |
+| 2 | Implicit-block multi-statement | **CLOSED** | `0b41355` (direct) + `f508f61` (SPI) |
+| 3 | Aborted-block rejection (`25P02`) | **CLOSED** | `409915c` |
+| 4 | `analyze_requires_snapshot` gating | open | — |
+| 5 | `debug_query_string` + pgstat | **CLOSED** | `97f1b1e` (direct) + `20cfb97` (extended + SPI) |
+| 6 | `statement_timeout` | **CLOSED** | `2e78127` |
+| 7 | `pg_stat_statements` query_id | open | — |
+| 8 | Cache `FmgrInfo` (perf) | **CLOSED** | `245ad37` |
+| 9 | Per-row buffer reuse (perf) | open | — |
+
+One audit-doc correction emerged from the §6.3 work and is folded
+into the status section there: the claim that
+`AbortCurrentTransaction` "collapses state to `DEFAULT`" was
+**wrong** for the explicit-`BEGIN` case (it moves to `TBLOCK_ABORT`),
+which made §6.3 a stability gap, not just a spec-deviation gap.
+See [§6 item 3 Status](#6-suggested-follow-ups) for the full
+correction.
+
 ## 5. Documentation drift
 
 The doc-comment on `execute_simple_query_direct` at
@@ -168,9 +195,20 @@ follow-up to consider:
   documented at [pg_code.md §2.2](../../../../../postgres/extdocs/background/pg_code.md)."
 - Or fixing the deviations and removing the qualifier.
 
+**Status update — 2026-05-25.** The deviation list has shrunk
+substantially: §6.1, §6.2, §6.3, §6.5, §6.6, §6.8 are all closed
+across the §6.2 + §6.3 commits. The remaining qualifier should
+now read along the lines of "Same semantics as the SPI bridge;
+both still differ from vanilla in §6.4, §6.7, §6.9 (snapshot
+gating, `pg_stat_statements` attribution, per-row buffer reuse)."
+The comment hasn't been rewritten in code yet — folded into the
+§6.7 pickup.
+
 ## 6. Suggested follow-ups
 
-Ordered by correctness-impact then engineering cost:
+Ordered by correctness-impact then engineering cost. Each item
+carries a **Status** block: `CLOSED` items cite the commit that
+landed them; `open` items are still as written.
 
 1. **FETCH-binary cursor format (§2.2.3).** Local fix:
    `simple_direct.rs` (and the extended-direct path) should
@@ -180,6 +218,15 @@ Ordered by correctness-impact then engineering cost:
    would then need a binary branch (`schema_and_encoders_binary`
    exists in spirit — the `Binary` variant of `ColumnEncoder` is
    already wired up at [`dest_receiver.rs:185-196`](../../../crates/core/src/backend/dest_receiver.rs#L185-L196)).
+
+   **Status — CLOSED (`b0dae62` + `a1802ae`).** Direct path
+   added `fetch_result_format(raw_stmt)` to inspect the
+   parsetree and consult `GetPortalByName` +
+   `CURSOR_OPT_BINARY` before encoder construction. SPI bridge
+   path piggybacks on the existing `parse_and_classify` pass:
+   `StmtMeta { xact, fetch_portalname }` stashes the cursor
+   name as a Rust-owned `CString` so `run_via_spi` makes the
+   same lookup without a second parse pass.
 
 2. **Implicit-block semantics for multi-statement `'Q'` (§2.2.2).**
    Wrap the per-statement loop in a single
@@ -191,6 +238,24 @@ Ordered by correctness-impact then engineering cost:
    Touches `executor.rs::with_xact` (split into "open" / "step"
    / "close" primitives) and `simple_direct.rs`'s statement loop.
 
+   **Status — CLOSED (`0b41355` + `f508f61`).** Direct path
+   landed `execute_with_implicit_block` (commit `0b41355`): a
+   single outer `catch_unwind` over a loop that does per-iter
+   `Start + BeginImplicit + Push + run_one_direct + Pop` and
+   selects the tail (`EndImplicit + Commit` last vs. `Commit`
+   for mid-batch xact-stmt vs. `CCI` otherwise). SPI bridge
+   followed in commit `f508f61` with `execute_with_implicit_block_spi`,
+   which can't reuse `with_spi` (nested `catch_unwind` would
+   collapse the implicit block on first ERROR); instead it
+   inlines `SPI_connect` / `SPI_finish` per iter under a single
+   outer `catch_unwind`. Mixed batches containing xact-control
+   fall back to the per-statement path on the SPI side (where
+   `handle_xact_control`'s xact-block API would fight an outer
+   implicit block). e2e regression: both
+   `implicit_block_rolls_back_partial_*_backend` tests now
+   assert `count == "0"` after `INSERT VALUES (1); SELECT 1/0`
+   in one `'Q'`.
+
 3. **Aborted-block rejection (§2.2.4).** Cheap: call
    `pg_sys::IsAbortedTransactionBlockState` at the top of
    `run_one_direct`, and `ereport(ERROR, ERRCODE_IN_FAILED_SQL_TRANSACTION, ...)`
@@ -198,12 +263,69 @@ Ordered by correctness-impact then engineering cost:
    non-`TransactionStmt` parsetrees. Same delta needed in
    `run_spi_statement`.
 
+   **Status — CLOSED (`409915c`); audit-doc claim revised.**
+   The original audit's framing was that this was a spec
+   deviation:
+   `AbortCurrentTransaction` (per §4.2 item 3) was said to
+   "collapse state to `DEFAULT`, so subsequent statements run
+   as if in a fresh auto-commit context — incorrect in spec
+   terms but harmless". **That framing is wrong** for the
+   explicit-`BEGIN` case. `AbortCurrentTransaction` from
+   `TBLOCK_INPROGRESS` actually moves to `TBLOCK_ABORT` (not
+   `DEFAULT` — see PG `xact.c:AbortCurrentTransaction`), and
+   our `with_xact` / `with_spi` then unconditionally call
+   `PushActiveSnapshot(GetTransactionSnapshot())` on the next
+   `'Q'`, which assert-fires from `TBLOCK_ABORT` and `SIGABRT`s
+   the slot. So §6.3 was a *stability* gap, not just a spec
+   gap. The fix adds the
+   `IsAbortedTransactionBlockState() && !is_*_exit_stmt(...)`
+   check at the top of each backend's per-statement dispatch
+   (mirroring vanilla `IsTransactionExitStmt`: COMMIT /
+   ROLLBACK / PREPARE / ROLLBACK_TO are allowed-through; the
+   SPI bridge only currently classifies COMMIT / ROLLBACK as
+   exits and is slightly over-strict for PREPARE / ROLLBACK_TO).
+   Companion change: `reset_per_handoff_state` now calls
+   `AbortOutOfAnyTransaction()` before `ResetAllOptions()`, so a
+   client that disconnects mid-aborted-block no longer leaks
+   xact state onto the next handoff's first statement. e2e
+   regression: both `aborted_block_*_backend_returns_25p02`
+   tests in `crates/e2e/tests/regressions.rs`.
+
+   **Known limitation pending §6.4.** A real-client wire-level
+   `ROLLBACK` from `TBLOCK_ABORT` on the **direct** backend
+   still crashes — `with_xact`'s unconditional snapshot Push is
+   what asserts. The fix needs §6.4 (`analyze_requires_snapshot`
+   gating in `with_xact`) plus a `run_one_direct` refactor to
+   pass `InvalidSnapshot` to `PortalStart` like vanilla
+   ([`postgres.c:1252`](../../../../../postgres/src/backend/tcop/postgres.c#L1252)).
+   The tests sidestep this by relying on the per-handoff
+   `AbortOutOfAnyTransaction` instead of issuing wire-level
+   `ROLLBACK`. SPI bridge does not have the same crash because
+   `handle_xact_control` doesn't push a snapshot for COMMIT /
+   ROLLBACK.
+
 4. **`analyze_requires_snapshot` gating (§2.2.5).** Easy.
    `with_xact` becomes
    `with_xact(needs_snapshot: bool, body)`; callers compute the
    bool from `pg_sys::analyze_requires_snapshot(raw_stmt)` and
    pass it through. Saves a `GetTransactionSnapshot` per
    utility-statement `'Q'`.
+
+   **Status — open. Promoted to a correctness gap by §6.3.**
+   Originally an "easy" perf win; now also required to make
+   wire-level `ROLLBACK` from `TBLOCK_ABORT` on the direct
+   backend work (see §6.3 Status above). The minimal
+   `with_xact(needs_snapshot, body)` signature change is small,
+   but `run_one_direct` also needs to be updated to pass
+   `InvalidSnapshot` to `PortalStart` when the parse-time
+   snapshot wasn't pushed (mirroring vanilla
+   [`postgres.c:1252`](../../../../../postgres/src/backend/tcop/postgres.c#L1252)) —
+   currently `run_one_direct` calls
+   `portal.start(..., pg_sys::GetActiveSnapshot())`, which
+   returns garbage / asserts when no Push happened. Tried in
+   commit `409915c` and broke 16+ tests on
+   non-`TransactionStmt` utility statements (e.g. `DROP TABLE`);
+   reverted in favour of the per-handoff cleanup workaround.
 
 5. **`pg_stat_activity.query` + `debug_query_string` (§2.3 row 1–2).**
    Single point of insertion at the top of
@@ -220,16 +342,40 @@ Ordered by correctness-impact then engineering cost:
    Restores observability for the two columns operators reach for
    first.
 
+   **Status — CLOSED (`97f1b1e` + `20cfb97`).** Direct backend
+   landed `DebugQueryGuard` RAII in `backend/observability.rs`
+   (commit `97f1b1e`); follow-up `20cfb97` installed it in the
+   other three backend entry points (`spi_bridge::execute_simple_query`,
+   `extended::prepare`, `extended::PreparedStatement::execute`).
+   Guard pins `debug_query_string` and
+   `pgstat_report_activity(STATE_RUNNING, ...)` for the lifetime
+   of the query body; Drop restores the previous global and
+   reports `STATE_IDLE`. Tests probe via `ExecutorStart_hook`.
+
 6. **`statement_timeout` (§2.4).** Wrap each statement in
    `enable_statement_timeout()` / `disable_statement_timeout()`
    when the GUC is set. Requires care around the
    `disable_statement_timeout` between intermediate statements
    that vanilla calls out at [`postgres.c:1336`](../../../../../postgres/src/backend/tcop/postgres.c#L1336).
 
+   **Status — CLOSED (`2e78127`).** Added `StatementTimeoutGuard`
+   in `backend/observability.rs` (manual FFI bindings for
+   `enable_timeout_after` / `disable_timeout` / `get_timeout_active`
+   and `STATEMENT_TIMEOUT = 3`). Installed in all four backend
+   entry points alongside `DebugQueryGuard`. Test uses a 60s
+   timeout + SQL-callable probe
+   (`tests.pg_transport_statement_timeout_is_active()`) to avoid
+   the pg_test xact-corruption pitfall.
+
 7. **`pg_stat_statements` attribution (§2.4).** Call
    `pgstat_report_query_id(0, true)` + `pgstat_report_plan_id(0, true)`
    per statement. Restores per-statement bucketing in
    `pg_stat_statements`.
+
+   **Status — open.** Single point of insertion (per-statement
+   in each backend's dispatch loop); the FFI surface is
+   straightforward. No correctness dependency on §6.4. Suggested
+   pick-up next.
 
 8. **Performance — cache `FmgrInfo` in `ColumnEncoder` (§3.1.1).**
    Highest perf payoff per LoC. Replace `TypeOutput { Oid }` with
@@ -237,16 +383,30 @@ Ordered by correctness-impact then engineering cost:
    the hot row loop becomes `OutputFunctionCall(&fns.finfo, datum)`,
    matching vanilla's call shape exactly.
 
+   **Status — CLOSED (`245ad37`).** `TypeOutput` /
+   `TypeSend` now cache `FmgrInfo` instead of just the Oid; the
+   hot loop calls `OutputFunctionCall(&finfo, datum)`. Matches
+   vanilla's `printtup` shape.
+
 9. **Per-row buffer reuse (§3.1.2).** Hold a per-receiver
    `BytesMut` cursor across `receiveSlot` invocations and reset
    rather than `with_capacity` per row. May require coordinating
    with pgwire's `DataRow` ownership.
+
+   **Status — open.** Largest deferred perf item; touches
+   pgwire `DataRow` ownership semantics. Likely needs design
+   discussion before a code change.
 
 Items 1–4 (correctness) and item 5 (observability headline)
 are the smallest deltas that bring the two backends substantially
 closer to "same semantics as `exec_simple_query`". Items 6–7
 fill in the rest of the day-one GUC surface. Items 8–9 close
 the per-query perf gap quantified in §3.
+
+**Post-status footnote.** Of the original five correctness items
+(1, 2, 3) plus the observability headline (5) and the timeout /
+perf wins (6, 8), six have landed; §6.4 (snapshot gating + the
+companion `PortalStart` refactor) and §6.7 / §6.9 remain.
 
 ## 7. Source-doc spot-check summary
 
