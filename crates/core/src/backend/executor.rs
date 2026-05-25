@@ -57,7 +57,7 @@ pub struct XactCtx {
 }
 
 impl XactCtx {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         XactCtx {
             _phantom: PhantomData,
         }

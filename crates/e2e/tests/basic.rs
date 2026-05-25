@@ -181,6 +181,118 @@ async fn syntax_error_surfaces_pg_native_message() -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Implicit-block multi-statement atomicity (review §6 item 2)
+// ---------------------------------------------------------------------------
+//
+// Vanilla `exec_simple_query` wraps multi-statement `'Q'` bodies
+// in `BeginImplicitTransactionBlock` / `EndImplicitTransactionBlock`
+// (postgres.c:1097 + 1167-1170 + 1310) so the whole batch
+// commits or rolls back atomically. The direct backend mirrors
+// this via [`crates/core/src/backend/simple_direct.rs::execute_with_implicit_block`]
+// — closes review §6 item 2 for the direct path.
+//
+// The pg_test unit test for this lives at
+// `crates/core/src/backend/simple_direct.rs::tests::pg_simple_direct_implicit_block_atomicity`
+// but is `#[cfg(any())]`-disabled: pg_test wraps each test in an
+// outer transaction, and (a) triggering the inner ERROR
+// `AbortCurrentTransaction`s pg_test's wrap-xact (segfaults the
+// framework on teardown), and (b) no public PG API distinguishes
+// `TBLOCK_IMPLICIT_INPROGRESS` from `TBLOCK_INPROGRESS` for an
+// in-process probe. The e2e harness has no wrap-xact and runs
+// against a real wire connection, so the assertion-via-ERROR
+// approach works here.
+
+/// Run the multi-statement-`'Q'`-with-error scenario through
+/// `execution_backend = <backend>` and return the count of rows
+/// that survived in the test table.
+///
+/// Issues `INSERT INTO t VALUES (1); SELECT 1/0` as one `'Q'`
+/// message. Vanilla rolls back via the implicit block → count
+/// is 0. The pg_transport direct backend (after the §6.2 fix)
+/// matches vanilla → count is 0. The SPI backend currently
+/// still bracket-per-statement → count is 1.
+async fn observe_implicit_block_rollback(backend: &str) -> Result<String> {
+    let c = Cluster::shared().await;
+    let client = c.connect("postgres").await?;
+    client
+        .simple_query(&format!("SET pg_transport.execution_backend = '{backend}'"))
+        .await?;
+
+    let table = format!("e2e_implicit_block_{backend}_demo");
+    let _ = client
+        .simple_query(&format!("DROP TABLE IF EXISTS {table}"))
+        .await;
+    client
+        .simple_query(&format!("CREATE TABLE {table} (n int)"))
+        .await?;
+
+    let err = client
+        .simple_query(&format!("INSERT INTO {table} VALUES (1); SELECT 1/0"))
+        .await
+        .expect_err("SELECT 1/0 must propagate as a wire ERROR");
+    let db = err
+        .as_db_error()
+        .unwrap_or_else(|| panic!("expected DbError, got: {err:?}"));
+    assert!(
+        db.message().contains("division by zero"),
+        "expected the divide-by-zero error to surface (so we know \
+         it was THIS error that the implicit block should have \
+         caught), got: {}",
+        db.message()
+    );
+
+    let msgs = client
+        .simple_query(&format!("SELECT count(*)::text FROM {table}"))
+        .await?;
+    let actual = first_text_cell(&msgs)
+        .unwrap_or_else(|| panic!("expected one text cell from count, got: {msgs:?}"));
+
+    let _ = client.simple_query(&format!("DROP TABLE {table}")).await;
+
+    Ok(actual)
+}
+
+#[tokio::test]
+async fn implicit_block_rolls_back_partial_direct_backend() -> Result<()> {
+    // Direct backend: §6.2 fix is in place. The INSERT must roll
+    // back when the SELECT errors.
+    let count = observe_implicit_block_rollback("direct").await?;
+    assert_eq!(
+        count, "0",
+        "REGRESSION on review 2026-05-24 §6 item 2 (backend=direct): \
+         SELECT count(*) returned {count:?} after \
+         'INSERT VALUES (1); SELECT 1/0'. Expected 0 (rolled back \
+         via BeginImplicitTransactionBlock / EndImplicitTransactionBlock). \
+         `execute_with_implicit_block` was bypassed or the panic-abort \
+         path in `simple_direct.rs::execute_with_implicit_block` no \
+         longer aborts the implicit block.",
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn implicit_block_atomicity_gap_spi_backend() -> Result<()> {
+    // SPI backend: §6.2 fix not yet applied. The SPI bridge still
+    // bracket-per-statement (with_spi's Start+Commit), so the
+    // INSERT commits before the SELECT errors. This test pins
+    // the current gap; flip to `assert_eq!(count, "0")` and
+    // rename to `implicit_block_rolls_back_partial_spi_backend`
+    // once the SPI bridge gets the equivalent fix (planned as a
+    // follow-up — see the SPI counterpart of
+    // `simple_direct::execute_with_implicit_block`).
+    let count = observe_implicit_block_rollback("spi").await?;
+    assert_eq!(
+        count, "1",
+        "BUG STATUS REVERSED on review 2026-05-24 §6 item 2 \
+         (backend=spi): SELECT count(*) returned {count:?} instead \
+         of \"1\". If actual == \"0\", the SPI bridge fix is in. \
+         Flip this assertion to \"0\" and rename to \
+         `implicit_block_rolls_back_partial_spi_backend`.",
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn admin_connect_speaks_full_protocol() -> Result<()> {
     // The admin connection bypasses pg_transport and talks to

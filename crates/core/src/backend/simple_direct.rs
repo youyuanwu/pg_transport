@@ -33,7 +33,7 @@
 //! framework-owned per-statement context is needed.
 
 use std::ffi::{CStr, CString};
-use std::panic::AssertUnwindSafe;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -41,6 +41,7 @@ use futures::stream;
 use pgrx::PgTryBuilder;
 use pgrx::pg_sys;
 use pgrx::pg_sys::panic::CaughtError;
+use pgwire::api::results::FieldFormat;
 use pgwire::api::results::{QueryResponse, Response, Tag};
 use pgwire::error::PgWireResult;
 use pgwire::messages::data::DataRow;
@@ -50,8 +51,7 @@ use super::dest_receiver::{
 };
 use super::executor::{ParamList, Portal, ScopedMemoryContext, TupleDescRef, XactCtx, with_xact};
 use super::observability::{DebugQueryGuard, StatementTimeoutGuard};
-use super::spi::{caught_error_to_pgwire, generic_error};
-use pgwire::api::results::FieldFormat;
+use super::spi::{caught_error_to_pgwire, generic_error, panic_to_pgwire};
 
 // ---------------------------------------------------------------------------
 // parse_and_keep — single raw_parser pass; keeps parsetrees alive
@@ -288,6 +288,18 @@ fn fetch_result_format(raw_stmt: *mut pg_sys::RawStmt) -> FieldFormat {
 /// `auto_explain`, `pg_stat_activity.query`, and server-log
 /// `STATEMENT:` lines attribute correctly. See the guard's
 /// doc-comment for the full list of consumers.
+///
+/// **Multi-statement atomicity.** When the `'Q'` body contains
+/// more than one non-empty statement,
+/// [`execute_with_implicit_block`] wraps the whole batch in
+/// `BeginImplicitTransactionBlock` /
+/// `EndImplicitTransactionBlock` — matching vanilla
+/// `exec_simple_query` ([postgres.c:1097 + :1167-1170 + :1310](../../../../../postgres/src/backend/tcop/postgres.c#L1097)).
+/// An error in any sub-statement rolls back the earlier
+/// successful ones. Single-statement bodies stay on the
+/// existing per-statement [`with_xact`] path (functionally
+/// equivalent — no implicit block needed for a batch of one).
+/// Closes review 2026-05-24 §6 item 2.
 pub fn execute_simple_query_direct(query: &str) -> PgWireResult<Vec<Response>> {
     let parsed = parse_and_keep(query)?;
 
@@ -315,7 +327,24 @@ pub fn execute_simple_query_direct(query: &str) -> PgWireResult<Vec<Response>> {
     // the slot's main loop with a transaction bracket).
     let _stmt_timeout = unsafe { StatementTimeoutGuard::install() };
 
-    let mut responses = Vec::with_capacity(parsed.statements.len());
+    // Count executable statements (non-whitespace-only).
+    // Single-statement (or zero) bodies don't need an implicit
+    // block — vanilla also skips `BeginImplicitTransactionBlock`
+    // when `list_length(parsetree_list) <= 1`.
+    let non_empty_count = parsed
+        .statements
+        .iter()
+        .filter(|(text, _)| !text.trim().is_empty())
+        .count();
+
+    if non_empty_count > 1 {
+        return execute_with_implicit_block(&parsed);
+    }
+
+    // Single-statement (or empty) body — existing per-statement
+    // path. with_xact's Start/Commit handles fresh-auto-commit
+    // and "already in outer xact" (CCI no-op) equally well.
+    let mut responses = Vec::with_capacity(non_empty_count);
     for (text, raw_stmt) in &parsed.statements {
         if text.trim().is_empty() {
             continue;
@@ -332,6 +361,138 @@ pub fn execute_simple_query_direct(query: &str) -> PgWireResult<Vec<Response>> {
     // reporting STATE_IDLE. `parsed` drops after, freeing the
     // parsetree and the CString that the guard borrowed from.
     Ok(responses)
+}
+
+/// Returns true iff `raw_stmt`'s inner Node is a
+/// `T_TransactionStmt` (BEGIN / COMMIT / ROLLBACK / SAVEPOINT /
+/// PREPARE TRANSACTION / etc.). Used by
+/// [`execute_with_implicit_block`] to mirror vanilla
+/// `exec_simple_query` at
+/// [postgres.c:1320](../../../../../postgres/src/backend/tcop/postgres.c#L1320):
+/// when a mid-batch statement is xact-control, the implicit
+/// block ends at that statement (via `finish_xact_command`)
+/// instead of waiting for the last iteration.
+fn is_transaction_stmt(raw_stmt: *mut pg_sys::RawStmt) -> bool {
+    // SAFETY: raw_stmt is a valid `*mut RawStmt` from raw_parser
+    // (parse_and_keep's lifetime invariant).
+    unsafe {
+        let node = (*raw_stmt).stmt;
+        !node.is_null() && (*node).type_ == pg_sys::NodeTag::T_TransactionStmt
+    }
+}
+
+/// Multi-statement implicit-block executor — vanilla
+/// `exec_simple_query`'s per-iter pattern for `'Q'` bodies with
+/// more than one statement. Closes review 2026-05-24 §6 item 2.
+///
+/// Mirrors the [postgres.c per-iter loop](../../../../../postgres/src/backend/tcop/postgres.c#L1097-L1340):
+///
+/// 1. **Per iteration**: `StartTransactionCommand` (idempotent —
+///    no-op if already in xact) + `BeginImplicitTransactionBlock`
+///    (idempotent — no-op if already inside an implicit block) +
+///    `PushActiveSnapshot`.
+/// 2. **Run the statement** via [`run_one_direct`] under a
+///    freshly-issued [`XactCtx`].
+/// 3. **`PopActiveSnapshot`** then decide what to do next:
+///    - Last iteration: `EndImplicitTransactionBlock` +
+///      `CommitTransactionCommand` (commits the whole batch).
+///    - Mid-batch [`TransactionStmt`](is_transaction_stmt):
+///      `CommitTransactionCommand` (commits/aborts whatever the
+///      stmt did to the xact state). Next iter re-enters the
+///      implicit block via `BeginImplicitTransactionBlock`.
+///    - Otherwise: `CommandCounterIncrement` (visible-to-next-
+///      statement, no commit).
+/// 4. **PG-ERROR catch**: a single `catch_unwind` wraps the
+///    whole loop body. Any sub-statement raising `ERROR`
+///    longjmp's to `pg_guard`'s sigsetjmp, gets converted to a
+///    Rust panic, unwinds out of the closure, and lands in the
+///    `Err(panic)` arm below — which calls
+///    `AbortCurrentTransaction` (collapsing the implicit block
+///    and rolling back all earlier sub-statements) and returns
+///    `Err`. Matches vanilla's behaviour: first error stops the
+///    batch and rolls back the whole implicit block.
+fn execute_with_implicit_block(parsed: &ParsedQuery<'_>) -> PgWireResult<Vec<Response>> {
+    let non_empty: Vec<*mut pg_sys::RawStmt> = parsed
+        .statements
+        .iter()
+        .filter(|(text, _)| !text.trim().is_empty())
+        .map(|(_, raw)| *raw)
+        .collect();
+    debug_assert!(
+        non_empty.len() > 1,
+        "execute_with_implicit_block must only be called for multi-statement bodies"
+    );
+    let last_idx = non_empty.len() - 1;
+    let sql_cstr_ref: &CStr = parsed.sql_cstr.as_c_str();
+
+    let body_outcome = catch_unwind(AssertUnwindSafe(|| {
+        let mut responses = Vec::with_capacity(non_empty.len());
+        for (i, &raw_stmt) in non_empty.iter().enumerate() {
+            // SAFETY: all calls are PG server-API entry points;
+            // StartTransactionCommand / BeginImplicitTransactionBlock
+            // are idempotent on already-open xact / implicit block.
+            unsafe {
+                pg_sys::SetCurrentStatementStartTimestamp();
+                pg_sys::StartTransactionCommand();
+                pg_sys::BeginImplicitTransactionBlock();
+                pg_sys::PushActiveSnapshot(pg_sys::GetTransactionSnapshot());
+            }
+            let ctx = XactCtx::new();
+            let resp = run_one_direct(&ctx, raw_stmt, sql_cstr_ref);
+            // SAFETY: matched Push above. If run_one_direct
+            // panic'd we'd never reach here; the outer catch_unwind
+            // catches and AbortCurrentTransaction drains the
+            // snapshot stack itself.
+            unsafe {
+                pg_sys::PopActiveSnapshot();
+            }
+            let resp = resp?;
+            responses.push(resp);
+
+            // SAFETY: each branch matches vanilla's per-iter tail.
+            unsafe {
+                if i == last_idx {
+                    pg_sys::EndImplicitTransactionBlock();
+                    pg_sys::CommitTransactionCommand();
+                } else if is_transaction_stmt(raw_stmt) {
+                    // Mid-batch TransactionStmt: commit/abort
+                    // whatever ProcessUtility did to the xact
+                    // state. Next iter re-opens via
+                    // start_xact_command + BeginImplicit.
+                    pg_sys::CommitTransactionCommand();
+                } else {
+                    pg_sys::CommandCounterIncrement();
+                }
+            }
+        }
+        Ok::<Vec<Response>, pgwire::error::PgWireError>(responses)
+    }));
+
+    match body_outcome {
+        Ok(Ok(responses)) => Ok(responses),
+        Ok(Err(err)) => {
+            // Typed error from run_one_direct without a PG ERROR
+            // (e.g. a downstream PgWireError from pgwire-level
+            // checks). Xact is still open; abort to match the
+            // implicit-block "first error rolls back all" rule.
+            //
+            // SAFETY: AbortCurrentTransaction is safe from any
+            // non-DEFAULT TBLOCK_* state.
+            unsafe { pg_sys::AbortCurrentTransaction() };
+            Err(err)
+        }
+        Err(panic_payload) => {
+            // PG ERROR longjmp'd through the body. The implicit
+            // block (and any earlier sub-statements' work)
+            // rolls back here — this is the load-bearing branch
+            // for the §6.2 fix.
+            //
+            // SAFETY: AbortCurrentTransaction handles snapshot
+            // cleanup itself; we do not Pop here.
+            unsafe { pg_sys::AbortCurrentTransaction() };
+            Err(panic_to_pgwire(panic_payload))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -634,6 +795,72 @@ mod tests {
     #[cfg(any())] // intentionally disabled — see note above
     #[pg_test]
     fn pg_simple_direct_xact_control() {}
+
+    /// Implicit-block multi-statement atomicity (review §6 item 2).
+    ///
+    /// **Vanilla `exec_simple_query` semantics
+    /// ([postgres.c:1097 + 1167-1170 + 1310](../../../../../postgres/src/backend/tcop/postgres.c#L1097)):**
+    /// for `list_length(parsetree_list) > 1`, wrap the per-statement
+    /// loop in `BeginImplicitTransactionBlock` /
+    /// `EndImplicitTransactionBlock` so the whole `'Q'` body
+    /// commits or rolls back atomically. If any statement raises
+    /// `ERROR`, the entire block aborts — earlier successful
+    /// statements are rolled back.
+    ///
+    /// **`execute_simple_query_direct` today:** the per-statement
+    /// `with_xact` bracket means each statement gets its own
+    /// `StartTransactionCommand` / `CommitTransactionCommand`
+    /// pair, so the first INSERT in
+    /// `INSERT 1; SELECT 1/0` commits before the SELECT errors.
+    /// The user's table ends up with the row that vanilla would
+    /// have rolled back.
+    ///
+    /// **Why this test is disabled in pg_test.** Demonstrating the
+    /// gap requires either:
+    /// 1. Raising an `ERROR` through `execute_simple_query_direct`
+    ///    so we can verify the earlier statements' rollback (or
+    ///    failure-to-roll-back) — but `with_xact`'s panic handler
+    ///    calls `AbortCurrentTransaction`, which collapses
+    ///    pg_test's wrap-xact to `TBLOCK_DEFAULT` and segfaults
+    ///    the framework on teardown. Same class of issue as
+    ///    [`pg_simple_direct_xact_control`] and the
+    ///    statement-timeout cancel test in §6 item 6.
+    /// 2. Probing for the `TBLOCK_IMPLICIT_INPROGRESS` state from
+    ///    inside a SQL callable — but `IsInTransactionBlock`,
+    ///    `IsTransactionBlock`, and `GetCurrentTransactionNestLevel`
+    ///    all return identical values for `TBLOCK_INPROGRESS`
+    ///    (what pg_test gives us) and `TBLOCK_IMPLICIT_INPROGRESS`
+    ///    (what the fix would add). PG exposes no public
+    ///    "am I in an implicit block specifically?" probe.
+    ///
+    /// **e2e test that should land alongside the §6.2 fix** (in
+    /// `crates/e2e/tests/basic.rs` or similar):
+    ///
+    /// ```sql
+    /// -- Setup
+    /// CREATE TEMP TABLE atomicity_t (n int);
+    ///
+    /// -- Multi-statement Q where statement 2 errors. Run via
+    /// -- pg_transport over a real wire connection (no outer xact
+    /// -- around the Q).
+    /// INSERT INTO atomicity_t VALUES (1); SELECT 1/0;
+    ///
+    /// -- After the ERROR comes back, the table should be empty
+    /// -- (vanilla's implicit block rolled the INSERT back).
+    /// -- pg_transport today: the INSERT committed → SELECT
+    /// -- COUNT(*) returns 1, exposing the gap.
+    /// SELECT COUNT(*) FROM atomicity_t;  -- expect 0 after fix
+    /// ```
+    ///
+    /// When §6.2 lands, flip this `#[cfg(any())]` off and rewrite
+    /// the test body to call `crates/e2e`'s harness equivalent of
+    /// the SQL above. Or — if pgrx-tests adds a "no wrap-xact"
+    /// per-test attribute — rewrite as a plain pg_test using a
+    /// real `INSERT … VALUES (1); SELECT 1/0` against the direct
+    /// path and assert `COUNT(*) = 0` afterward.
+    #[cfg(any())] // intentionally disabled — see note above
+    #[pg_test]
+    fn pg_simple_direct_implicit_block_atomicity() {}
 
     /// Syntax error → PgWireError. Subsequent statements are
     /// not executed (matches PG's 'Q' semantics).
