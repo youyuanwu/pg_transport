@@ -116,6 +116,128 @@ impl Drop for DebugQueryGuard<'_> {
 }
 
 // ---------------------------------------------------------------------------
+// StatementTimeoutGuard — arm/disarm STATEMENT_TIMEOUT per query
+// (review 2026-05-24 §6 item 6)
+// ---------------------------------------------------------------------------
+
+// Manual FFI bindings for the PG timeout API. pgrx-pg-sys 0.18
+// does not expose `enable_timeout_after` / `disable_timeout` /
+// `get_timeout_active`, even though they are plain extern C
+// functions in `src/backend/utils/misc/timeout.c`. Vanilla
+// `enable_statement_timeout` (postgres.c:5208) wraps these with
+// the StatementTimeout > 0 + already-active checks; we replicate
+// that policy here. The wrapper itself is `static` in
+// `postgres.c` and therefore not linkable from outside the
+// backend binary.
+unsafe extern "C-unwind" {
+    fn enable_timeout_after(id: std::ffi::c_int, delay_ms: std::ffi::c_int);
+    fn disable_timeout(id: std::ffi::c_int, keep_indicator: bool);
+    fn get_timeout_active(id: std::ffi::c_int) -> bool;
+}
+
+/// `TimeoutId::STATEMENT_TIMEOUT` from
+/// [`src/include/utils/timeout.h`](../../../../../postgres/src/include/utils/timeout.h)
+/// at PG 18. The enum is documented as stable across PG majors
+/// for the predefined entries; STATEMENT_TIMEOUT is the 4th
+/// (index 3) member.
+const STATEMENT_TIMEOUT: std::ffi::c_int = 3;
+
+/// RAII guard that arms `STATEMENT_TIMEOUT` for the lifetime of
+/// the guard and disables it on drop. Mirrors vanilla
+/// [`enable_statement_timeout` in postgres.c:5208-5223](../../../../../postgres/src/backend/tcop/postgres.c#L5208-L5223)
+/// plus the matching
+/// [`disable_statement_timeout`](../../../../../postgres/src/backend/tcop/postgres.c#L5230-L5236).
+///
+/// Drop runs on every exit path (Ok / typed-Err / PG-ERROR
+/// panic caught by `with_xact` / `with_spi`'s `catch_unwind`),
+/// so a fired statement-timeout ERROR correctly disarms the
+/// timer before the panic propagates out.
+///
+/// **Activation policy.** Only arms when:
+/// - `pg_sys::StatementTimeout > 0` (the GUC is set), AND
+/// - the timer is not already active (matches vanilla's "don't
+///   restart on re-entry" comment at postgres.c:2811 — restarting
+///   would skew the deadline forward and is observably wrong for
+///   multi-statement bodies).
+///
+/// The guard remembers whether *it* armed the timer
+/// (`armed_by_us`); only then does drop disable. This preserves
+/// the "outer code may have armed it for its own purposes"
+/// invariant, though under pg_transport's current slot-bgworker
+/// shape no outer code does so.
+///
+/// Without this guard, `statement_timeout` is silently inactive
+/// for every pg_transport-served query — an operational hazard
+/// for any deployment that relies on the GUC to bound runaway
+/// queries. See review 2026-05-24 §6 item 6.
+pub(crate) struct StatementTimeoutGuard {
+    armed_by_us: bool,
+}
+
+impl StatementTimeoutGuard {
+    /// Arm `STATEMENT_TIMEOUT` if the GUC is set and the timer
+    /// isn't already running. Returns a guard whose `Drop` will
+    /// disarm only if this call did the arming.
+    ///
+    /// # Safety
+    ///
+    /// Must be called from a PG backend / bgworker (the only
+    /// place the timeout API is meaningful) and inside an active
+    /// transaction (matches vanilla's `Assert(xact_started)`).
+    pub(crate) unsafe fn install() -> Self {
+        // SAFETY: backend-context globals + extern fns. The
+        // GUC read is a plain memory load; the FFI calls are
+        // PG server-API entry points.
+        let armed_by_us = unsafe {
+            let timeout_ms = pg_sys::StatementTimeout;
+            if timeout_ms <= 0 {
+                false
+            } else if get_timeout_active(STATEMENT_TIMEOUT) {
+                // Already armed by outer code; leave alone so
+                // their drop doesn't see us steal it. Drop of
+                // this guard will be a no-op.
+                false
+            } else {
+                enable_timeout_after(STATEMENT_TIMEOUT, timeout_ms);
+                true
+            }
+        };
+        StatementTimeoutGuard { armed_by_us }
+    }
+}
+
+impl Drop for StatementTimeoutGuard {
+    fn drop(&mut self) {
+        if self.armed_by_us {
+            // SAFETY: matches install(). `keep_indicator=false`
+            // clears the "fired" flag so a subsequent
+            // get_timeout_indicator from outer code doesn't see
+            // our expiry.
+            unsafe { disable_timeout(STATEMENT_TIMEOUT, false) };
+        }
+    }
+}
+
+/// Crate-internal probe for whether `STATEMENT_TIMEOUT` is
+/// currently armed in this backend. Wraps the manually-declared
+/// `get_timeout_active` FFI symbol with a safe Rust signature
+/// so test helpers don't need to re-declare the extern block.
+///
+/// Used by the regression test for review §6 item 6: a SQL
+/// callable runs inside `PortalRun` and asks "did
+/// [`StatementTimeoutGuard`] actually arm the timer for this
+/// query?" — without needing to provoke an actual cancel (which
+/// would corrupt the pg_test harness's outer transaction).
+#[cfg(any(test, feature = "pg_test"))]
+pub(crate) fn is_statement_timeout_active() -> bool {
+    // SAFETY: get_timeout_active is a side-effect-free read of
+    // backend-local timer state; safe to call from any backend
+    // context that has an active TimerCallbackContext (i.e. any
+    // bgworker or backend).
+    unsafe { get_timeout_active(STATEMENT_TIMEOUT) }
+}
+
+// ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
 

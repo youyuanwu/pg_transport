@@ -35,7 +35,7 @@ use pgwire::error::PgWireResult;
 use pgwire::messages::data::DataRow;
 
 use super::dest_receiver::ColumnEncoder;
-use super::observability::DebugQueryGuard;
+use super::observability::{DebugQueryGuard, StatementTimeoutGuard};
 use super::spi::{
     SpiCtx, SpiTuples, caught_error_to_pgwire, generic_error, panic_to_pgwire, spi_rc_error,
     with_spi,
@@ -84,6 +84,11 @@ pub fn execute_simple_query(query: &str) -> PgWireResult<Vec<Response>> {
     // `_guard` (both drop at end-of-function in reverse decl
     // order: _guard first, then sql_cstr).
     let _guard = unsafe { DebugQueryGuard::install(sql_cstr.as_c_str()) };
+
+    // Arm statement_timeout for the duration of this 'Q' body.
+    // See [`StatementTimeoutGuard`] for the semantics and closes
+    // review 2026-05-24 §6 item 6 for the SPI backend.
+    let _stmt_timeout = unsafe { StatementTimeoutGuard::install() };
 
     let statements = parse_and_classify(query)?;
     let mut responses = Vec::with_capacity(statements.len());

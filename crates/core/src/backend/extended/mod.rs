@@ -35,7 +35,7 @@ use pgwire::api::portal::Format;
 use pgwire::api::results::{FieldInfo, Response};
 use pgwire::error::PgWireResult;
 
-use super::observability::DebugQueryGuard;
+use super::observability::{DebugQueryGuard, StatementTimeoutGuard};
 use super::spi::generic_error;
 use crate::guc::{self, ExecutionBackend};
 
@@ -106,6 +106,9 @@ impl PreparedStatement {
         // SAFETY: slot bgworker context; `sql_cstr` outlives
         // `_guard` (drops last).
         let _guard = unsafe { DebugQueryGuard::install(sql_cstr.as_c_str()) };
+        // Arm statement_timeout for the duration of this Execute.
+        // Closes review 2026-05-24 §6 item 6 for the extended path.
+        let _stmt_timeout = unsafe { StatementTimeoutGuard::install() };
         self.plan
             .execute(parameters, parameter_format, result_format, max_rows)
     }
@@ -125,6 +128,10 @@ pub fn prepare(sql: &str, param_hints: &[Option<u32>]) -> PgWireResult<PreparedS
         .map_err(|_| generic_error("pg_transport", "query string contains a NUL byte"))?;
     // SAFETY: slot bgworker context; `sql_cstr` outlives `_guard`.
     let _guard = unsafe { DebugQueryGuard::install(sql_cstr.as_c_str()) };
+    // Arm statement_timeout for parse + plan. Mirrors vanilla
+    // exec_parse_message, which arms via start_xact_command at
+    // the top of parse-time. Drops at end of prepare.
+    let _stmt_timeout = unsafe { StatementTimeoutGuard::install() };
     match guc::execution_backend() {
         ExecutionBackend::Spi => spi::prepare(sql, param_hints),
         ExecutionBackend::Direct => direct::prepare(sql, param_hints),

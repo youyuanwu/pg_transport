@@ -49,7 +49,7 @@ use super::dest_receiver::{
     ColumnEncoder, WireDestReceiver, command_tag_name, schema_and_encoders_uniform,
 };
 use super::executor::{ParamList, Portal, ScopedMemoryContext, TupleDescRef, XactCtx, with_xact};
-use super::observability::DebugQueryGuard;
+use super::observability::{DebugQueryGuard, StatementTimeoutGuard};
 use super::spi::{caught_error_to_pgwire, generic_error};
 use pgwire::api::results::FieldFormat;
 
@@ -300,6 +300,20 @@ pub fn execute_simple_query_direct(query: &str) -> PgWireResult<Vec<Response>> {
     // is held by `parsed` for the lifetime of this function,
     // which is also the lifetime of `_guard`.
     let _guard = unsafe { DebugQueryGuard::install(parsed.sql_cstr.as_c_str()) };
+
+    // Arm `statement_timeout` for the lifetime of this 'Q' body.
+    // No-op when StatementTimeout = 0. Disarms on every exit
+    // path including PG-ERROR panic, so a fired
+    // "canceling statement due to statement timeout" ERROR
+    // correctly disarms the timer before the panic propagates.
+    // Closes review 2026-05-24 §6 item 6.
+    //
+    // SAFETY: as above; transaction is established by with_xact
+    // for each per-statement call, but enable_timeout_after only
+    // needs xact_started at fire time (the timer handler runs
+    // inside an interrupt; the xact is active because we're in
+    // the slot's main loop with a transaction bracket).
+    let _stmt_timeout = unsafe { StatementTimeoutGuard::install() };
 
     let mut responses = Vec::with_capacity(parsed.statements.len());
     for (text, raw_stmt) in &parsed.statements {
@@ -631,6 +645,110 @@ mod tests {
             msg.to_ascii_lowercase().contains("syntax")
                 || msg.to_ascii_lowercase().contains("selectt"),
             "expected syntax error, got: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // statement_timeout enforced (review 2026-05-24 §6 item 6)
+    // -----------------------------------------------------------------------
+
+    /// SQL-callable probe used by
+    /// [`pg_simple_direct_statement_timeout_arms_timer`]. Runs as
+    /// the only column of the test's inner SELECT, so by the
+    /// time it executes the executor is fully active and
+    /// `STATEMENT_TIMEOUT` reflects whatever the surrounding
+    /// `execute_simple_query_direct` armed (or didn't).
+    ///
+    /// Reading the timer state mid-query (rather than triggering
+    /// an actual cancel) sidesteps the pg_test harness's outer
+    /// transaction: a real statement-timeout cancel would
+    /// `AbortCurrentTransaction`, collapsing pg_test's wrap-xact
+    /// to `TBLOCK_DEFAULT` and corrupting the framework's
+    /// commit-on-success teardown. Same class of issue
+    /// documented for the BEGIN/COMMIT test below; an end-to-end
+    /// "cancel actually fires + raises 57014" assertion lives
+    /// in `crates/e2e`.
+    #[pgrx::pg_extern]
+    fn pg_transport_statement_timeout_is_active() -> bool {
+        super::super::observability::is_statement_timeout_active()
+    }
+
+    /// Regression guard for [docs/design/reviews/2026-05-24-pg-code-findings.md](../../../../docs/design/reviews/2026-05-24-pg-code-findings.md)
+    /// §6 item 6.
+    ///
+    /// **Downstream property under test.** Vanilla
+    /// `exec_simple_query` arms `enable_statement_timeout()`
+    /// before running each statement; on expiry, the timer sets
+    /// `QueryCancelPending` and `CHECK_FOR_INTERRUPTS` raises
+    /// an `ERROR` with SQLSTATE `57014` ("canceling statement
+    /// due to statement timeout"). Without arming, the GUC is
+    /// silently inactive — operators set `statement_timeout`
+    /// expecting protection against runaway queries and get
+    /// none.
+    ///
+    /// `execute_simple_query_direct` arms the timer via
+    /// [`super::super::observability::StatementTimeoutGuard::install`]
+    /// right after [`super::super::observability::DebugQueryGuard::install`].
+    /// This test verifies the guard ran by asking PG's own
+    /// `get_timeout_active(STATEMENT_TIMEOUT)` *mid-execution*
+    /// from inside the inner SELECT (via the
+    /// `tests.pg_transport_statement_timeout_is_active()` helper
+    /// above).
+    ///
+    /// Uses a 60-second timeout — long enough that the timer
+    /// can't possibly fire during the test, but the guard sets
+    /// `armed_by_us = true` regardless of the deadline value
+    /// (any value > 0 triggers arming). When the function runs,
+    /// `get_timeout_active` returns true. The guard's `Drop`
+    /// then disarms cleanly before the test returns.
+    ///
+    /// If this regresses (the helper returns false), one of:
+    /// - `StatementTimeoutGuard::install` was removed from
+    ///   `execute_simple_query_direct`, OR
+    /// - reordered past `with_xact` so it didn't take effect
+    ///   before the inner `PortalRun`, OR
+    /// - the `_stmt_timeout` binding was dropped early.
+    #[pg_test]
+    fn pg_simple_direct_statement_timeout_arms_timer() {
+        // 60_000 ms = 60 s. Long enough that the timer cannot
+        // realistically fire mid-test (which would otherwise
+        // corrupt pg_test's outer xact via PG's automatic
+        // AbortCurrentTransaction on QueryCanceled).
+        execute_simple_query_direct("SET statement_timeout = 60000")
+            .expect("SET statement_timeout should succeed");
+
+        let r =
+            execute_simple_query_direct("SELECT tests.pg_transport_statement_timeout_is_active()")
+                .expect("probe SELECT should succeed");
+
+        // Reset defensively before consuming the result, in case
+        // an assertion below panics.
+        let _ = execute_simple_query_direct("RESET statement_timeout");
+
+        let mut q = match r.into_iter().next().expect("expected one Response") {
+            Response::Query(q) => q,
+            other => panic!("expected Query response, got {other:?}"),
+        };
+        let row = futures::executor::block_on(async { q.data_rows().next().await })
+            .expect("probe should return one row")
+            .expect("row item should be Ok");
+        assert_eq!(row.field_count, 1);
+        let mut data = row.data;
+        let len = data.get_i32();
+        assert_eq!(len, 1, "boolean text output is 1 byte");
+        let cell = data.split_to(len as usize);
+        let active_str = std::str::from_utf8(&cell).unwrap();
+
+        assert_eq!(
+            active_str, "t",
+            "REGRESSION on review 2026-05-24 §6 item 6: \
+             `get_timeout_active(STATEMENT_TIMEOUT)` returned {active_str:?} \
+             while inside `execute_simple_query_direct` with \
+             statement_timeout=60000. `StatementTimeoutGuard::install` \
+             is no longer arming the timer — check that it runs before \
+             `with_xact` in `execute_simple_query_direct` and that the \
+             `_stmt_timeout` binding lives for the duration of the \
+             per-statement loop.",
         );
     }
 
