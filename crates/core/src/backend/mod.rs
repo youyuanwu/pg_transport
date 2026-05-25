@@ -13,6 +13,7 @@ pub mod dest_receiver;
 pub mod executor;
 pub mod extended;
 pub mod fd_pass;
+pub mod observability;
 pub mod paths;
 pub mod pool;
 pub mod simple_direct;

@@ -35,6 +35,7 @@ use pgwire::error::PgWireResult;
 use pgwire::messages::data::DataRow;
 
 use super::dest_receiver::ColumnEncoder;
+use super::observability::DebugQueryGuard;
 use super::spi::{
     SpiCtx, SpiTuples, caught_error_to_pgwire, generic_error, panic_to_pgwire, spi_rc_error,
     with_spi,
@@ -63,6 +64,27 @@ use super::spi::{
 ///   `Vec<Response>`; pgwire's SimpleQueryHandler renders that as a
 ///   single `EmptyQueryResponse` + `ReadyForQuery`.
 pub fn execute_simple_query(query: &str) -> PgWireResult<Vec<Response>> {
+    // Pin per-query observability (debug_query_string + pgstat
+    // STATE_RUNNING) for the lifetime of the query body. The
+    // guard drops on every exit path (Ok / Err / panic), restoring
+    // the previous global and transitioning pgstat to STATE_IDLE.
+    // Matches vanilla `exec_simple_query` at postgres.c:1046-1048;
+    // closes review 2026-05-24 §6 item 5 for the SPI backend.
+    //
+    // The CString is owned here for the whole function so the
+    // guard's `'a` lifetime covers the entire query body. A second
+    // CString is materialised inside `parse_and_classify` and
+    // again inside the per-statement SPI path — both are tiny
+    // allocations relative to the query work, not worth threading
+    // through. If profiling shows it, lift the CString through
+    // `parse_and_classify` and reuse.
+    let sql_cstr = CString::new(query)
+        .map_err(|_| generic_error("pg_transport", "query string contains a NUL byte"))?;
+    // SAFETY: we're in the slot bgworker; `sql_cstr` outlives
+    // `_guard` (both drop at end-of-function in reverse decl
+    // order: _guard first, then sql_cstr).
+    let _guard = unsafe { DebugQueryGuard::install(sql_cstr.as_c_str()) };
+
     let statements = parse_and_classify(query)?;
     let mut responses = Vec::with_capacity(statements.len());
     for (text, classification) in statements {
@@ -628,5 +650,44 @@ mod tests {
             }
             other => panic!("unexpected error variant: {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Observability — debug_query_string downstream attribution
+    // (review 2026-05-24 §6 item 5)
+    // -----------------------------------------------------------------------
+
+    /// Mirror of the simple-direct backend's
+    /// `pg_simple_direct_executor_start_hook_sees_inner_query`
+    /// test for the SPI bridge. Verifies
+    /// [`super::execute_simple_query`] installs
+    /// [`super::super::observability::DebugQueryGuard`] before
+    /// running the executor, so `pg_stat_statements` /
+    /// `auto_explain` attribute correctly.
+    ///
+    /// Uses the shared
+    /// [`super::super::observability::test_helpers::capture_executor_start`]
+    /// helper, which co-locates the hook + capture-state with
+    /// the guard it asserts.
+    #[pg_test]
+    fn pg_spi_bridge_executor_start_hook_sees_inner_query() {
+        use super::super::observability::test_helpers::capture_executor_start;
+
+        const SQL: &str = "SELECT 1 AS only_one";
+
+        let (result, captured) = capture_executor_start(|| super::execute_simple_query(SQL));
+        result.expect("SELECT 1 should succeed");
+
+        assert_eq!(
+            captured.debug_query_string_at_hook.as_deref(),
+            Some(SQL),
+            "REGRESSION on review 2026-05-24 §6 item 5: at \
+             ExecutorStart_hook time, `debug_query_string` is not \
+             set to the inner SQL for the SPI backend. \
+             `pg_stat_statements` / `auto_explain` would \
+             mis-attribute every SPI-backend query. Likely cause: \
+             `DebugQueryGuard::install` was moved or dropped in \
+             `execute_simple_query`.",
+        );
     }
 }

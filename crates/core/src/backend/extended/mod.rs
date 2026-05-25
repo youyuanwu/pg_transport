@@ -27,12 +27,16 @@
 pub mod direct;
 pub mod spi;
 
+use std::ffi::CString;
+
 use bytes::Bytes;
 use pgwire::api::Type;
 use pgwire::api::portal::Format;
 use pgwire::api::results::{FieldInfo, Response};
 use pgwire::error::PgWireResult;
 
+use super::observability::DebugQueryGuard;
+use super::spi::generic_error;
 use crate::guc::{self, ExecutionBackend};
 
 /// What the wire layer stores in pgwire's `StoredStatement` for a
@@ -82,6 +86,12 @@ impl PreparedStatement {
     /// callback funnels through here; backend dispatch is
     /// already-resolved at this point because the plan was created
     /// by whichever backend won the GUC check at Parse time.
+    ///
+    /// Pins `debug_query_string` and pgstat `STATE_RUNNING` to
+    /// this statement's SQL for the duration of the plan call so
+    /// `pg_stat_statements`, `auto_explain`,
+    /// `pg_stat_activity.query`, and the server-log `STATEMENT:`
+    /// line all attribute correctly (review 2026-05-24 §6.5).
     pub fn execute(
         &self,
         parameters: &[Option<Bytes>],
@@ -89,6 +99,13 @@ impl PreparedStatement {
         result_format: &Format,
         max_rows: usize,
     ) -> PgWireResult<Response> {
+        // `self.sql` was accepted by the analyzer at prepare time,
+        // so a parser-rejected interior NUL is impossible.
+        let sql_cstr =
+            CString::new(self.sql.as_str()).expect("prepared SQL is parser-validated NUL-free");
+        // SAFETY: slot bgworker context; `sql_cstr` outlives
+        // `_guard` (drops last).
+        let _guard = unsafe { DebugQueryGuard::install(sql_cstr.as_c_str()) };
         self.plan
             .execute(parameters, parameter_format, result_format, max_rows)
     }
@@ -98,7 +115,16 @@ impl PreparedStatement {
 /// to pick the SPI or direct backend; the returned
 /// [`PreparedStatement`] is sticky on that choice (re-executing it
 /// later does not re-consult the GUC).
+///
+/// Pins `debug_query_string` and pgstat `STATE_RUNNING` for the
+/// duration of the parse + plan work so `pg_stat_statements`'s
+/// `post_parse_analyze_hook` attributes correctly (review
+/// 2026-05-24 §6.5).
 pub fn prepare(sql: &str, param_hints: &[Option<u32>]) -> PgWireResult<PreparedStatement> {
+    let sql_cstr = CString::new(sql)
+        .map_err(|_| generic_error("pg_transport", "query string contains a NUL byte"))?;
+    // SAFETY: slot bgworker context; `sql_cstr` outlives `_guard`.
+    let _guard = unsafe { DebugQueryGuard::install(sql_cstr.as_c_str()) };
     match guc::execution_backend() {
         ExecutionBackend::Spi => spi::prepare(sql, param_hints),
         ExecutionBackend::Direct => direct::prepare(sql, param_hints),
