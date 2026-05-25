@@ -164,7 +164,7 @@ state. For the post-fix state, see the per-item Status column in
 | 1 | FETCH-binary cursor format | **CLOSED** | `b0dae62` (direct) + `a1802ae` (SPI) |
 | 2 | Implicit-block multi-statement | **CLOSED** | `0b41355` (direct) + `f508f61` (SPI) |
 | 3 | Aborted-block rejection (`25P02`) | **CLOSED** | `409915c` |
-| 4 | `analyze_requires_snapshot` gating | open | — |
+| 4 | `analyze_requires_snapshot` gating | **CLOSED** | (pending) |
 | 5 | `debug_query_string` + pgstat | **CLOSED** | `97f1b1e` (direct) + `20cfb97` (extended + SPI) |
 | 6 | `statement_timeout` | **CLOSED** | `2e78127` |
 | 7 | `pg_stat_statements` query_id | open | — |
@@ -291,41 +291,42 @@ landed them; `open` items are still as written.
    regression: both `aborted_block_*_backend_returns_25p02`
    tests in `crates/e2e/tests/regressions.rs`.
 
-   **Known limitation pending §6.4.** A real-client wire-level
-   `ROLLBACK` from `TBLOCK_ABORT` on the **direct** backend
-   still crashes — `with_xact`'s unconditional snapshot Push is
-   what asserts. The fix needs §6.4 (`analyze_requires_snapshot`
-   gating in `with_xact`) plus a `run_one_direct` refactor to
-   pass `InvalidSnapshot` to `PortalStart` like vanilla
-   ([`postgres.c:1252`](../../../../../postgres/src/backend/tcop/postgres.c#L1252)).
-   The tests sidestep this by relying on the per-handoff
-   `AbortOutOfAnyTransaction` instead of issuing wire-level
-   `ROLLBACK`. SPI bridge does not have the same crash because
-   `handle_xact_control` doesn't push a snapshot for COMMIT /
-   ROLLBACK.
+   **Resolved by §6.4 (2026-05-25).** A real-client wire-level
+   `ROLLBACK` from `TBLOCK_ABORT` on the **direct** backend now
+   returns cleanly and a subsequent `SELECT` on the same
+   connection works as expected. The §6.4 fix below closes
+   this — both `with_xact`'s snapshot Push and
+   `PortalStart`'s snapshot argument are now vanilla-aligned.
+   `aborted_block_direct_backend_wire_rollback_succeeds`
+   (previously `#[ignore]`-gated as a gap pin) is now a live
+   regression test.
 
-4. **`analyze_requires_snapshot` gating (§2.2.5).** Easy.
-   `with_xact` becomes
-   `with_xact(needs_snapshot: bool, body)`; callers compute the
-   bool from `pg_sys::analyze_requires_snapshot(raw_stmt)` and
-   pass it through. Saves a `GetTransactionSnapshot` per
-   utility-statement `'Q'`.
+4. **`analyze_requires_snapshot` gating (§2.2.5).** Closed.
+   `with_xact` is now `with_xact(needs_snapshot: bool, body)`;
+   `execute_simple_query_direct` / `execute_with_implicit_block`
+   compute the bool from `pg_sys::analyze_requires_snapshot(raw_stmt)`
+   and pass it through. `run_one_direct` passes
+   `InvalidSnapshot` to `PortalStart` (matches vanilla
+   [`postgres.c:1235`](../../../../../postgres/src/backend/tcop/postgres.c#L1235)).
+   `parse_ctx` is now a `TopMemoryContext` child (matches
+   vanilla `MessageContext`'s parent) so analyze/plan
+   transients survive any per-statement xact `Commit`/`Abort`
+   that fires while the parsetree is still in flight; this is
+   the memory-context-discipline half from
+   [pg_code.md §2.5](../../../postgres/extdocs/background/pg_code.md#25-memory-context-discipline)
+   without which the snapshot gate alone is insufficient.
 
-   **Status — open. Promoted to a correctness gap by §6.3.**
-   Originally an "easy" perf win; now also required to make
-   wire-level `ROLLBACK` from `TBLOCK_ABORT` on the direct
-   backend work (see §6.3 Status above). The minimal
-   `with_xact(needs_snapshot, body)` signature change is small,
-   but `run_one_direct` also needs to be updated to pass
-   `InvalidSnapshot` to `PortalStart` when the parse-time
-   snapshot wasn't pushed (mirroring vanilla
-   [`postgres.c:1252`](../../../../../postgres/src/backend/tcop/postgres.c#L1252)) —
-   currently `run_one_direct` calls
-   `portal.start(..., pg_sys::GetActiveSnapshot())`, which
-   returns garbage / asserts when no Push happened. Tried in
-   commit `409915c` and broke 16+ tests on
-   non-`TransactionStmt` utility statements (e.g. `DROP TABLE`);
-   reverted in favour of the per-handoff cleanup workaround.
+   **Status — CLOSED (2026-05-25).** The earlier "broke 16+
+   tests" attempt referenced below was specifically the
+   snapshot-gate-only patch without the
+   `parse_ctx`-parent-and-context-switch change; once both
+   halves landed together the failures disappeared. Now a
+   correctness fix (resolves the §6.3 known limitation above)
+   *and* a perf win (saves a `GetTransactionSnapshot` per
+   utility-statement `'Q'`). Regression coverage:
+   `aborted_block_direct_backend_wire_rollback_succeeds`
+   exercises the `TBLOCK_ABORT` → ROLLBACK → SELECT path
+   end-to-end.
 
 5. **`pg_stat_activity.query` + `debug_query_string` (§2.3 row 1–2).**
    Single point of insertion at the top of

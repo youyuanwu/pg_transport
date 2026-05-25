@@ -182,7 +182,7 @@ fn execute_impl(
         .map(|i| parameter_format.is_binary(i))
         .collect();
 
-    with_xact(|ctx| -> PgWireResult<Response> {
+    with_xact(true, |ctx| -> PgWireResult<Response> {
         let (param_values, param_is_null) =
             decode_parameters(parameters, &backend.param_oids, &param_is_binary)?;
         // SAFETY: inside with_xact; Datums are palloc'd in this
@@ -288,7 +288,7 @@ pub fn prepare(sql: &str, param_hints: &[Option<u32>]) -> PgWireResult<PreparedS
     let sql_owned = sql.to_string();
     let any_hint_present = param_hints.iter().any(|o| o.is_some());
 
-    with_xact(|ctx| -> PgWireResult<PreparedStatement> {
+    with_xact(true, |ctx| -> PgWireResult<PreparedStatement> {
         // 1. Raw parse.
         // SAFETY: inside with_xact; pg_parse_query is the
         // standard PG raw parser. Allocates in CurrentMemoryContext.

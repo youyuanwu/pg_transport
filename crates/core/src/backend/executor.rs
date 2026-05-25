@@ -64,17 +64,40 @@ impl XactCtx {
     }
 }
 
-/// Run `body` inside `StartTransactionCommand` + `PushActiveSnapshot`
-/// ... `PopActiveSnapshot` + `CommitTransactionCommand`. No
-/// `SPI_connect` (that's [`super::spi::with_spi`]'s job).
+/// Run `body` inside `StartTransactionCommand` + optional
+/// `PushActiveSnapshot` ... `PopActiveSnapshot` +
+/// `CommitTransactionCommand`. No `SPI_connect` (that's
+/// [`super::spi::with_spi`]'s job).
+///
+/// `needs_snapshot` mirrors vanilla `exec_simple_query`'s
+/// `analyze_requires_snapshot(parsetree)` gate at
+/// [postgres.c:1191](../../../../../postgres/src/backend/tcop/postgres.c#L1191):
+/// pass `true` when the body will run a parse-analysis /
+/// rewrite / plan that needs a transaction snapshot
+/// (`SELECT` / DML / `EXPLAIN` / `DECLARE CURSOR` /
+/// `CREATE TABLE AS` / `CALL`), and `false` for everything else
+/// (`SET`, `BEGIN` / `COMMIT` / `ROLLBACK`, `SAVEPOINT`,
+/// `CREATE TABLE`, …). Wrong `false` makes `analyze` raise on
+/// `GetActiveSnapshot`; wrong `true` only costs a snapshot
+/// acquisition. Callers that already hold a parsetree should
+/// use `pg_sys::analyze_requires_snapshot(raw_stmt)` directly.
+///
+/// `false` is the only safe value when entering from
+/// `TBLOCK_ABORT` (`GetTransactionSnapshot` from `TBLOCK_ABORT`
+/// asserts). Combined with [`Portal::start`] being called with
+/// `InvalidSnapshot`, this is exactly vanilla's pattern for
+/// running `ROLLBACK` / `COMMIT` from `TBLOCK_ABORT` without
+/// any short-circuit.
 ///
 /// Error path:
-/// - Body returns `Ok(value)` → `Pop` + `Commit`, return value.
-/// - Body returns `Err(e)` → `Pop` + `Commit` (xact state intact;
-///   we just propagate the typed error). Mirrors `with_spi`.
+/// - Body returns `Ok(value)` → `Pop` (if pushed) + `Commit`, return value.
+/// - Body returns `Err(e)` → `Pop` (if pushed) + `Commit` (xact
+///   state intact; we just propagate the typed error). Mirrors
+///   `with_spi`.
 /// - Body panics (PG ERROR longjmp'd to Rust panic) →
-///   `AbortCurrentTransaction` (handles snapshot stack itself; we
-///   must NOT `Pop` after Abort), convert payload to `PgWireError`.
+///   `AbortCurrentTransaction` (handles snapshot stack itself;
+///   we must NOT `Pop` after Abort), convert payload to
+///   `PgWireError`.
 ///
 /// `body` receives a `&`[`XactCtx`] to use the in-xact-only APIs.
 ///
@@ -86,7 +109,7 @@ impl XactCtx {
 /// the second Commit would be incorrect. **Do not nest.** Direct
 /// path callers go straight from the wire layer, same as
 /// `with_spi`.
-pub fn with_xact<T, F>(body: F) -> PgWireResult<T>
+pub fn with_xact<T, F>(needs_snapshot: bool, body: F) -> PgWireResult<T>
 where
     F: FnOnce(&XactCtx) -> PgWireResult<T>,
 {
@@ -95,7 +118,9 @@ where
     unsafe {
         pg_sys::SetCurrentStatementStartTimestamp();
         pg_sys::StartTransactionCommand();
-        pg_sys::PushActiveSnapshot(pg_sys::GetTransactionSnapshot());
+        if needs_snapshot {
+            pg_sys::PushActiveSnapshot(pg_sys::GetTransactionSnapshot());
+        }
     }
 
     let outcome: Result<PgWireResult<T>, Box<dyn Any + Send>> =
@@ -107,19 +132,24 @@ where
     match outcome {
         Ok(Ok(value)) => {
             // SAFETY: matched Start/Push above; closure returned
-            // cleanly. Pop + Commit drains the snapshot stack and
-            // closes the xact.
+            // cleanly. Pop (if pushed) + Commit drains the
+            // snapshot stack and closes the xact.
             unsafe {
-                pg_sys::PopActiveSnapshot();
+                if needs_snapshot {
+                    pg_sys::PopActiveSnapshot();
+                }
                 pg_sys::CommitTransactionCommand();
             }
             Ok(value)
         }
         Ok(Err(err)) => {
             // Body returned a typed PgWireError without raising a
-            // PG ERROR. Xact state intact; Pop + Commit (not Abort).
+            // PG ERROR. Xact state intact; Pop (if pushed) +
+            // Commit (not Abort).
             unsafe {
-                pg_sys::PopActiveSnapshot();
+                if needs_snapshot {
+                    pg_sys::PopActiveSnapshot();
+                }
                 pg_sys::CommitTransactionCommand();
             }
             Err(err)
@@ -671,6 +701,22 @@ impl Portal {
     /// `eflags` is the standard `EXEC_FLAG_*` mask (pass `0` for
     /// "no special flags").
     ///
+    /// Callers should normally pass
+    /// `std::ptr::null_mut::<pg_sys::SnapshotData>()` (i.e.
+    /// `InvalidSnapshot`) for `snapshot` — mirrors vanilla
+    /// `exec_simple_query` /
+    /// `exec_execute_message` at
+    /// [postgres.c:1235](../../../../../postgres/src/backend/tcop/postgres.c#L1235)
+    /// and [`:2052`](../../../../../postgres/src/backend/tcop/postgres.c#L2052).
+    /// `PortalStart` itself takes a fresh
+    /// `GetTransactionSnapshot` for `PORTAL_ONE_SELECT` and pops
+    /// it before returning; passing an explicit
+    /// `GetActiveSnapshot()` is correct only when [`with_xact`]
+    /// was called with `needs_snapshot = true`, and even then
+    /// `InvalidSnapshot` is the recommended shape because
+    /// vanilla uses it unconditionally and it's the only value
+    /// that's safe across the `needs_snapshot = false` path.
+    ///
     /// # Safety
     ///
     /// Caller must have already called [`Self::define`].
@@ -848,7 +894,24 @@ mod tests {
     /// crash).
     #[pg_test]
     fn pg_with_xact_basic_lifecycle() {
-        with_xact(|_ctx| -> PgWireResult<i32> { Ok(42) }).expect("with_xact body failed");
+        with_xact(true, |_ctx| -> PgWireResult<i32> { Ok(42) }).expect("with_xact body failed");
+    }
+
+    /// `needs_snapshot = false` mirrors vanilla's path for
+    /// utility / xact-control statements: `with_xact` skips
+    /// the `PushActiveSnapshot(GetTransactionSnapshot())`
+    /// prologue. We exercise this end-to-end via the e2e
+    /// regression `aborted_block_direct_backend_wire_rollback_succeeds`
+    /// (which `with_xact(false, ...)` enters from `TBLOCK_ABORT`);
+    /// the in-PG smoke here just confirms the call shape compiles
+    /// + completes (the pgrx test framework wraps the whole test
+    /// in an outer xact that already has an active snapshot, so
+    /// asserting `!ActiveSnapshotSet()` would only check the
+    /// framework, not `with_xact`).
+    #[pg_test]
+    fn pg_with_xact_no_snapshot_call_shape() {
+        with_xact(false, |_ctx| -> PgWireResult<()> { Ok(()) })
+            .expect("with_xact(false, ...) body failed");
     }
 
     /// Validate the Portal create/drop lifecycle in isolation. No
@@ -856,7 +919,7 @@ mod tests {
     /// portal.
     #[pg_test]
     fn pg_portal_create_drop() {
-        with_xact(|ctx| -> PgWireResult<()> {
+        with_xact(true, |ctx| -> PgWireResult<()> {
             // SAFETY: with_xact established the xact + memcontext.
             let portal = unsafe { Portal::create_anonymous(ctx) };
             assert!(!portal.as_ptr().is_null(), "CreatePortal returned null");
@@ -881,7 +944,7 @@ mod tests {
     fn pg_direct_path_smoke() {
         use std::ffi::CString;
 
-        with_xact(|ctx| -> PgWireResult<()> {
+        with_xact(true, |ctx| -> PgWireResult<()> {
             let sql = CString::new("SELECT 1").unwrap();
 
             // 1. Parse.

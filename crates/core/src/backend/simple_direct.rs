@@ -16,21 +16,42 @@
 //!   ├─ parse_and_keep                         (one raw_parser pass)
 //!   │    └─ ParsedQuery { statements, parse_ctx, sql_cstr }
 //!   └─ for each statement:
-//!        with_xact(|ctx| run_one_direct(ctx, raw_stmt, &sql_cstr))
+//!        needs_snapshot = analyze_requires_snapshot(raw_stmt)
+//!        with_xact(needs_snapshot, |ctx| run_one_direct(ctx, raw_stmt, ...))
 //!         ├─ CreateCommandTag(raw_stmt)
-//!         ├─ pg_analyze_and_rewrite_fixedparams  (→ TopTransactionContext)
-//!         ├─ pg_plan_queries                      (→ TopTransactionContext)
-//!         ├─ Portal::create_anonymous → define → start → run(WireDestReceiver)
+//!         ├─ MemoryContextSwitchTo(parse_ctx)
+//!         ├─ pg_analyze_and_rewrite_fixedparams  (→ parse_ctx)
+//!         ├─ pg_plan_queries                      (→ parse_ctx)
+//!         ├─ Portal::create_anonymous → define
+//!         ├─ MemoryContextSwitchTo(prev)
+//!         ├─ portal.start(InvalidSnapshot)
+//!         ├─ portal.run(WireDestReceiver)
 //!         └─ Portal drops (PortalDrop)
 //! ```
 //!
-//! `with_xact`'s `StartTransactionCommand` creates a fresh
-//! `TopTransactionContext` and switches `CurrentMemoryContext`
-//! into it; `CommitTransactionCommand` deletes it. Per-statement
-//! analyze/plan transients land in `TopTransactionContext` and
-//! are freed automatically at end-of-statement. This matches
-//! vanilla `exec_simple_query`'s memory discipline — no
-//! framework-owned per-statement context is needed.
+//! Memory + snapshot discipline mirrors vanilla
+//! `exec_simple_query`
+//! ([postgres.c:1180-1235](../../../../../postgres/src/backend/tcop/postgres.c#L1180)):
+//! the parsetree, querytree, and plantree all live in
+//! `parse_ctx` (a `TopMemoryContext` child — vanilla's
+//! `MessageContext` parent), independent of the per-statement
+//! xact's `TopTransactionContext`. `parse_ctx` outlives all
+//! per-statement `Commit`/`Abort` calls and is freed when
+//! `ParsedQuery` drops at end-of-`'Q'`. See
+//! [pg_code.md §2.5](../../../../../postgres/extdocs/background/pg_code.md#25-memory-context-discipline)
+//! for the equivalence framing.
+//!
+//! `TBLOCK_ABORT` handling: the §6.3 pre-check rejects every
+//! non-exit parsetree with SQLSTATE `25P02` (matches vanilla
+//! [postgres.c:1058-1063](../../../../../postgres/src/backend/tcop/postgres.c#L1058));
+//! exit statements (`COMMIT` / `ROLLBACK` / `PREPARE TRANSACTION`
+//! / `ROLLBACK TO SAVEPOINT`) flow through the normal portal
+//! path. `analyze_requires_snapshot(TransactionStmt)` returns
+//! `false`, so `with_xact(false, ...)` skips the
+//! `GetTransactionSnapshot` Push that would assert from
+//! `TBLOCK_ABORT`. Recovery is automatic via the normal
+//! `ProcessUtility(TransactionStmt)` codepath inside `PortalRun`,
+//! same as vanilla — no SPI-bridge intercept needed.
 
 use std::ffi::{CStr, CString};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -110,11 +131,26 @@ pub(crate) fn parse_and_keep(query: &str) -> PgWireResult<ParsedQuery<'_>> {
     let cstr = CString::new(query)
         .map_err(|_| generic_error("pg_transport", "query string contains a NUL byte"))?;
 
-    // Create parse_ctx as a child of whatever the current
-    // MessageContext is (typically the bgworker top-level loop
-    // context). It outlives this function via the returned
-    // ParsedQuery.
-    let parse_ctx = ScopedMemoryContext::new(c"pg_transport_parse_ctx");
+    // Create parse_ctx as a child of `TopMemoryContext` —
+    // never a child of `CurrentMemoryContext`. Mirrors vanilla
+    // `exec_simple_query`'s `MessageContext` parent
+    // ([postgres.c:1058](../../../../../postgres/src/backend/tcop/postgres.c#L1058)
+    // — `MessageContext = AllocSetContextCreate(TopMemoryContext, ...)`).
+    //
+    // Rationale: callers may enter `execute_simple_query_direct`
+    // with `CurrentMemoryContext == TransactionAbortContext`
+    // (when the previous `'Q'` aborted and the wire layer hasn't
+    // run any cleanup). Anchoring `parse_ctx` to
+    // `TransactionAbortContext` is wrong: a subsequent
+    // `CommitTransactionCommand` reaches `AtCleanup_Memory`,
+    // which calls `MemoryContextReset(TransactionAbortContext)`,
+    // which in turn `MemoryContextDeleteChildren` deletes our
+    // `parse_ctx` out from under us. The Drop's
+    // `MemoryContextDelete` then double-frees. `TopMemoryContext`
+    // is the slot-lifetime root and never gets reset under us.
+    let parse_ctx = unsafe {
+        ScopedMemoryContext::new_child(pg_sys::TopMemoryContext, c"pg_transport_parse_ctx")
+    };
 
     let outcome: Result<Vec<(usize, usize, *mut pg_sys::RawStmt)>, CaughtError> =
         PgTryBuilder::new(AssertUnwindSafe(|| {
@@ -353,17 +389,14 @@ pub fn execute_simple_query_direct(query: &str) -> PgWireResult<Vec<Response>> {
         }
         let raw_stmt = *raw_stmt;
         // §6.3 — Aborted-block rejection. Must fire BEFORE
-        // `with_xact` because `with_xact`'s prologue does
-        // `PushActiveSnapshot(GetTransactionSnapshot())`, and
-        // `GetTransactionSnapshot` from `TBLOCK_ABORT` walks
-        // into a PG-side assert / SIGABRT (mirrors why vanilla
-        // checks at [postgres.c:1058-1063](../../../../../postgres/src/backend/tcop/postgres.c#L1058-L1063)
-        // *after* `start_xact_command` but *before* any
-        // analyze / push call). Reject every non-exit
-        // parsetree in aborted state with SQLSTATE `25P02`
-        // and leave the block sticky for the client to clean
-        // up via `COMMIT` / `ROLLBACK` / `PREPARE` /
-        // `ROLLBACK TO`.
+        // `with_xact` even though `with_xact`'s Push is gated
+        // (§6.4): vanilla also performs this check before
+        // `start_xact_command` reaches the body, see
+        // [postgres.c:1058-1063](../../../../../postgres/src/backend/tcop/postgres.c#L1058-L1063).
+        // Rejecting non-exit parsetrees with SQLSTATE `25P02`
+        // matches vanilla's user-visible behaviour and leaves
+        // the block sticky for the client to clean up via
+        // `COMMIT` / `ROLLBACK` / `PREPARE` / `ROLLBACK TO`.
         //
         // SAFETY: `IsAbortedTransactionBlockState` is a pure
         // read of `CurrentTransactionState->blockState`; safe
@@ -373,11 +406,28 @@ pub fn execute_simple_query_direct(query: &str) -> PgWireResult<Vec<Response>> {
         {
             return Err(aborted_transaction_block_error());
         }
+        // §6.4 — `analyze_requires_snapshot` gating. Mirrors
+        // vanilla `exec_simple_query` at
+        // [postgres.c:1191-1195](../../../../../postgres/src/backend/tcop/postgres.c#L1191).
+        // `with_xact(false, ...)` is the only safe entry from
+        // `TBLOCK_ABORT` because `GetTransactionSnapshot` from
+        // that state asserts; passing `analyze_requires_snapshot`
+        // makes that gate fall out naturally
+        // (`TransactionStmt` / `SET` / `SHOW` / …  return
+        // `false`; `SELECT` / DML / `EXPLAIN` / `DECLARE CURSOR`
+        // / `CTAS` / `CALL` return `true`).
+        //
+        // SAFETY: `analyze_requires_snapshot` is a pure walk of
+        // the parsetree; raw_stmt lives in `parsed.parse_ctx`.
+        let needs_snapshot = unsafe { pg_sys::analyze_requires_snapshot(raw_stmt) };
         // Borrow sql_cstr for the closure's lifetime; raw_stmt
         // is alive as long as parsed.parse_ctx is, and with_xact
         // runs the closure to completion synchronously.
         let sql_cstr_ref: &CStr = parsed.sql_cstr.as_c_str();
-        let resp = with_xact(|ctx| run_one_direct(ctx, raw_stmt, sql_cstr_ref))?;
+        let parse_ctx_ptr = parsed.parse_ctx.as_ptr();
+        let resp = with_xact(needs_snapshot, |ctx| {
+            run_one_direct(ctx, raw_stmt, sql_cstr_ref, parse_ctx_ptr, needs_snapshot)
+        })?;
         responses.push(resp);
     }
     // _guard drops here, restoring debug_query_string and
@@ -486,6 +536,7 @@ fn execute_with_implicit_block(parsed: &ParsedQuery<'_>) -> PgWireResult<Vec<Res
     );
     let last_idx = non_empty.len() - 1;
     let sql_cstr_ref: &CStr = parsed.sql_cstr.as_c_str();
+    let parse_ctx_ptr = parsed.parse_ctx.as_ptr();
 
     let body_outcome = catch_unwind(AssertUnwindSafe(|| {
         let mut responses = Vec::with_capacity(non_empty.len());
@@ -512,6 +563,22 @@ fn execute_with_implicit_block(parsed: &ParsedQuery<'_>) -> PgWireResult<Vec<Res
             {
                 return Err(aborted_transaction_block_error());
             }
+            // §6.4 — `analyze_requires_snapshot` gating
+            // (per-iter). Mirrors vanilla
+            // [postgres.c:1191-1195](../../../../../postgres/src/backend/tcop/postgres.c#L1191):
+            // only `Push` when analyze actually needs a
+            // transaction snapshot. `TransactionStmt` /
+            // `SET` / `SHOW` / etc. return `false`; SELECT/DML/
+            // EXPLAIN/CALL/CTAS return `true`. From
+            // `TBLOCK_ABORT` (last iter saw a `COMMIT`/
+            // `ROLLBACK` that recovered the block), this is
+            // also what keeps us from calling
+            // `GetTransactionSnapshot` (which would assert).
+            //
+            // SAFETY: `analyze_requires_snapshot` is a pure
+            // walk of the parsetree.
+            let needs_snapshot = unsafe { pg_sys::analyze_requires_snapshot(raw_stmt) };
+
             // SAFETY: all calls are PG server-API entry points;
             // StartTransactionCommand / BeginImplicitTransactionBlock
             // are idempotent on already-open xact / implicit block.
@@ -519,16 +586,21 @@ fn execute_with_implicit_block(parsed: &ParsedQuery<'_>) -> PgWireResult<Vec<Res
                 pg_sys::SetCurrentStatementStartTimestamp();
                 pg_sys::StartTransactionCommand();
                 pg_sys::BeginImplicitTransactionBlock();
-                pg_sys::PushActiveSnapshot(pg_sys::GetTransactionSnapshot());
+                if needs_snapshot {
+                    pg_sys::PushActiveSnapshot(pg_sys::GetTransactionSnapshot());
+                }
             }
             let ctx = XactCtx::new();
-            let resp = run_one_direct(&ctx, raw_stmt, sql_cstr_ref);
-            // SAFETY: matched Push above. If run_one_direct
-            // panic'd we'd never reach here; the outer catch_unwind
-            // catches and AbortCurrentTransaction drains the
-            // snapshot stack itself.
-            unsafe {
-                pg_sys::PopActiveSnapshot();
+            let resp = run_one_direct(&ctx, raw_stmt, sql_cstr_ref, parse_ctx_ptr, needs_snapshot);
+            // SAFETY: matched Push above (only if pushed). If
+            // run_one_direct panic'd we'd never reach here;
+            // the outer catch_unwind catches and
+            // AbortCurrentTransaction drains the snapshot
+            // stack itself.
+            if needs_snapshot {
+                unsafe {
+                    pg_sys::PopActiveSnapshot();
+                }
             }
             let resp = resp?;
             responses.push(resp);
@@ -593,22 +665,49 @@ fn execute_with_implicit_block(parsed: &ParsedQuery<'_>) -> PgWireResult<Vec<Res
 ///    Rust-side `Vec<DataRow>`; pgwire consumes that vec after
 ///    we return.
 ///
-/// Memory-context discipline: relies on [`with_xact`]'s
-/// `StartTransactionCommand` having switched
-/// `CurrentMemoryContext` to a fresh `TopTransactionContext`.
-/// Everything `pg_analyze_and_rewrite_fixedparams` and
-/// `pg_plan_queries` `palloc` lands there;
-/// `CommitTransactionCommand` (called by `with_xact` on the way
-/// out) deletes the context, freeing those transients without
-/// an explicit per-statement `AllocSetContextCreateInternal` +
-/// `MemoryContextDelete` pair. `PortalDefineQuery` copies what
-/// it needs onto the portal's own independent context, so
-/// `PortalRun` is unaffected by the TopTransactionContext
-/// teardown.
+/// Memory-context discipline (mirrors vanilla
+/// [postgres.c:1180-1205](../../../../../postgres/src/backend/tcop/postgres.c#L1180)
+/// and [pg_code.md §2.5](../../../../../postgres/extdocs/background/pg_code.md#25-memory-context-discipline)):
+/// `parse_ctx` (TopMemoryContext child, owned by the caller's
+/// [`ParsedQuery`]) is the `MessageContext`-equivalent here.
+/// We switch `CurrentMemoryContext` into it for analyze + plan
+/// so the querytree / plantree land there — NOT in
+/// `TopTransactionContext` — exactly matching vanilla's comment
+/// at [postgres.c:1186-1190](../../../../../postgres/src/backend/tcop/postgres.c#L1186)
+/// (*"these can't be in the transaction context, as that will
+/// get reset when the command is COMMIT/ROLLBACK"*). Critical
+/// for `TBLOCK_ABORT` entry: `StartTransactionCommand` from
+/// `TBLOCK_ABORT` is a no-op and leaves `CurrentMemoryContext`
+/// at `TransactionAbortContext` (a tiny sibling not meant for
+/// normal allocations), so an unconditional palloc here would
+/// be wrong. We restore `CurrentMemoryContext` before
+/// `PortalRun` so the executor's per-scan allocations land in
+/// whatever PG picks for that path (typically the portal's own
+/// `PortalContext`).
+///
+/// `needs_snapshot` mirrors vanilla
+/// `analyze_requires_snapshot(parsetree)`
+/// ([postgres.c:1191](../../../../../postgres/src/backend/tcop/postgres.c#L1191)):
+/// callers pass the same value they passed to [`with_xact`],
+/// so the Push that happens inside `with_xact` is paired
+/// with the analyze/plan that actually needs it. `with_xact`
+/// has already Pushed (if needed) by the time we enter here,
+/// so we don't Pop before `PortalStart` (vanilla does, then
+/// `PortalStart(InvalidSnapshot)` reacquires for
+/// `PORTAL_ONE_SELECT`; we skip the Pop because `PortalStart`
+/// happily uses the existing active snapshot). We pass
+/// `InvalidSnapshot` to `PortalStart` regardless to match
+/// vanilla's [postgres.c:1235](../../../../../postgres/src/backend/tcop/postgres.c#L1235)
+/// — for utility statements (`PORTAL_MULTI_QUERY`) this is the
+/// only safe value (no snapshot has been Pushed and none is
+/// needed); for `PORTAL_ONE_SELECT` `PortalStart` falls back
+/// to `GetActiveSnapshot` internally.
 fn run_one_direct(
     ctx: &XactCtx,
     raw_stmt: *mut pg_sys::RawStmt,
     sql_cstr: &CStr,
+    parse_ctx: pg_sys::MemoryContext,
+    _needs_snapshot: bool,
 ) -> PgWireResult<Response> {
     // 1. Command tag from the raw parsetree. Matches
     //    exec_simple_query, which calls CreateCommandTag before
@@ -622,11 +721,18 @@ fn run_one_direct(
     // by safe Rust after PortalDrop ran (Portal drops at end of
     // the unsafe block).
     let (schema, encoders, qc, data_rows) = unsafe {
-        // 2. Analyze + rewrite (no client-side type hints in
+        // 2. Switch into `parse_ctx` for analyze + plan. Mirrors
+        //    vanilla's `oldcontext = MemoryContextSwitchTo(MessageContext)`
+        //    at [postgres.c:1199-1205](../../../../../postgres/src/backend/tcop/postgres.c#L1199).
+        //    `parse_ctx` is a `TopMemoryContext` child (see
+        //    `parse_and_keep`), so it survives any xact
+        //    Commit/Abort that happens between the Push above
+        //    and PortalDrop below. Restored before PortalRun.
+        let prev_ctx = pg_sys::MemoryContextSwitchTo(parse_ctx);
+
+        // 3. Analyze + rewrite (no client-side type hints in
         //    simple-query; pass NULL/0/NULL). Output querytree
-        //    list is palloc'd in CurrentMemoryContext =
-        //    TopTransactionContext (set by with_xact's
-        //    StartTransactionCommand).
+        //    list is palloc'd in `parse_ctx`.
         let query_list = pg_sys::pg_analyze_and_rewrite_fixedparams(
             raw_stmt,
             sql_cstr.as_ptr(),
@@ -635,8 +741,8 @@ fn run_one_direct(
             std::ptr::null_mut(), // queryEnv
         );
 
-        // 3. Plan. Same call shape as exec_simple_query. Output
-        //    PlannedStmt list also lands in TopTransactionContext.
+        // 4. Plan. Same call shape as exec_simple_query. Output
+        //    `PlannedStmt` list also lands in `parse_ctx`.
         let plan_list = pg_sys::pg_plan_queries(
             query_list,
             sql_cstr.as_ptr(),
@@ -644,25 +750,43 @@ fn run_one_direct(
             std::ptr::null_mut(), // boundParams
         );
 
-        // 4. Portal lifecycle via the existing wrapper. Portal's
-        //    own MemoryContext is independent of
-        //    TopTransactionContext; PortalDefineQuery copies
-        //    what it needs onto it.
+        // 5. Portal lifecycle via the existing wrapper. Portal's
+        //    own MemoryContext is independent of `parse_ctx`;
+        //    PortalDefineQuery references plan_list directly
+        //    (vanilla comment at [postgres.c:1226-1230](../../../../../postgres/src/backend/tcop/postgres.c#L1226):
+        //    *"we don't have to copy anything into the portal,
+        //    because everything we are passing here is in
+        //    MessageContext"* — same for us, modulo s/MessageContext/parse_ctx/).
         let portal = Portal::create_anonymous(ctx);
         portal.define(sql_cstr, command_tag, plan_list, std::ptr::null_mut());
 
-        // 5. Start. with_xact already PushActiveSnapshot'd;
-        //    PortalStart records it on the QueryDesc and
-        //    populates portal->tupDesc as a side effect (we read
-        //    it next). PortalRun later pushes its own active
-        //    snapshot per scan internally for SELECT — nested
-        //    push/pop is fine (matches the extended-query direct
-        //    backend).
-        portal.start(&ParamList::empty(), 0, pg_sys::GetActiveSnapshot());
+        // 6. Restore `CurrentMemoryContext` to what we entered
+        //    with (mirrors vanilla
+        //    [postgres.c:1283](../../../../../postgres/src/backend/tcop/postgres.c#L1283)
+        //    `MemoryContextSwitchTo(oldcontext);` before
+        //    `PortalRun`). The portal references plan_list in
+        //    `parse_ctx`; PortalRun's per-scan allocations land
+        //    elsewhere (typically the portal's own context).
+        pg_sys::MemoryContextSwitchTo(prev_ctx);
 
-        // 6. Pick the result format. Mirrors vanilla
+        // 7. Start with `InvalidSnapshot` — matches vanilla
+        //    [postgres.c:1235](../../../../../postgres/src/backend/tcop/postgres.c#L1235).
+        //    For `PORTAL_ONE_SELECT`, `PortalStart` calls
+        //    `GetActiveSnapshot` itself (or `GetTransactionSnapshot`
+        //    if none is active); for `PORTAL_MULTI_QUERY` it
+        //    doesn't need one — utility statements push their
+        //    own as needed inside `ProcessUtility`. Removes
+        //    pg_transport's previous (pg_code.md §2.2.6) divergence
+        //    from vanilla.
+        portal.start(
+            &ParamList::empty(),
+            0,
+            std::ptr::null_mut::<pg_sys::SnapshotData>(),
+        );
+
+        // 8. Pick the result format. Mirrors vanilla
         //    `exec_simple_query` at
-        //    [postgres.c:1259-1273](../../../../../postgres/src/backend/tcop/postgres.c#L1259-L1273):
+        //    [postgres.c:1259-1273](../../../../../postgres/src/backend/tcop/postgres.c#L1259):
         //    `FETCH` from a `DECLARE … BINARY CURSOR` promotes
         //    the *whole* result set to binary; everything else
         //    stays text (the `'Q'` protocol has no per-column
@@ -670,7 +794,7 @@ fn run_one_direct(
         //    Text in every non-FETCH-binary case.
         let result_format = fetch_result_format(raw_stmt);
 
-        // 7. Schema + per-column encoders from the now-populated
+        // 9. Schema + per-column encoders from the now-populated
         //    portal->tupDesc. NULL tupdesc → utility / no-tuple
         //    statement → empty schema, no encoders.
         let tupdesc = TupleDescRef::from_raw((*portal.as_ptr()).tupDesc);
@@ -679,7 +803,7 @@ fn run_one_direct(
             None => (Vec::new(), Vec::new()),
         };
 
-        // 8. Execute. Per-row encoding happens inside the
+        // 10. Execute. Per-row encoding happens inside the
         //    receiver's receiveSlot callback, which appends to
         //    `data_rows`. Pre-size to a modest default so a typical
         //    multi-row SELECT doesn't pay the 0→4→8→16 geometric
@@ -698,7 +822,7 @@ fn run_one_direct(
             &mut qc,
         );
 
-        // 9. portal drops here (PortalDrop on scope exit),
+        // 11. portal drops here (PortalDrop on scope exit),
         //    tearing down executor state and freeing the portal's
         //    MemoryContext. dest also drops; its rows/encoders
         //    borrow ends.
