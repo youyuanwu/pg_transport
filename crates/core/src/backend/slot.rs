@@ -268,27 +268,49 @@ fn cleanup_per_slot_state() {
 ///   handoff on the same slot, which historically reproduced as
 ///   `ERROR: unrecognized node type: 0x7F7F7F7F` (a use-after-free
 ///   in the direct backend's plan cache) under e2e parallelism.
+/// * **Prepared statements** — `pg_sys::DropAllPreparedStatements()`
+///   walks PG's session-level `prepared_queries` hashtable
+///   (shared between SQL-level `PREPARE name AS …` /
+///   `DEALLOCATE` and wire-protocol Parse messages with
+///   non-empty `statement_name`) and `DropCachedPlan`s every
+///   entry. Without this, a client A that issues
+///   `PREPARE foo AS SELECT 7` and disconnects leaves `foo`
+///   visible to whichever client lands on the same slot next —
+///   the slot survives across handoffs, so the registry does
+///   too. Vanilla PG hides this because the backend `proc_exit`s
+///   between sessions. Regression coverage:
+///   `extended_query_per_handoff_state_isolation` in the e2e
+///   suite (10/10 fail pre-fix, deterministic when the test
+///   runs in isolation; sometimes hidden in the full suite by
+///   connection-routing landing client B on a different slot).
 ///
 /// Future scope (phase ≥ 9.5):
-/// * SQL-level prepared statements (`DropAllPreparedStatements`).
 /// * Temp namespace cleanup.
 /// * Cursors / portals not already torn down by pgwire's drop.
+/// * `LISTEN` channel cleanup.
 ///
-/// SAFETY: `AbortOutOfAnyTransaction` and `ResetAllOptions` are
-/// both callable from any backend with the basic transam +
-/// GUC machinery initialised (we are — `connect_worker_to_spi`
-/// ran at slot boot). They may `ereport(ERROR)` if a check_hook
-/// fails on a default value, which pgrx surfaces as a Rust panic
-/// the slot's `#[pg_guard]` boundary catches; the panic propagates
-/// out of `run_slot`, the bgworker exits, and the FE's reader
-/// observes EOF and removes the slot. No state corruption.
+/// SAFETY: `AbortOutOfAnyTransaction`, `ResetAllOptions`, and
+/// `DropAllPreparedStatements` are all callable from any backend
+/// with the basic transam + GUC machinery initialised (we are —
+/// `connect_worker_to_spi` ran at slot boot).
+/// `DropAllPreparedStatements` is a pure walk of
+/// `prepared_queries`, no catalog access, no xact required.
+/// `AbortOutOfAnyTransaction` / `ResetAllOptions` may
+/// `ereport(ERROR)` if a check_hook fails on a default value,
+/// which pgrx surfaces as a Rust panic the slot's `#[pg_guard]`
+/// boundary catches; the panic propagates out of `run_slot`,
+/// the bgworker exits, and the FE's reader observes EOF and
+/// removes the slot. No state corruption.
 fn reset_per_handoff_state() {
     // SAFETY: see fn doc. Order matters: abort the xact first
     // (which restores TBLOCK_DEFAULT and frees the per-xact
-    // MemoryContext) so the subsequent GUC reset doesn't run
-    // against a half-collapsed xact context.
+    // MemoryContext) so the subsequent steps don't run against
+    // a half-collapsed xact context. `DropAllPreparedStatements`
+    // is sequenced before `ResetAllOptions` only by convention
+    // (the two are independent); both happen at `TBLOCK_DEFAULT`.
     unsafe {
         pg_sys::AbortOutOfAnyTransaction();
+        pg_sys::DropAllPreparedStatements();
         pg_sys::ResetAllOptions();
     }
 }
