@@ -98,7 +98,7 @@ impl SpiCtx {
     /// that opens and closes an SPI session per iteration, without
     /// `with_spi`'s nested `catch_unwind` + `AbortCurrentTransaction`
     /// (which would collapse the outer implicit block on the very
-    /// first ERROR — defeating the §6.2 fix).
+    /// first ERROR — defeating multi-statement atomicity).
     pub(super) fn new() -> Self {
         Self {
             _marker: PhantomData,
@@ -568,8 +568,8 @@ impl TypeReceive {
 /// lookup — on *every cell*. Matches vanilla
 /// [`printtup_prepare_info`](../../../../../postgres/src/backend/access/common/printtup.c#L251)
 /// and the [`printtup` hot loop](../../../../../postgres/src/backend/access/common/printtup.c#L361);
-/// closes the per-cell syscache cost called out in
-/// [review §3.1.1](../../../../docs/design/reviews/2026-05-24-pg-code-findings.md).
+/// see
+/// [docs/design/deferred/simple-query-direct-path.md §8.1](../../../../docs/design/deferred/simple-query-direct-path.md#81-per-column-fmgrinfo-cache).
 ///
 /// **Lifetime / context invariant.** `fmgr_info` writes
 /// `fn_mcxt = CurrentMemoryContext` into the FmgrInfo at
@@ -677,7 +677,7 @@ pub fn generic_error(prefix: &str, message: &str) -> PgWireError {
 /// `pg_sys::IsAbortedTransactionBlockState()` **and** a parsetree
 /// inspection (the "not an exit stmt" half of vanilla's
 /// `IsTransactionExitStmt` predicate) — see the per-backend
-/// dispatchers for the shape. Closes review 2026-05-24 §6 item 3.
+/// dispatchers for the shape.
 ///
 /// Why this exists as a shared helper: both backends raise the
 /// same wire frame from per-statement dispatchers that live in

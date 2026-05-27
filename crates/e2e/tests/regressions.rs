@@ -4,11 +4,8 @@
 //!
 //! Each entry should:
 //!
-//!   * Cite the audit / issue / PR the gap or regression
-//!     originated from.
-//!   * State plainly which outcome it currently asserts (the
-//!     buggy shape, the fixed shape, or a moving-window post-fix
-//!     assertion).
+//!   * Cite the design doc section the property comes from.
+//!   * State plainly which outcome it currently asserts.
 //!   * If `#[ignore]`-gated, explain *why* — typically because
 //!     the reproducer takes the cluster down or otherwise
 //!     poisons sibling tests, and document the rename / flip
@@ -35,99 +32,54 @@
 //!
 //! # Index of regressions
 //!
-//! ## §6.3 — Aborted-block rejection (CLOSED)
+//! ## Aborted-block rejection (SQLSTATE `25P02`)
 //!
-//! `aborted_block_*_backend_returns_25p02` —
-//! Review 2026-05-24 §6 item 3. After a statement raises
-//! `ERROR` inside an explicit `BEGIN` block, vanilla PG moves
-//! the xact state to `TBLOCK_ABORT` and rejects every
-//! subsequent non-`TransactionStmt` with SQLSTATE `25P02`
-//! ("current transaction is aborted, commands ignored until
-//! end of transaction block" —
+//! `aborted_block_*_backend_returns_25p02` — pins the property
+//! described in
+//! [docs/design/deferred/simple-query-direct-path.md §7.4](../../../docs/design/deferred/simple-query-direct-path.md#74-aborted-block-rejection-sqlstate-25p02).
+//! After a statement raises `ERROR` inside an explicit `BEGIN`
+//! block, vanilla PG moves the xact state to `TBLOCK_ABORT`
+//! and rejects every subsequent non-`TransactionStmt` with
+//! SQLSTATE `25P02` ("current transaction is aborted, commands
+//! ignored until end of transaction block" —
 //! `ERRCODE_IN_FAILED_SQL_TRANSACTION`). The aborted block
 //! stays sticky until the client sends `COMMIT` / `ROLLBACK` /
 //! `PREPARE TRANSACTION` / `ROLLBACK TO`.
 //!
-//! Originally pinned as `aborted_block_*_silently_clears_abort`
-//! (asserting the buggy succeed-anyway behaviour, `#[ignore]`-
-//! gated because the slot `SIGABRT`'d on the second statement —
-//! the audit doc's "AbortCurrentTransaction collapses state to
-//! DEFAULT" claim was wrong; the abort actually moves state to
-//! `TBLOCK_ABORT` and the next statement walks into a PG-side
-//! assert on `GetTransactionSnapshot`).
-//!
-//! The fix adds an `IsAbortedTransactionBlockState()` check at
-//! the top of the per-statement dispatch loops in both backends,
-//! firing *before* any `PushActiveSnapshot(GetTransactionSnapshot())`
-//! call. The check raises `25P02` for every parsetree that isn't
-//! in vanilla's `IsTransactionExitStmt` set
-//! (`COMMIT` / `ROLLBACK` / `PREPARE TRANSACTION` /
-//! `ROLLBACK TO`) — for the SPI backend we currently only
-//! recognise the first two as exit, slightly over-strict for
-//! `PREPARE` / `ROLLBACK TO` (which aren't in our `XactCmd`
-//! classification yet). Documented in
+//! Both backends gate the per-statement dispatch loop on
+//! `IsAbortedTransactionBlockState()` *before* any
+//! `PushActiveSnapshot(GetTransactionSnapshot())` call (which
+//! would assert from `TBLOCK_ABORT`). For the SPI backend the
+//! `IsTransactionExitStmt`-equivalent classification only
+//! recognises `COMMIT` / `ROLLBACK` as exits (over-strict for
+//! `PREPARE` / `ROLLBACK TO` which aren't in our `XactCmd`
+//! classification yet); documented in
 //! `spi_bridge::is_xact_exit_stmt`.
 //!
-//! The companion piece is the per-handoff
-//! `AbortOutOfAnyTransaction` call now in
-//! [`backend::slot::reset_per_handoff_state`](crate::backend::slot):
-//! when a client disconnects mid-aborted-block (e.g. the test
-//! here doesn't issue an explicit `ROLLBACK` after the 25P02
-//! reject), the slot self-recovers to `TBLOCK_DEFAULT` for the
-//! next handoff. This is one of the two paths through which the
-//! direct backend recovers from `TBLOCK_ABORT`; the §6.4 path
-//! below covers the other (explicit `ROLLBACK` then continue on
-//! the same connection).
+//! Companion piece: `reset_per_handoff_state` calls
+//! `AbortOutOfAnyTransaction` between handoffs, so a client
+//! that disconnects mid-aborted-block (e.g. this test doesn't
+//! issue an explicit `ROLLBACK` after the 25P02 reject) leaves
+//! the slot recovering to `TBLOCK_DEFAULT` for the next
+//! handoff.
 //!
-//! These tests are no longer `#[ignore]`-gated — they run by
-//! default and assert `PostAbortOutcome::Rejected("25P02")`. A
-//! regression to the pre-fix behaviour would either return
-//! `Succeeded("42")` (check bypassed) or take the cluster down
-//! (check missing).
-//!
-//! ## §6.4 — `analyze_requires_snapshot` gating (closed)
+//! ## Wire-level `ROLLBACK` from `TBLOCK_ABORT` (direct backend)
 //!
 //! `aborted_block_direct_backend_wire_rollback_succeeds` —
-//! Review 2026-05-24 §6 item 4. A wire-level `ROLLBACK` issued
-//! from `TBLOCK_ABORT` on the **direct** backend now returns
-//! cleanly, *and* a subsequent `SELECT` on the same connection
-//! also returns cleanly. Pre-fix the `ROLLBACK` itself
-//! `SIGABRT`'d the slot because `ROLLBACK` is in vanilla's
-//! `IsTransactionExitStmt` set, so the §6.3 check allowed it
-//! through, and it then fell into `with_xact` whose prologue
-//! unconditionally called
-//! `PushActiveSnapshot(GetTransactionSnapshot())`, which
-//! assert-fires from `TBLOCK_ABORT`.
-//!
-//! The fix mirrors vanilla `exec_simple_query`
-//! ([postgres.c:1180-1235](../../../../../postgres/src/backend/tcop/postgres.c#L1180))
-//! along three axes:
-//!
-//!   1. **Snapshot gating.** `with_xact(needs_snapshot, body)`
-//!      gates the prologue `Push` on
-//!      `analyze_requires_snapshot(parsetree)`. For
-//!      `TransactionStmt` (and every other utility-class
-//!      parsetree) it returns `false`, so the `Push` is elided
-//!      and `TBLOCK_ABORT` never reaches
-//!      `GetTransactionSnapshot`.
-//!   2. **`PortalStart(InvalidSnapshot)`.** Matches
-//!      [postgres.c:1235](../../../../../postgres/src/backend/tcop/postgres.c#L1235);
-//!      `PortalStart` picks its own snapshot policy per
-//!      portal-strategy (utility statements get none).
-//!   3. **Memory-context discipline.** `parse_ctx` is now a
-//!      `TopMemoryContext` child (matches vanilla
-//!      `MessageContext`'s parent), not a
-//!      `CurrentMemoryContext` child. Analyze + plan run with
-//!      `CurrentMemoryContext` switched into `parse_ctx`, so
-//!      querytree / plantree allocations land there (not in
-//!      `TopTransactionContext`). Documented framing:
-//!      [pg_code.md §2.5](../../../../../postgres/extdocs/background/pg_code.md#25-memory-context-discipline).
-//!
-//! With those three in place there's no need for the previous
-//! `handle_xact_control_one` short-circuit — the normal
-//! analyze + plan + `ProcessUtility(TransactionStmt)` path
-//! handles `TBLOCK_ABORT` `ROLLBACK` exactly the way vanilla
-//! does.
+//! pins the per-statement snapshot gating + memory-context
+//! discipline described in
+//! [docs/design/deferred/simple-query-direct-path.md §7.3](../../../docs/design/deferred/simple-query-direct-path.md#73-per-statement-snapshot-gating)
+//! and [§4](../../../docs/design/deferred/simple-query-direct-path.md#4-memory-context-discipline).
+//! A wire-level `ROLLBACK` issued from `TBLOCK_ABORT` on the
+//! direct backend returns cleanly, *and* a subsequent `SELECT`
+//! on the same connection also returns cleanly. The path
+//! exercises every axis of the vanilla `exec_simple_query`
+//! parity for the direct backend: snapshot gating
+//! (`analyze_requires_snapshot` returns `false` for
+//! `TransactionStmt`, so the `Push` is elided),
+//! `PortalStart(InvalidSnapshot)`, and `parse_ctx` anchored to
+//! `TopMemoryContext` so analyze/plan transients survive any
+//! per-statement xact `Commit`/`Abort`.
 
 use anyhow::Result;
 use e2e::{Cluster, first_text_cell};
@@ -136,13 +88,12 @@ use e2e::{Cluster, first_text_cell};
 /// → `SELECT 42` scenario:
 ///
 ///  * `Succeeded(text)` — pg_transport ran the post-error
-///    `SELECT` to completion. Pre-§6.3-fix this happened
-///    sometimes (and the slot usually `SIGABRT`'d on the
-///    `GetTransactionSnapshot` path immediately after); post-
-///    fix it should never happen.
+///    `SELECT` to completion. Would mean the
+///    `IsAbortedTransactionBlockState()` check has been
+///    bypassed; the slot will typically `SIGABRT` shortly after
+///    on the `GetTransactionSnapshot` path.
 ///  * `Rejected(sqlstate)` — pg_transport returned a wire ERROR
-///    instead of running the SELECT. Post-§6.3-fix this is
-///    `"25P02"`.
+///    instead of running the SELECT. Expected: `"25P02"`.
 #[derive(Debug)]
 enum PostAbortOutcome {
     Succeeded(String),
@@ -183,9 +134,8 @@ async fn observe_post_abort_query(backend: &str) -> Result<PostAbortOutcome> {
     let probe = client.simple_query("SELECT 42::text").await;
 
     // No explicit `ROLLBACK` cleanup here — these tests pin the
-    // §6.3 *rejection* behaviour, not the §6.4 wire-level
-    // recovery path. The wire-level `ROLLBACK` after the abort
-    // is exercised by
+    // *rejection* behaviour, not the wire-level recovery path.
+    // The wire-level `ROLLBACK` after the abort is exercised by
     // `aborted_block_direct_backend_wire_rollback_succeeds`
     // below. The slot's `reset_per_handoff_state` calls
     // `AbortOutOfAnyTransaction` after `client` drops, so the
@@ -210,10 +160,8 @@ async fn observe_post_abort_query(backend: &str) -> Result<PostAbortOutcome> {
 
 #[tokio::test]
 async fn aborted_block_direct_backend_returns_25p02() -> Result<()> {
-    // POST-FIX REGRESSION on review 2026-05-24 §6 item 3
-    // (backend=direct). The pre-Push
-    // `IsAbortedTransactionBlockState()` check in the per-
-    // statement dispatch loop of `execute_simple_query_direct`
+    // The pre-Push `IsAbortedTransactionBlockState()` check in the
+    // per-statement dispatch loop of `execute_simple_query_direct`
     // (and in `execute_with_implicit_block`'s per-iter loop)
     // rejects every non-exit statement in `TBLOCK_ABORT` with
     // SQLSTATE `25P02` — mirroring vanilla `exec_simple_query`
@@ -228,17 +176,17 @@ async fn aborted_block_direct_backend_returns_25p02() -> Result<()> {
     match outcome {
         PostAbortOutcome::Rejected(code) => assert_eq!(
             code, "25P02",
-            "REGRESSION on §6.3 (backend=direct): post-abort \
-             SELECT was rejected with SQLSTATE {code:?} but vanilla \
-             / our fix raises 25P02 (in_failed_sql_transaction). \
-             The dispatch loop's IsAbortedTransactionBlockState() \
-             check in `execute_simple_query_direct` / \
+            "backend=direct: post-abort SELECT was rejected with \
+             SQLSTATE {code:?} but vanilla raises 25P02 \
+             (in_failed_sql_transaction). The dispatch loop's \
+             IsAbortedTransactionBlockState() check in \
+             `execute_simple_query_direct` / \
              `execute_with_implicit_block` may be returning a \
              different error type."
         ),
         PostAbortOutcome::Succeeded(val) => panic!(
-            "REGRESSION on §6.3 (backend=direct): post-abort SELECT \
-             ran to completion and returned {val:?}. The \
+            "backend=direct: post-abort SELECT ran to completion \
+             and returned {val:?}. The \
              IsAbortedTransactionBlockState() check is missing or \
              unreachable; the slot will SIGABRT on the next \
              non-trivial post-abort statement."
@@ -249,8 +197,7 @@ async fn aborted_block_direct_backend_returns_25p02() -> Result<()> {
 
 #[tokio::test]
 async fn aborted_block_spi_backend_returns_25p02() -> Result<()> {
-    // POST-FIX REGRESSION on review 2026-05-24 §6 item 3
-    // (backend=spi). Same shape as the direct-backend test: the
+    // Same shape as the direct-backend test: the
     // `IsAbortedTransactionBlockState()` check at the top of
     // `execute_one_statement` (and in
     // `execute_with_implicit_block_spi`'s per-iter loop)
@@ -262,26 +209,26 @@ async fn aborted_block_spi_backend_returns_25p02() -> Result<()> {
     match outcome {
         PostAbortOutcome::Rejected(code) => assert_eq!(
             code, "25P02",
-            "REGRESSION on §6.3 (backend=spi): post-abort SELECT was \
-             rejected with SQLSTATE {code:?} but vanilla / our fix \
-             raises 25P02 (in_failed_sql_transaction). The dispatch \
-             loop's IsAbortedTransactionBlockState() check in \
+            "backend=spi: post-abort SELECT was rejected with \
+             SQLSTATE {code:?} but vanilla raises 25P02 \
+             (in_failed_sql_transaction). The dispatch loop's \
+             IsAbortedTransactionBlockState() check in \
              `spi_bridge::execute_one_statement` / \
              `execute_with_implicit_block_spi` may be returning a \
              different error type."
         ),
         PostAbortOutcome::Succeeded(val) => panic!(
-            "REGRESSION on §6.3 (backend=spi): post-abort SELECT ran \
-             to completion and returned {val:?}. The \
-             IsAbortedTransactionBlockState() check is missing or \
-             unreachable; the slot will SIGABRT on the next non-\
-             trivial post-abort statement."
+            "backend=spi: post-abort SELECT ran to completion and \
+             returned {val:?}. The IsAbortedTransactionBlockState() \
+             check is missing or unreachable; the slot will SIGABRT \
+             on the next non-trivial post-abort statement."
         ),
     }
     Ok(())
 }
 
-/// REGRESSION on review 2026-05-24 §6 item 4 (closed).
+/// Wire-level `ROLLBACK` from `TBLOCK_ABORT` on the **direct**
+/// backend.
 ///
 /// Three load-bearing assertions on the same connection:
 ///
@@ -324,7 +271,7 @@ async fn aborted_block_direct_backend_wire_rollback_succeeds() -> Result<()> {
         .await?;
 
     // Park the session in TBLOCK_ABORT via the same shape as
-    // the §6.3 tests above.
+    // the 25P02-rejection tests above.
     client
         .simple_query("BEGIN")
         .await
@@ -344,8 +291,8 @@ async fn aborted_block_direct_backend_wire_rollback_succeeds() -> Result<()> {
     );
 
     // (1) ROLLBACK from `TBLOCK_ABORT`. `ROLLBACK` is in
-    // vanilla's `IsTransactionExitStmt` set so the §6.3
-    // pre-Push check correctly *allows* it through.
+    // vanilla's `IsTransactionExitStmt` set so the
+    // aborted-block pre-Push check correctly *allows* it through.
     // `analyze_requires_snapshot(TransactionStmt)` returns
     // `false`, so `with_xact(false, ...)` skips the
     // `GetTransactionSnapshot` Push that would assert from
@@ -355,13 +302,13 @@ async fn aborted_block_direct_backend_wire_rollback_succeeds() -> Result<()> {
     let rollback = client.simple_query("ROLLBACK").await;
     let msgs = rollback.unwrap_or_else(|err| {
         panic!(
-            "REGRESSION on §6.4 (backend=direct): wire-level ROLLBACK \
-             from TBLOCK_ABORT failed with {err:?}. Expected a clean \
-             ROLLBACK CommandComplete. Most likely the slot SIGABRT'd \
-             on `GetTransactionSnapshot` inside `with_xact` — the \
-             `analyze_requires_snapshot` gate may have been removed \
-             or the Push made unconditional again. See this binary's \
-             module docstring for the full §6.4 contract."
+            "backend=direct: wire-level ROLLBACK from TBLOCK_ABORT \
+             failed with {err:?}. Expected a clean ROLLBACK \
+             CommandComplete. Most likely the slot SIGABRT'd on \
+             `GetTransactionSnapshot` inside `with_xact` — the \
+             `analyze_requires_snapshot` gate may have been \
+             removed or the Push made unconditional again. See \
+             this binary's module docstring for the full contract."
         )
     });
     let saw_rollback_tag = msgs
@@ -369,8 +316,8 @@ async fn aborted_block_direct_backend_wire_rollback_succeeds() -> Result<()> {
         .any(|m| matches!(m, tokio_postgres::SimpleQueryMessage::CommandComplete(_)));
     assert!(
         saw_rollback_tag,
-        "REGRESSION on §6.4 (backend=direct): wire-level ROLLBACK \
-         returned no CommandComplete, only: {msgs:?}"
+        "backend=direct: wire-level ROLLBACK returned no \
+         CommandComplete, only: {msgs:?}"
     );
 
     // (2) Post-ROLLBACK SELECT on same connection. Exercises
@@ -382,8 +329,8 @@ async fn aborted_block_direct_backend_wire_rollback_succeeds() -> Result<()> {
     // executor's `mem_allocated` accounting and SIGABRT'd a
     // later allocation.
     let sel = client.simple_query("SELECT 42::text").await.expect(
-        "REGRESSION on §6.4: post-ROLLBACK SELECT on same connection \
-             must succeed. Likely `parse_ctx` is no longer parented to \
+        "post-ROLLBACK SELECT on same connection must succeed. \
+             Likely `parse_ctx` is no longer parented to \
              `TopMemoryContext` (and is getting freed by the cleanup \
              reset), or `run_one_direct` is allocating analyze/plan \
              output in `TopTransactionContext` again instead of \
@@ -398,7 +345,7 @@ async fn aborted_block_direct_backend_wire_rollback_succeeds() -> Result<()> {
     });
     assert!(
         saw_42,
-        "REGRESSION on §6.4: post-ROLLBACK SELECT returned no '42' row, only: {sel:?}"
+        "post-ROLLBACK SELECT returned no '42' row, only: {sel:?}"
     );
 
     // (3) Slot recycling. Drop the client → slot returns to

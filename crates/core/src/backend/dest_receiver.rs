@@ -166,7 +166,7 @@ impl ColumnEncoder {
     /// so the per-cell cost is one direct function-pointer call
     /// (`fn_addr`) — no `fmgr_info` / syscache lookup per cell.
     /// Matches vanilla [`printtup`'s hot loop](../../../../../postgres/src/backend/access/common/printtup.c#L361)
-    /// shape; closes [review §3.1.1](../../../../docs/design/reviews/2026-05-24-pg-code-findings.md).
+    /// shape.
     pub(crate) fn encode_into(&self, datum: pg_sys::Datum, buf: &mut BytesMut) {
         match self {
             Self::Text(fns) => {

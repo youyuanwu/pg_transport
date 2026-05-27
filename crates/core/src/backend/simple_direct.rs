@@ -18,7 +18,7 @@
 //!   └─ for each statement:
 //!        needs_snapshot = analyze_requires_snapshot(raw_stmt)
 //!        with_xact(needs_snapshot, |ctx| run_one_direct(ctx, raw_stmt, ...))
-//!         ├─ pgstat_report_{query,plan}_id(0, true)  (§6.7 reset)
+//!         ├─ pgstat_report_{query,plan}_id(0, true)
 //!         ├─ CreateCommandTag(raw_stmt)
 //!         ├─ MemoryContextSwitchTo(parse_ctx)
 //!         ├─ pg_analyze_and_rewrite_fixedparams  (→ parse_ctx)
@@ -42,7 +42,7 @@
 //! [pg_code.md §2.5](../../../../../postgres/extdocs/background/pg_code.md#25-memory-context-discipline)
 //! for the equivalence framing.
 //!
-//! `TBLOCK_ABORT` handling: the §6.3 pre-check rejects every
+//! `TBLOCK_ABORT` handling: the aborted-block pre-check rejects every
 //! non-exit parsetree with SQLSTATE `25P02` (matches vanilla
 //! [postgres.c:1058-1063](../../../../../postgres/src/backend/tcop/postgres.c#L1058));
 //! exit statements (`COMMIT` / `ROLLBACK` / `PREPARE TRANSACTION`
@@ -338,7 +338,6 @@ fn fetch_result_format(raw_stmt: *mut pg_sys::RawStmt) -> FieldFormat {
 /// successful ones. Single-statement bodies stay on the
 /// existing per-statement [`with_xact`] path (functionally
 /// equivalent — no implicit block needed for a batch of one).
-/// Closes review 2026-05-24 §6 item 2.
 pub fn execute_simple_query_direct(query: &str) -> PgWireResult<Vec<Response>> {
     let parsed = parse_and_keep(query)?;
 
@@ -357,7 +356,6 @@ pub fn execute_simple_query_direct(query: &str) -> PgWireResult<Vec<Response>> {
     // path including PG-ERROR panic, so a fired
     // "canceling statement due to statement timeout" ERROR
     // correctly disarms the timer before the panic propagates.
-    // Closes review 2026-05-24 §6 item 6.
     //
     // SAFETY: as above; transaction is established by with_xact
     // for each per-statement call, but enable_timeout_after only
@@ -389,9 +387,9 @@ pub fn execute_simple_query_direct(query: &str) -> PgWireResult<Vec<Response>> {
             continue;
         }
         let raw_stmt = *raw_stmt;
-        // §6.3 — Aborted-block rejection. Must fire BEFORE
+        // Aborted-block rejection. Must fire BEFORE
         // `with_xact` even though `with_xact`'s Push is gated
-        // (§6.4): vanilla also performs this check before
+        // by `needs_snapshot`: vanilla also performs this check before
         // `start_xact_command` reaches the body, see
         // [postgres.c:1058-1063](../../../../../postgres/src/backend/tcop/postgres.c#L1058-L1063).
         // Rejecting non-exit parsetrees with SQLSTATE `25P02`
@@ -407,7 +405,7 @@ pub fn execute_simple_query_direct(query: &str) -> PgWireResult<Vec<Response>> {
         {
             return Err(aborted_transaction_block_error());
         }
-        // §6.4 — `analyze_requires_snapshot` gating. Mirrors
+        // `analyze_requires_snapshot` gating. Mirrors
         // vanilla `exec_simple_query` at
         // [postgres.c:1191-1195](../../../../../postgres/src/backend/tcop/postgres.c#L1191).
         // `with_xact(false, ...)` is the only safe entry from
@@ -474,7 +472,6 @@ fn is_transaction_stmt(raw_stmt: *mut pg_sys::RawStmt) -> bool {
 /// [`execute_with_implicit_block`] to mirror vanilla
 /// `exec_simple_query`'s pre-Push aborted-block check at
 /// [postgres.c:1058-1063](../../../../../postgres/src/backend/tcop/postgres.c#L1058-L1063).
-/// Closes review 2026-05-24 §6 item 3 for the direct backend.
 fn is_transaction_exit_stmt(raw_stmt: *mut pg_sys::RawStmt) -> bool {
     // SAFETY: raw_stmt is a valid `*mut RawStmt` from raw_parser
     // (parse_and_keep's lifetime invariant).
@@ -496,7 +493,7 @@ fn is_transaction_exit_stmt(raw_stmt: *mut pg_sys::RawStmt) -> bool {
 
 /// Multi-statement implicit-block executor — vanilla
 /// `exec_simple_query`'s per-iter pattern for `'Q'` bodies with
-/// more than one statement. Closes review 2026-05-24 §6 item 2.
+/// more than one statement.
 ///
 /// Mirrors the [postgres.c per-iter loop](../../../../../postgres/src/backend/tcop/postgres.c#L1097-L1340):
 ///
@@ -542,7 +539,8 @@ fn execute_with_implicit_block(parsed: &ParsedQuery<'_>) -> PgWireResult<Vec<Res
     let body_outcome = catch_unwind(AssertUnwindSafe(|| {
         let mut responses = Vec::with_capacity(non_empty.len());
         for (i, &raw_stmt) in non_empty.iter().enumerate() {
-            // §6.3 — Aborted-block rejection. Must fire BEFORE
+            // Aborted-block rejection (same as the single-statement
+            // path in `execute_simple_query_direct`). Must fire BEFORE
             // `PushActiveSnapshot(GetTransactionSnapshot())`
             // below, because `GetTransactionSnapshot` from
             // `TBLOCK_ABORT` walks into a PG-side assert. The
@@ -564,7 +562,7 @@ fn execute_with_implicit_block(parsed: &ParsedQuery<'_>) -> PgWireResult<Vec<Res
             {
                 return Err(aborted_transaction_block_error());
             }
-            // §6.4 — `analyze_requires_snapshot` gating
+            // `analyze_requires_snapshot` gating
             // (per-iter). Mirrors vanilla
             // [postgres.c:1191-1195](../../../../../postgres/src/backend/tcop/postgres.c#L1191):
             // only `Push` when analyze actually needs a
@@ -642,7 +640,8 @@ fn execute_with_implicit_block(parsed: &ParsedQuery<'_>) -> PgWireResult<Vec<Res
             // PG ERROR longjmp'd through the body. The implicit
             // block (and any earlier sub-statements' work)
             // rolls back here — this is the load-bearing branch
-            // for the §6.2 fix.
+            // for the implicit-block "first error rolls back all"
+            // rule.
             //
             // SAFETY: AbortCurrentTransaction handles snapshot
             // cleanup itself; we do not Pop here.
@@ -705,8 +704,9 @@ fn execute_with_implicit_block(parsed: &ParsedQuery<'_>) -> PgWireResult<Vec<Res
 /// to `GetActiveSnapshot` internally.
 ///
 /// Per-statement `pgstat_report_query_id(0, true)` /
-/// `pgstat_report_plan_id(0, true)` reset (step 0) closes review
-/// 2026-05-24 §6 item 7; see the body comment for the rationale.
+/// `pgstat_report_plan_id(0, true)` reset (step 0) mirrors
+/// vanilla [postgres.c:1110-1111](../../../../../postgres/src/backend/tcop/postgres.c#L1110-L1111);
+/// see the body comment for the rationale.
 fn run_one_direct(
     ctx: &XactCtx,
     raw_stmt: *mut pg_sys::RawStmt,
@@ -714,7 +714,7 @@ fn run_one_direct(
     parse_ctx: pg_sys::MemoryContext,
     _needs_snapshot: bool,
 ) -> PgWireResult<Response> {
-    // 0. §6.7 — per-statement pg_stat_statements query_id /
+    // 0. Per-statement pg_stat_statements query_id /
     //    plan_id reset. Mirrors vanilla `exec_simple_query` at
     //    [postgres.c:1110-1111](../../../../../postgres/src/backend/tcop/postgres.c#L1110-L1111):
     //
@@ -1045,72 +1045,6 @@ mod tests {
     #[pg_test]
     fn pg_simple_direct_xact_control() {}
 
-    /// Implicit-block multi-statement atomicity (review §6 item 2).
-    ///
-    /// **Vanilla `exec_simple_query` semantics
-    /// ([postgres.c:1097 + 1167-1170 + 1310](../../../../../postgres/src/backend/tcop/postgres.c#L1097)):**
-    /// for `list_length(parsetree_list) > 1`, wrap the per-statement
-    /// loop in `BeginImplicitTransactionBlock` /
-    /// `EndImplicitTransactionBlock` so the whole `'Q'` body
-    /// commits or rolls back atomically. If any statement raises
-    /// `ERROR`, the entire block aborts — earlier successful
-    /// statements are rolled back.
-    ///
-    /// **`execute_simple_query_direct` today:** the per-statement
-    /// `with_xact` bracket means each statement gets its own
-    /// `StartTransactionCommand` / `CommitTransactionCommand`
-    /// pair, so the first INSERT in
-    /// `INSERT 1; SELECT 1/0` commits before the SELECT errors.
-    /// The user's table ends up with the row that vanilla would
-    /// have rolled back.
-    ///
-    /// **Why this test is disabled in pg_test.** Demonstrating the
-    /// gap requires either:
-    /// 1. Raising an `ERROR` through `execute_simple_query_direct`
-    ///    so we can verify the earlier statements' rollback (or
-    ///    failure-to-roll-back) — but `with_xact`'s panic handler
-    ///    calls `AbortCurrentTransaction`, which collapses
-    ///    pg_test's wrap-xact to `TBLOCK_DEFAULT` and segfaults
-    ///    the framework on teardown. Same class of issue as
-    ///    [`pg_simple_direct_xact_control`] and the
-    ///    statement-timeout cancel test in §6 item 6.
-    /// 2. Probing for the `TBLOCK_IMPLICIT_INPROGRESS` state from
-    ///    inside a SQL callable — but `IsInTransactionBlock`,
-    ///    `IsTransactionBlock`, and `GetCurrentTransactionNestLevel`
-    ///    all return identical values for `TBLOCK_INPROGRESS`
-    ///    (what pg_test gives us) and `TBLOCK_IMPLICIT_INPROGRESS`
-    ///    (what the fix would add). PG exposes no public
-    ///    "am I in an implicit block specifically?" probe.
-    ///
-    /// **e2e test that should land alongside the §6.2 fix** (in
-    /// `crates/e2e/tests/basic.rs` or similar):
-    ///
-    /// ```sql
-    /// -- Setup
-    /// CREATE TEMP TABLE atomicity_t (n int);
-    ///
-    /// -- Multi-statement Q where statement 2 errors. Run via
-    /// -- pg_transport over a real wire connection (no outer xact
-    /// -- around the Q).
-    /// INSERT INTO atomicity_t VALUES (1); SELECT 1/0;
-    ///
-    /// -- After the ERROR comes back, the table should be empty
-    /// -- (vanilla's implicit block rolled the INSERT back).
-    /// -- pg_transport today: the INSERT committed → SELECT
-    /// -- COUNT(*) returns 1, exposing the gap.
-    /// SELECT COUNT(*) FROM atomicity_t;  -- expect 0 after fix
-    /// ```
-    ///
-    /// When §6.2 lands, flip this `#[cfg(any())]` off and rewrite
-    /// the test body to call `crates/e2e`'s harness equivalent of
-    /// the SQL above. Or — if pgrx-tests adds a "no wrap-xact"
-    /// per-test attribute — rewrite as a plain pg_test using a
-    /// real `INSERT … VALUES (1); SELECT 1/0` against the direct
-    /// path and assert `COUNT(*) = 0` afterward.
-    #[cfg(any())] // intentionally disabled — see note above
-    #[pg_test]
-    fn pg_simple_direct_implicit_block_atomicity() {}
-
     /// Syntax error → PgWireError. Subsequent statements are
     /// not executed (matches PG's 'Q' semantics).
     #[pg_test]
@@ -1125,7 +1059,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // statement_timeout enforced (review 2026-05-24 §6 item 6)
+    // statement_timeout enforced (design: deferred/simple-query-direct-path.md §7.5)
     // -----------------------------------------------------------------------
 
     /// SQL-callable probe used by
@@ -1149,8 +1083,8 @@ mod tests {
         super::super::observability::is_statement_timeout_active()
     }
 
-    /// Regression guard for [docs/design/reviews/2026-05-24-pg-code-findings.md](../../../../docs/design/reviews/2026-05-24-pg-code-findings.md)
-    /// §6 item 6.
+    /// Regression guard for [`docs/design/deferred/simple-query-direct-path.md`](../../../../docs/design/deferred/simple-query-direct-path.md)
+    /// §7.5 (per-query observability globals — `statement_timeout`).
     ///
     /// **Downstream property under test.** Vanilla
     /// `exec_simple_query` arms `enable_statement_timeout()`
@@ -1217,8 +1151,7 @@ mod tests {
 
         assert_eq!(
             active_str, "t",
-            "REGRESSION on review 2026-05-24 §6 item 6: \
-             `get_timeout_active(STATEMENT_TIMEOUT)` returned {active_str:?} \
+            "`get_timeout_active(STATEMENT_TIMEOUT)` returned {active_str:?} \
              while inside `execute_simple_query_direct` with \
              statement_timeout=60000. `StatementTimeoutGuard::install` \
              is no longer arming the timer — check that it runs before \
@@ -1229,11 +1162,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // FETCH-binary cursor format (review 2026-05-24 §6 item 1)
+    // FETCH-binary cursor format
+    // (design: deferred/simple-query-direct-path.md §7.1)
     // -----------------------------------------------------------------------
 
-    /// Regression guard for [docs/design/reviews/2026-05-24-pg-code-findings.md](../../../../docs/design/reviews/2026-05-24-pg-code-findings.md)
-    /// §6 item 1.
+    /// Regression guard for [`docs/design/deferred/simple-query-direct-path.md`](../../../../docs/design/deferred/simple-query-direct-path.md)
+    /// §7.1 (FETCH-binary cursor format).
     ///
     /// **Downstream property under test.** Vanilla
     /// `exec_simple_query` checks
@@ -1288,22 +1222,21 @@ mod tests {
         let expected_binary: Vec<u8> = 42i32.to_be_bytes().to_vec();
         assert_eq!(
             cell, expected_binary,
-            "REGRESSION on review 2026-05-24 §6 item 1: FETCH from a \
-             BINARY cursor produced {cell:?} instead of the expected \
-             4-byte big-endian int4 encoding {expected_binary:?}. \
+            "FETCH from a BINARY cursor produced {cell:?} instead of the \
+             expected 4-byte big-endian int4 encoding {expected_binary:?}. \
              `fetch_result_format` or `schema_and_encoders_uniform` \
              was bypassed in `run_one_direct`.",
         );
     }
 
     // -----------------------------------------------------------------------
-    // Observability gap — debug_query_string downstream attribution
-    // (review 2026-05-24 §6 item 5)
+    // Per-query observability — debug_query_string at ExecutorStart
+    // (design: deferred/simple-query-direct-path.md §7.5)
     // -----------------------------------------------------------------------
 
-    /// Regression guard for [`docs/design/reviews/2026-05-24-pg-code-findings.md`](../../../../docs/design/reviews/2026-05-24-pg-code-findings.md)
-    /// §6 item 5, asserting the fix against its actual
-    /// downstream consumer surface.
+    /// Regression guard for [`docs/design/deferred/simple-query-direct-path.md`](../../../../docs/design/deferred/simple-query-direct-path.md)
+    /// §7.5 (per-query observability globals), asserting the
+    /// fix against its actual downstream consumer surface.
     ///
     /// **Downstream property under test.** When the executor
     /// starts running a query, `pg_stat_statements`,
@@ -1358,8 +1291,7 @@ mod tests {
         assert_eq!(
             captured.debug_query_string_at_hook.as_deref(),
             Some(SQL),
-            "REGRESSION on review 2026-05-24 §6 item 5: at \
-             ExecutorStart_hook time, `debug_query_string` is no \
+            "at ExecutorStart_hook time, `debug_query_string` is no \
              longer set to the inner SQL. \
              `pg_stat_statements` / `auto_explain` will \
              mis-attribute every direct-path query. Likely \
@@ -1369,12 +1301,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Observability gap — pg_stat_statements query_id attribution
-    // (review 2026-05-24 §6 item 7)
+    // pg_stat_statements query_id reset per statement
+    // (design: deferred/simple-query-direct-path.md §7.6)
     // -----------------------------------------------------------------------
 
-    /// Regression guard for [`docs/design/reviews/2026-05-24-pg-code-findings.md`](../../../../docs/design/reviews/2026-05-24-pg-code-findings.md)
-    /// §6 item 7: vanilla `exec_simple_query` calls
+    /// Regression guard for [`docs/design/deferred/simple-query-direct-path.md`](../../../../docs/design/deferred/simple-query-direct-path.md)
+    /// §7.6 (per-statement query_id reset): vanilla
+    /// `exec_simple_query` calls
     /// `pgstat_report_query_id(0, true)` /
     /// `pgstat_report_plan_id(0, true)` at the top of every
     /// per-statement iteration so that an extension (the
@@ -1405,7 +1338,7 @@ mod tests {
     ///
     /// The reset is *invisible* in single-statement `'Q'` runs
     /// because [`super::observability::DebugQueryGuard::install`]
-    /// (review §6 item 5) already calls
+    /// (per-query observability, §7.5) already calls
     /// `pgstat_report_activity(STATE_RUNNING, ...)`, which itself
     /// zeroes `st_query_id` as a documented side-effect (see PG
     /// `backend_status.c:660-668`). The gap surfaces only in
@@ -1461,24 +1394,25 @@ mod tests {
 
         // Statement 1's hook always observes `0` — both vanilla
         // and pg_transport get this right because
-        // `DebugQueryGuard::install` (review §6 item 5) calls
-        // `pgstat_report_activity(STATE_RUNNING, ...)` which
-        // zeroes `st_query_id` as a side-effect. Anchor this so
-        // a regression of §6 item 5 surfaces as a clear
-        // separate failure instead of getting tangled with the
-        // §6 item 7 assertion below.
+        // `DebugQueryGuard::install` (per-query observability,
+        // §7.5) calls `pgstat_report_activity(STATE_RUNNING, ...)`
+        // which zeroes `st_query_id` as a side-effect. Anchor
+        // this so a regression of the observability guard
+        // surfaces as a clear separate failure instead of
+        // getting tangled with the per-statement reset
+        // assertion below.
         assert_eq!(
             observations[0], 0,
             "statement 1's post_parse_analyze_hook should see \
              `st_query_id == 0` (cleared by \
              `pgstat_report_activity(STATE_RUNNING)` in \
              `DebugQueryGuard::install`); got {:#x}. This \
-             suggests a regression of review §6 item 5, not §6 \
-             item 7.",
+             suggests a regression of the observability guard, \
+             not the per-statement query_id reset.",
             observations[0],
         );
 
-        // The actual §6 item 7 probe. The per-iter reset in
+        // The actual per-statement reset probe. The reset in
         // `run_one_direct` clears statement 1's leftover before
         // statement 2's `post_parse_analyze_hook` runs, so the
         // hook observes `0` and successfully installs its own
@@ -1488,8 +1422,7 @@ mod tests {
         // pins.
         assert_eq!(
             observations[1], 0,
-            "REGRESSION on review 2026-05-24 §6 item 7: \
-             statement 2's `post_parse_analyze_hook` observed \
+            "statement 2's `post_parse_analyze_hook` observed \
              `st_query_id == {:#x}` (statement 1's sentinel \
              {:#x}) instead of the vanilla-expected 0. The \
              `pgstat_report_query_id(0, true)` + \

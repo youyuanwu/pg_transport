@@ -4,8 +4,7 @@
 //! vanilla `exec_simple_query` does at
 //! [postgres.c:1046-1048](../../../../../postgres/src/backend/tcop/postgres.c#L1046-L1048).
 //!
-//! Audit: [`docs/design/reviews/2026-05-24-pg-code-findings.md`](../../../../docs/design/reviews/2026-05-24-pg-code-findings.md)
-//! §6 item 5.
+//! Design: [`docs/design/deferred/simple-query-direct-path.md §7.5`](../../../../docs/design/deferred/simple-query-direct-path.md#75-per-query-observability-globals).
 //!
 //! Used by every backend entry point:
 //! - [`super::simple_direct::execute_simple_query_direct`] —
@@ -117,7 +116,6 @@ impl Drop for DebugQueryGuard<'_> {
 
 // ---------------------------------------------------------------------------
 // StatementTimeoutGuard — arm/disarm STATEMENT_TIMEOUT per query
-// (review 2026-05-24 §6 item 6)
 // ---------------------------------------------------------------------------
 
 // Manual FFI bindings for the PG timeout API. pgrx-pg-sys 0.18
@@ -169,7 +167,7 @@ const STATEMENT_TIMEOUT: std::ffi::c_int = 3;
 /// Without this guard, `statement_timeout` is silently inactive
 /// for every pg_transport-served query — an operational hazard
 /// for any deployment that relies on the GUC to bound runaway
-/// queries. See review 2026-05-24 §6 item 6.
+/// queries.
 pub(crate) struct StatementTimeoutGuard {
     armed_by_us: bool,
 }
@@ -223,7 +221,7 @@ impl Drop for StatementTimeoutGuard {
 /// `get_timeout_active` FFI symbol with a safe Rust signature
 /// so test helpers don't need to re-declare the extern block.
 ///
-/// Used by the regression test for review §6 item 6: a SQL
+/// Used by the `statement_timeout` regression test: a SQL
 /// callable runs inside `PortalRun` and asks "did
 /// [`StatementTimeoutGuard`] actually arm the timer for this
 /// query?" — without needing to provoke an actual cancel (which
@@ -367,7 +365,7 @@ pub(crate) mod test_helpers {
     }
 
     // -----------------------------------------------------------------------
-    // post_parse_analyze_hook probe — review 2026-05-24 §6 item 7
+    // post_parse_analyze_hook probe — per-statement query_id reset
     // -----------------------------------------------------------------------
 
     /// Sentinel base used by
@@ -393,11 +391,11 @@ pub(crate) mod test_helpers {
     ///    the `false` mirrors the real extension's call shape
     ///    (`pg_stat_statements` never uses `force=true`).
     ///
-    /// The recorded sequence is what the §6.7 regression tests
-    /// assert on: vanilla's per-statement reset makes every
-    /// invocation observe `0` at entry; without the reset,
-    /// statement N+1's invocation observes statement N's
-    /// sentinel.
+    /// The recorded sequence is what the per-statement query_id
+    /// reset regression tests assert on: vanilla's per-statement
+    /// reset makes every invocation observe `0` at entry; without
+    /// the reset, statement N+1's invocation observes statement
+    /// N's sentinel.
     unsafe extern "C-unwind" fn fake_pgss_post_parse_analyze_hook(
         _pstate: *mut pg_sys::ParseState,
         _query: *mut pg_sys::Query,
@@ -413,7 +411,7 @@ pub(crate) mod test_helpers {
         // SAFETY: pgstat_report_query_id is the documented
         // installer; `force=false` mirrors real
         // `pg_stat_statements` behaviour (and is the call shape
-        // the §6.7 reset has to clear for to work).
+        // the per-statement reset has to clear for to work).
         unsafe {
             pg_sys::pgstat_report_query_id(QUERY_ID_SENTINEL_BASE + nth, false);
         }
@@ -427,7 +425,8 @@ pub(crate) mod test_helpers {
     /// observed at each hook entry, one per parsed statement in
     /// invocation order.
     ///
-    /// Used by the §6 item 7 regression tests on both the
+    /// Used by the per-statement query_id reset regression
+    /// tests on both the
     /// direct and SPI backends. See those tests'
     /// doc-comments for the full mechanism write-up — why a
     /// `post_parse_analyze_hook`-based probe is the only way

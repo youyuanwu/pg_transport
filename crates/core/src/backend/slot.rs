@@ -256,7 +256,7 @@ fn cleanup_per_slot_state() {
 ///   client that disconnects mid-block leaves the slot's xact
 ///   state non-DEFAULT; the next handoff's first statement
 ///   would either inherit the explicit block (silent data-
-///   integrity violation) or hit the §6.3 abort-rejection on
+///   integrity violation) or hit the aborted-block rejection on
 ///   every non-exit statement (loud but unrecoverable until the
 ///   slot is recycled). Mirrors what `ProcessClientReadInterrupt`
 ///   / vanilla's `proc_exit` would do.

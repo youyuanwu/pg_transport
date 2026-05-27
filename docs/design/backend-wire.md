@@ -399,6 +399,31 @@ extended path, `SPI_prepare` would reject it with the same
 `ERRCODE_INVALID_TRANSACTION_TERMINATION` and the wire-layer error
 translation would surface a clean DbError to the client.
 
+### 6.2 Vanilla `exec_simple_query` parity
+
+The SPI bridge holds the same client-observable invariants as
+vanilla `exec_simple_query` — aborted-block rejection,
+implicit-block atomicity, snapshot gating, FETCH-binary
+cursor format, observability globals, statement timeout,
+per-statement `pg_stat_statements` query_id reset. See
+[deferred/simple-query-direct-path.md §7](deferred/simple-query-direct-path.md#7-vanilla-exec_simple_query-parity)
+for the per-invariant description (each subsection covers both
+backends).
+
+Two SPI-side deviations are deliberate and don't appear in the
+direct path:
+
+- **Xact-control re-routing** (§6.1 above) — `SPI_execute` in
+  atomic mode would reject `TransactionStmt`, so
+  `handle_xact_control_one` routes BEGIN/COMMIT/ROLLBACK
+  through the xact-block API directly. Vanilla doesn't need
+  this because it doesn't go through SPI.
+- **`WARNING: there is already a transaction in progress`
+  suppression** — for nested `BEGIN` and out-of-block
+  `COMMIT`/`ROLLBACK`, the bridge returns the canonical
+  CommandTag without emitting the warning vanilla would. See
+  [`spi_bridge.rs:328-330`](../../crates/core/src/backend/spi_bridge.rs).
+
 ---
 
 ## 7. `WireCtx` — services the slot runner provides

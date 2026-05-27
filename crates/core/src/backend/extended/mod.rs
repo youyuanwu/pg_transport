@@ -91,7 +91,7 @@ impl PreparedStatement {
     /// this statement's SQL for the duration of the plan call so
     /// `pg_stat_statements`, `auto_explain`,
     /// `pg_stat_activity.query`, and the server-log `STATEMENT:`
-    /// line all attribute correctly (review 2026-05-24 §6.5).
+    /// line all attribute correctly.
     pub fn execute(
         &self,
         parameters: &[Option<Bytes>],
@@ -107,7 +107,6 @@ impl PreparedStatement {
         // `_guard` (drops last).
         let _guard = unsafe { DebugQueryGuard::install(sql_cstr.as_c_str()) };
         // Arm statement_timeout for the duration of this Execute.
-        // Closes review 2026-05-24 §6 item 6 for the extended path.
         let _stmt_timeout = unsafe { StatementTimeoutGuard::install() };
         self.plan
             .execute(parameters, parameter_format, result_format, max_rows)
@@ -121,8 +120,7 @@ impl PreparedStatement {
 ///
 /// Pins `debug_query_string` and pgstat `STATE_RUNNING` for the
 /// duration of the parse + plan work so `pg_stat_statements`'s
-/// `post_parse_analyze_hook` attributes correctly (review
-/// 2026-05-24 §6.5).
+/// `post_parse_analyze_hook` attributes correctly.
 pub fn prepare(sql: &str, param_hints: &[Option<u32>]) -> PgWireResult<PreparedStatement> {
     let sql_cstr = CString::new(sql)
         .map_err(|_| generic_error("pg_transport", "query string contains a NUL byte"))?;

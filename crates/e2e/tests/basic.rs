@@ -182,7 +182,8 @@ async fn syntax_error_surfaces_pg_native_message() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Implicit-block multi-statement atomicity (review §6 item 2)
+// Implicit-block multi-statement atomicity
+// (design: docs/design/deferred/simple-query-direct-path.md §7.2)
 // ---------------------------------------------------------------------------
 //
 // Vanilla `exec_simple_query` wraps multi-statement `'Q'` bodies
@@ -192,17 +193,14 @@ async fn syntax_error_surfaces_pg_native_message() -> Result<()> {
 // mirror this:
 //   * direct → [`crates/core/src/backend/simple_direct.rs::execute_with_implicit_block`]
 //   * spi    → [`crates/core/src/backend/spi_bridge.rs::execute_with_implicit_block_spi`]
-// — closes review §6 item 2 for both backends.
 //
-// The pg_test unit test for this lives at
-// `crates/core/src/backend/simple_direct.rs::tests::pg_simple_direct_implicit_block_atomicity`
-// but is `#[cfg(any())]`-disabled: pg_test wraps each test in an
-// outer transaction, and (a) triggering the inner ERROR
-// `AbortCurrentTransaction`s pg_test's wrap-xact (segfaults the
-// framework on teardown), and (b) no public PG API distinguishes
-// `TBLOCK_IMPLICIT_INPROGRESS` from `TBLOCK_INPROGRESS` for an
-// in-process probe. The e2e harness has no wrap-xact and runs
-// against a real wire connection, so the assertion-via-ERROR
+// No in-process pg_test fixture exists for this property: pg_test
+// wraps each test in an outer transaction, and (a) triggering the
+// inner ERROR `AbortCurrentTransaction`s pg_test's wrap-xact
+// (segfaults the framework on teardown), and (b) no public PG API
+// distinguishes `TBLOCK_IMPLICIT_INPROGRESS` from `TBLOCK_INPROGRESS`
+// for an in-process probe. The e2e harness has no wrap-xact and
+// runs against a real wire connection, so the assertion-via-ERROR
 // approach works here.
 
 /// Run the multi-statement-`'Q'`-with-error scenario through
@@ -211,8 +209,8 @@ async fn syntax_error_surfaces_pg_native_message() -> Result<()> {
 ///
 /// Issues `INSERT INTO t VALUES (1); SELECT 1/0` as one `'Q'`
 /// message. Vanilla rolls back via the implicit block → count
-/// is 0. Both pg_transport backends (after the §6.2 fix on each)
-/// match vanilla → count is 0 for `direct` and `spi`.
+/// is 0. Both pg_transport backends match vanilla → count is 0
+/// for `direct` and `spi`.
 async fn observe_implicit_block_rollback(backend: &str) -> Result<String> {
     let c = Cluster::shared().await;
     let client = c.connect("postgres").await?;
@@ -256,13 +254,12 @@ async fn observe_implicit_block_rollback(backend: &str) -> Result<String> {
 
 #[tokio::test]
 async fn implicit_block_rolls_back_partial_direct_backend() -> Result<()> {
-    // Direct backend: §6.2 fix is in place. The INSERT must roll
-    // back when the SELECT errors.
+    // Direct backend: the INSERT must roll back when the SELECT
+    // errors.
     let count = observe_implicit_block_rollback("direct").await?;
     assert_eq!(
         count, "0",
-        "REGRESSION on review 2026-05-24 §6 item 2 (backend=direct): \
-         SELECT count(*) returned {count:?} after \
+        "backend=direct: SELECT count(*) returned {count:?} after \
          'INSERT VALUES (1); SELECT 1/0'. Expected 0 (rolled back \
          via BeginImplicitTransactionBlock / EndImplicitTransactionBlock). \
          `execute_with_implicit_block` was bypassed or the panic-abort \
@@ -274,17 +271,16 @@ async fn implicit_block_rolls_back_partial_direct_backend() -> Result<()> {
 
 #[tokio::test]
 async fn implicit_block_rolls_back_partial_spi_backend() -> Result<()> {
-    // SPI backend: §6.2 fix is in place. The SPI bridge now wraps
-    // multi-statement non-xact-control batches in
-    // `BeginImplicitTransactionBlock` / `EndImplicitTransactionBlock`
-    // (see `spi_bridge.rs::execute_with_implicit_block_spi`),
-    // matching the direct backend. The INSERT must roll back when
-    // the SELECT errors.
+    // SPI backend: the SPI bridge wraps multi-statement
+    // non-xact-control batches in `BeginImplicitTransactionBlock` /
+    // `EndImplicitTransactionBlock` (see
+    // `spi_bridge.rs::execute_with_implicit_block_spi`), matching
+    // the direct backend. The INSERT must roll back when the
+    // SELECT errors.
     let count = observe_implicit_block_rollback("spi").await?;
     assert_eq!(
         count, "0",
-        "REGRESSION on review 2026-05-24 §6 item 2 (backend=spi): \
-         SELECT count(*) returned {count:?} after \
+        "backend=spi: SELECT count(*) returned {count:?} after \
          'INSERT VALUES (1); SELECT 1/0'. Expected 0 (rolled back \
          via BeginImplicitTransactionBlock / EndImplicitTransactionBlock). \
          `execute_with_implicit_block_spi` was bypassed or the \

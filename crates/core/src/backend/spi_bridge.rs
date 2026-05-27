@@ -73,16 +73,13 @@ use super::spi::{
 /// ([postgres.c:1097 + :1167-1170 + :1310](../../../../../postgres/src/backend/tcop/postgres.c#L1097)).
 /// Mixed batches containing xact-control fall back to the per-
 /// statement bracket path so [`handle_xact_control`]'s xact-block
-/// API calls don't fight an outer implicit block. Closes review
-/// 2026-05-24 §6 item 2 for the SPI backend (parity with
-/// [`super::simple_direct::execute_with_implicit_block`]).
+/// API calls don't fight an outer implicit block.
 pub fn execute_simple_query(query: &str) -> PgWireResult<Vec<Response>> {
     // Pin per-query observability (debug_query_string + pgstat
     // STATE_RUNNING) for the lifetime of the query body. The
     // guard drops on every exit path (Ok / Err / panic), restoring
     // the previous global and transitioning pgstat to STATE_IDLE.
-    // Matches vanilla `exec_simple_query` at postgres.c:1046-1048;
-    // closes review 2026-05-24 §6 item 5 for the SPI backend.
+    // Matches vanilla `exec_simple_query` at postgres.c:1046-1048.
     //
     // The CString is owned here for the whole function so the
     // guard's `'a` lifetime covers the entire query body. A second
@@ -99,8 +96,7 @@ pub fn execute_simple_query(query: &str) -> PgWireResult<Vec<Response>> {
     let _guard = unsafe { DebugQueryGuard::install(sql_cstr.as_c_str()) };
 
     // Arm statement_timeout for the duration of this 'Q' body.
-    // See [`StatementTimeoutGuard`] for the semantics and closes
-    // review 2026-05-24 §6 item 6 for the SPI backend.
+    // See [`StatementTimeoutGuard`] for the semantics.
     let _stmt_timeout = unsafe { StatementTimeoutGuard::install() };
 
     let statements = parse_and_classify(query)?;
@@ -136,8 +132,7 @@ pub fn execute_simple_query(query: &str) -> PgWireResult<Vec<Response>> {
 
 /// Multi-statement implicit-block executor for the SPI bridge —
 /// SPI counterpart to
-/// [`super::simple_direct::execute_with_implicit_block`]. Closes
-/// review 2026-05-24 §6 item 2 for the SPI backend.
+/// [`super::simple_direct::execute_with_implicit_block`].
 ///
 /// Pre-condition (enforced by the caller in
 /// [`execute_simple_query`]): every entry in `statements` has
@@ -197,7 +192,7 @@ fn execute_with_implicit_block_spi(
     let body_outcome = catch_unwind(AssertUnwindSafe(|| -> PgWireResult<Vec<Response>> {
         let mut responses: Vec<Response> = Vec::with_capacity(prepared.len());
         for (i, (text, fetch_portalname)) in prepared.iter().enumerate() {
-            // §6.3 — Aborted-block rejection. Must fire BEFORE
+            // Aborted-block rejection. Must fire BEFORE
             // `PushActiveSnapshot(GetTransactionSnapshot())`
             // below, because `GetTransactionSnapshot` from
             // `TBLOCK_ABORT` walks into a PG-side assert. The
@@ -293,8 +288,8 @@ fn execute_with_implicit_block_spi(
         }
         Err(panic_payload) => {
             // PG ERROR longjmp'd through `run_via_spi`. This is
-            // the load-bearing branch for the §6.2 fix on the
-            // SPI backend: the implicit block plus every
+            // the load-bearing branch for implicit-block atomicity
+            // on the SPI side: the implicit block plus every
             // earlier sub-statement's work rolls back here.
             //
             // SAFETY: AbortCurrentTransaction handles SPI state
@@ -313,8 +308,7 @@ fn execute_with_implicit_block_spi(
 /// `TBLOCK_SUBABORT` (i.e. a previous `'Q'` errored inside an
 /// explicit `BEGIN` block), reject every non-exit statement with
 /// SQLSTATE `25P02`. Mirrors vanilla's pre-Push check at
-/// [postgres.c:1058-1063](../../../../../postgres/src/backend/tcop/postgres.c#L1058-L1063);
-/// closes review 2026-05-24 §6 item 3 for the SPI backend.
+/// [postgres.c:1058-1063](../../../../../postgres/src/backend/tcop/postgres.c#L1058-L1063).
 /// `with_spi`'s prologue does
 /// `PushActiveSnapshot(GetTransactionSnapshot())`, and
 /// `GetTransactionSnapshot` from `TBLOCK_ABORT` walks into a
@@ -344,8 +338,9 @@ fn execute_one_statement(query: &str, meta: StmtMeta) -> PgWireResult<Vec<Respon
 /// [`parse_and_classify`] does not currently classify them
 /// (they're `meta.xact == None` and flow into `run_spi_statement`,
 /// where SPI atomic-mode rejects them with `SPI_ERROR_TRANSACTION`
-/// in normal state). With the §6.3 check in place they now get
-/// `25P02` in aborted state instead of being run. Acceptable
+/// in normal state). With the aborted-block check in place they
+/// now get `25P02` in aborted state instead of being run.
+/// Acceptable
 /// trade-off: neither statement appears in pgbench / sysbench
 /// workloads, and the failure mode is a clean wire error rather
 /// than the previous SIGABRT.
@@ -373,8 +368,7 @@ fn is_xact_exit_stmt(meta: &StmtMeta) -> bool {
 /// [`execute_one_statement`] pre-flight then rejects every
 /// non-exit statement with SQLSTATE `25P02` until the client
 /// issues `COMMIT` / `ROLLBACK`, mirroring vanilla
-/// `exec_simple_query` (closes review 2026-05-24 §6 item 3 for
-/// the SPI backend).
+/// `exec_simple_query`.
 fn run_spi_statement(
     query: &str,
     fetch_portalname: Option<CString>,
@@ -591,9 +585,7 @@ pub(super) unsafe fn classify_raw_stmt(raw_stmt: *mut pg_sys::RawStmt) -> Option
 /// end-of-`parse_and_classify`. The CString is then handed
 /// through [`run_spi_statement`] → [`run_via_spi`] which does
 /// the `GetPortalByName` + `CURSOR_OPT_BINARY` check **without
-/// any second parse pass**. Closes review 2026-05-24 §6 item 1
-/// for the SPI backend on the same parsetree the existing
-/// statement-splitter already produced.
+/// any second parse pass**.
 ///
 /// # Safety
 ///
@@ -744,8 +736,7 @@ fn run_via_spi(
     // The cursor's portal was created by an earlier statement
     // (this Q or a previous one in the same outer xact) and is
     // visible to `GetPortalByName` now. Mirrors
-    // [`super::simple_direct::fetch_result_format`]; closes
-    // review 2026-05-24 §6 item 1 for the SPI backend.
+    // [`super::simple_direct::fetch_result_format`].
     let result_format = match fetch_portalname {
         Some(name) => unsafe {
             // SAFETY: `GetPortalByName` is a backend-context lookup;
@@ -764,7 +755,7 @@ fn run_via_spi(
         None => FieldFormat::Text,
     };
 
-    // §6.7 — per-statement pg_stat_statements query_id / plan_id
+    // Per-statement pg_stat_statements query_id / plan_id
     // reset. Mirrors vanilla `exec_simple_query` at
     // [postgres.c:1110-1111](../../../../../postgres/src/backend/tcop/postgres.c#L1110-L1111):
     //
@@ -1044,7 +1035,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Observability — debug_query_string downstream attribution
-    // (review 2026-05-24 §6 item 5)
+    // (design: deferred/simple-query-direct-path.md §7.5)
     // -----------------------------------------------------------------------
 
     /// Mirror of the simple-direct backend's
@@ -1071,8 +1062,7 @@ mod tests {
         assert_eq!(
             captured.debug_query_string_at_hook.as_deref(),
             Some(SQL),
-            "REGRESSION on review 2026-05-24 §6 item 5: at \
-             ExecutorStart_hook time, `debug_query_string` is not \
+            "at ExecutorStart_hook time, `debug_query_string` is not \
              set to the inner SQL for the SPI backend. \
              `pg_stat_statements` / `auto_explain` would \
              mis-attribute every SPI-backend query. Likely cause: \
@@ -1082,7 +1072,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // FETCH-binary cursor format (review 2026-05-24 §6 item 1)
+    // FETCH-binary cursor format
+    // (design: deferred/simple-query-direct-path.md §7.1)
     // -----------------------------------------------------------------------
 
     /// Mirror of the simple-direct backend's
@@ -1130,17 +1121,16 @@ mod tests {
         let expected_binary: Vec<u8> = 42i32.to_be_bytes().to_vec();
         assert_eq!(
             cell, expected_binary,
-            "REGRESSION on review 2026-05-24 §6 item 1: FETCH from a \
-             BINARY cursor through the SPI bridge produced {cell:?} \
-             instead of the expected 4-byte big-endian int4 encoding \
-             {expected_binary:?}. `fetch_result_format_for_spi` was \
-             bypassed or returned Text incorrectly.",
+            "FETCH from a BINARY cursor through the SPI bridge produced \
+             {cell:?} instead of the expected 4-byte big-endian int4 \
+             encoding {expected_binary:?}. `fetch_result_format_for_spi` \
+             was bypassed or returned Text incorrectly.",
         );
     }
 
     // -----------------------------------------------------------------------
-    // Observability gap — pg_stat_statements query_id attribution
-    // (review 2026-05-24 §6 item 7)
+    // pg_stat_statements query_id reset per statement
+    // (design: deferred/simple-query-direct-path.md §7.6)
     // -----------------------------------------------------------------------
 
     /// Mirror of the simple-direct backend's
@@ -1172,7 +1162,8 @@ mod tests {
     ///   per-iter path doesn't get its own
     ///   `pgstat_report_activity(STATE_RUNNING)` clear inside
     ///   the loop). We tolerate that and only assert on
-    ///   `observations[1]`, which is the strict §6.7 invariant.
+    ///   `observations[1]`, which is the strict per-statement
+    ///   reset invariant.
     #[pg_test]
     fn pg_spi_bridge_resets_query_id_between_statements() {
         use super::super::observability::test_helpers::{
@@ -1196,7 +1187,7 @@ mod tests {
             observations,
         );
 
-        // The §6 item 7 invariant. The per-iter reset in
+        // The per-statement reset invariant. The reset in
         // `run_via_spi` clears statement 1's leftover before
         // statement 2's `post_parse_analyze_hook` runs, so the
         // hook observes `0` and successfully installs its own
@@ -1212,12 +1203,11 @@ mod tests {
         // path inside `execute_with_implicit_block_spi` doesn't
         // open the activity guard inside the loop, so iter 1
         // sees whatever the outer harness left in
-        // `st_query_id`. That's not a regression of §6 item 5
+        // `st_query_id`. That's not an observability regression
         // — it's a function of when the activity guard fires.
         assert_eq!(
             observations[1], 0,
-            "REGRESSION on review 2026-05-24 §6 item 7 (SPI \
-             backend): statement 2's `post_parse_analyze_hook` \
+            "SPI backend: statement 2's `post_parse_analyze_hook` \
              observed `st_query_id == {:#x}` (statement 1's \
              sentinel {:#x}) instead of the vanilla-expected 0. \
              The `pgstat_report_query_id(0, true)` + \

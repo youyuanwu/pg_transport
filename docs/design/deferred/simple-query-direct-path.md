@@ -186,17 +186,22 @@ instead would emit the same error payload but double-emit
 `ReadyForQuery` — observable to clients and breaks
 dual-backend test parity. Keep the `?` shape.
 
-### 5.4 `with_xact` abort path collapses to `DEFAULT`
+### 5.4 `with_xact` matches vanilla `TBLOCK_ABORT` recovery
 
-On a PG `ERROR` from inside the closure, `with_xact` calls
-`AbortCurrentTransaction`, which moves the xact state machine
-to `DEFAULT`. Vanilla PG would have left it at `TBLOCK_ABORT`,
-requiring the client to issue `ROLLBACK`. This deviation is
-inherited from the SPI bridge (see
-[`run_spi_statement`'s doc comment](../../../crates/core/src/backend/spi_bridge.rs))
-— harmless for our target workloads; flagged here so anyone
-chasing a "why doesn't my next statement need ROLLBACK after an
-error" question finds the answer.
+On a PG `ERROR` from inside `with_xact`'s closure for an
+explicit `BEGIN` block, `AbortCurrentTransaction` moves the
+xact state machine to `TBLOCK_ABORT` (not `DEFAULT` — see PG
+[`xact.c::AbortCurrentTransaction`](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/access/transam/xact.c)).
+The client must issue `COMMIT` / `ROLLBACK` / `PREPARE TRANSACTION`
+/ `ROLLBACK TO SAVEPOINT` to exit the aborted block; every
+other parsetree on the next `'Q'` is rejected with SQLSTATE
+`25P02` by the pre-Push aborted-block check in
+[`execute_simple_query_direct`](../../../crates/core/src/backend/simple_direct.rs).
+Matches vanilla `exec_simple_query` exactly. Crossing this
+state requires `with_xact(needs_snapshot=false, ...)` — see
+[§7.3](#73-per-statement-snapshot-gating) for why an
+unconditional `PushActiveSnapshot(GetTransactionSnapshot())`
+from `TBLOCK_ABORT` is unsafe.
 
 ### 5.5 Utility statements go through `ProcessUtility`
 
@@ -275,7 +280,212 @@ read-back.
 
 `just check` runs both pgrx and e2e suites.
 
-## 7. References
+## 7. Vanilla `exec_simple_query` parity
+
+The direct backend mirrors vanilla
+[`exec_simple_query`](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/tcop/postgres.c)
+in every behaviour a client can observe through a `'Q'`
+message: aborted-block rejection, implicit-block atomicity,
+snapshot discipline, FETCH-binary cursor format, the
+observability globals downstream extensions read, and the
+GUC-armed timeout. The SPI bridge holds the same invariants by
+the same shape, with two deliberate divergences documented in
+[backend-wire.md §6](../backend-wire.md#6-spi-bridge)
+(xact-control re-routing, warning suppression).
+
+Each subsection below describes one such invariant: what the
+code does, where it lives, the vanilla line it tracks, and the
+test that pins it. Per-query performance shapes (FmgrInfo cache,
+per-row buffer) are in [§8](#8-per-query-performance-shape).
+
+### 7.1 FETCH-binary cursor format
+
+[`fetch_result_format(raw_stmt)`](../../../crates/core/src/backend/simple_direct.rs)
+walks the parsetree for `IsA(stmt, FetchStmt)`, calls
+`GetPortalByName(portalname)`, and returns `FieldFormat::Binary`
+when the cursor was declared with `CURSOR_OPT_BINARY`.
+`run_one_direct` consults it right before
+`schema_and_encoders_uniform` so the entire result set picks the
+matching encoder. The SPI bridge piggybacks on the existing
+`parse_and_classify` pass: `StmtMeta { fetch_portalname }`
+stashes the cursor name as a Rust-owned `CString` so
+`run_via_spi` makes the same lookup without a second parse.
+Mirrors vanilla
+[postgres.c:1259-1273](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/tcop/postgres.c#L1259-L1273).
+Pinned by `pg_simple_direct_fetch_binary_cursor_returns_binary`
+(direct) + `pg_spi_bridge_fetch_binary_cursor_returns_binary`
+(SPI).
+
+### 7.2 Implicit-block multi-statement atomicity
+
+When a `'Q'` body parses to more than one non-empty statement,
+[`execute_with_implicit_block`](../../../crates/core/src/backend/simple_direct.rs)
+wraps the per-statement loop in
+`BeginImplicitTransactionBlock` /
+`EndImplicitTransactionBlock`, with one outer `catch_unwind`
+around the whole body. A PG `ERROR` in any sub-statement
+unwinds to `AbortCurrentTransaction`, collapsing the implicit
+block and rolling back every earlier sub-statement's work.
+Last-iteration tail is `EndImplicit + Commit`; mid-batch
+`TransactionStmt` ends the implicit block at that statement
+(`Commit`); everything else uses `CommandCounterIncrement`.
+Mirrors vanilla
+[postgres.c:1097 + :1167-1170 + :1310](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/tcop/postgres.c#L1097).
+
+The SPI bridge's
+[`execute_with_implicit_block_spi`](../../../crates/core/src/backend/spi_bridge.rs)
+inlines `SPI_connect` / `SPI_finish` per iter under one outer
+`catch_unwind`; it can't reuse
+[`with_spi`](../../../crates/core/src/backend/spi.rs) because
+the nested `catch_unwind` inside `with_spi` would collapse the
+implicit block on first ERROR. Pinned by
+`implicit_block_rolls_back_partial_*_backend` in
+[`crates/e2e/tests/basic.rs`](../../../crates/e2e/tests/basic.rs).
+
+### 7.3 Per-statement snapshot gating
+
+The dispatch loops compute
+`needs_snapshot = pg_sys::analyze_requires_snapshot(raw_stmt)`
+per statement and pass it through to
+[`with_xact(needs_snapshot, body)`](../../../crates/core/src/backend/executor.rs),
+which conditionally `PushActiveSnapshot(GetTransactionSnapshot())`s
+only when analyze needs one. `TransactionStmt` / `SET` / `SHOW`
+return `false`; SELECT / DML / `EXPLAIN` / `DECLARE CURSOR` /
+`CTAS` / `CALL` return `true`. The conditional Push is
+load-bearing for `TBLOCK_ABORT` entry: from that state,
+`GetTransactionSnapshot` walks into a PG assert (which would
+`SIGABRT` the slot in a cassert build).
+
+[`run_one_direct`](../../../crates/core/src/backend/simple_direct.rs)
+passes `InvalidSnapshot` (`std::ptr::null_mut::<SnapshotData>()`)
+to `PortalStart`. For `PORTAL_ONE_SELECT`, `PortalStart`
+reacquires via `GetActiveSnapshot` internally; for
+`PORTAL_MULTI_QUERY` (utility statements) no snapshot is needed.
+Mirrors vanilla
+[postgres.c:1191-1195](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/tcop/postgres.c#L1191)
+and [postgres.c:1235](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/tcop/postgres.c#L1235).
+Pinned by the §6.3 abort-recovery e2e test
+(`aborted_block_direct_backend_wire_rollback_succeeds` —
+`TBLOCK_ABORT` → `ROLLBACK` → `SELECT` end-to-end).
+
+### 7.4 Aborted-block rejection (SQLSTATE `25P02`)
+
+Both per-statement dispatch loops on each backend gate the
+xact-bracket entry on
+`pg_sys::IsAbortedTransactionBlockState() && !is_transaction_exit_stmt(raw_stmt)`
+and return
+[`aborted_transaction_block_error()`](../../../crates/core/src/backend/spi.rs)
+(SQLSTATE `25P02`) when the gate trips. `is_transaction_exit_stmt`
+mirrors vanilla's `IsTransactionExitStmt`: `COMMIT` /
+`ROLLBACK` / `PREPARE TRANSACTION` / `ROLLBACK TO SAVEPOINT`
+are allowed through; everything else (including `BEGIN`,
+`SAVEPOINT`, `RELEASE`, `COMMIT PREPARED`) is rejected.
+Mirrors vanilla
+[postgres.c:1058-1063](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/tcop/postgres.c#L1058-L1063).
+
+Companion:
+[`reset_per_handoff_state`](../../../crates/core/src/backend/slot.rs)
+calls `AbortOutOfAnyTransaction()` before `ResetAllOptions()`,
+so a client that disconnects mid-aborted-block doesn't leave
+xact state for the next handoff's first statement to inherit.
+Pinned by `aborted_block_*_backend_returns_25p02` and
+`aborted_block_direct_backend_wire_rollback_succeeds` in
+[`crates/e2e/tests/regressions.rs`](../../../crates/e2e/tests/regressions.rs).
+
+### 7.5 Per-query observability globals
+
+[`DebugQueryGuard::install`](../../../crates/core/src/backend/observability.rs)
+(RAII) pins `pg_sys::debug_query_string` to the query body and
+reports `pgstat_report_activity(STATE_RUNNING, ...)` for the
+guard's lifetime. Drop restores the previous global and reports
+`STATE_IDLE`. Installed at every backend entry point: simple
+direct, simple SPI, extended Parse, extended Execute. These
+globals are the ones `pg_stat_statements`, `auto_explain`,
+`pg_stat_activity.query`, and the server-log `STATEMENT:` line
+read for attribution.
+
+[`StatementTimeoutGuard::install`](../../../crates/core/src/backend/observability.rs)
+arms `enable_timeout_after(STATEMENT_TIMEOUT, StatementTimeout)`
+when the GUC is set and disarms on Drop — including on the
+PG-ERROR panic path, so a fired
+"canceling statement due to statement timeout" (SQLSTATE
+`57014`) disarms the timer before the panic propagates. Mirrors
+vanilla [postgres.c:1046-1048 + :1131-1139](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/tcop/postgres.c#L1046-L1048).
+
+Pinned by `pg_*_backend_executor_start_hook_sees_inner_query`
+(via the shared
+[`capture_executor_start`](../../../crates/core/src/backend/observability.rs)
+test helper) and `pg_simple_direct_statement_timeout_arms_timer`
+(via the SQL-callable `pg_transport_statement_timeout_is_active`
+probe — reads `get_timeout_active(STATEMENT_TIMEOUT)`
+mid-execution to avoid the pg_test outer-xact corruption a real
+cancel would cause).
+
+### 7.6 `pg_stat_statements` query_id reset per statement
+
+[`run_one_direct`](../../../crates/core/src/backend/simple_direct.rs)
+(direct) and [`run_via_spi`](../../../crates/core/src/backend/spi_bridge.rs)
+(SPI) call `pg_sys::pgstat_report_query_id(0, true)` +
+`pg_sys::pgstat_report_plan_id(0, true)` immediately before the
+analyze step (`pg_analyze_and_rewrite_fixedparams` on direct,
+inside `SPI_execute` on SPI). Both reporters bail out with
+`force=false` when `st_query_id` is non-zero, so without the
+explicit reset statement N's id (installed by
+`pg_stat_statements`'s `post_parse_analyze_hook` via
+`pgstat_report_query_id(hash, false)`) would leak into
+statement N+1's attribution.
+
+The reset is redundant on iter 1 — §7.5's
+`pgstat_report_activity(STATE_RUNNING)` already zeroes
+`st_query_id` as a side-effect (`backend_status.c:660-668`) —
+but load-bearing on iter 2+. Issued uniformly to keep the code
+shape symmetric across single/multi callers. Mirrors vanilla
+[postgres.c:1110-1111](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/tcop/postgres.c#L1110-L1111).
+Pinned by `pg_*_resets_query_id_between_statements` (both
+backends) via the shared
+[`capture_query_id_at_parse_analyze`](../../../crates/core/src/backend/observability.rs)
+helper, which installs a fake-`pg_stat_statements`
+`post_parse_analyze_hook` that records `st_query_id` at entry
+and writes a per-invocation sentinel via
+`pgstat_report_query_id(SENTINEL + n, false)`.
+
+## 8. Per-query performance shape
+
+### 8.1 Per-column `FmgrInfo` cache
+
+[`TypeOutput`](../../../crates/core/src/backend/spi.rs) and
+`TypeSend` cache a full `FmgrInfo` (resolved once at
+`for_column` time via `fmgr_info_cxt` against the receiver's
+context) instead of the type OID. The hot row loop dispatches
+via `OutputFunctionCall(&finfo, datum)` /
+`SendFunctionCall(&finfo, datum)` — same call shape as vanilla
+[`printtup`](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/access/common/printtup.c#L361),
+no per-cell syscache lookup. Pinned by
+`pg_simple_direct_wide_multirow_select_uses_cached_finfo`
+(five distinct types so a broken cache surfaces regardless of
+which column it lives on).
+
+### 8.2 Per-row `BytesMut` allocation (known divergence)
+
+[`dest_receiver.rs`](../../../crates/core/src/backend/dest_receiver.rs)'s
+`receiveSlot` callback allocates a fresh
+`BytesMut::with_capacity(64)` per row. Vanilla's
+[`printtup_prepare_info`](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/access/common/printtup.c#L122)
+runs `initStringInfo(&myState->buf)` once per portal and then
+recycles via `pq_beginmessage_reuse` /
+`pq_endmessage_reuse`
+([`printtup.c:327`](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/access/common/printtup.c#L327)).
+
+The receiver materialises every row as a `DataRow` owning its
+own bytes and pushes onto a `Vec<DataRow>` that pgwire consumes
+*after* `PortalDrop` (see [§5.6](#56-vecdatarow-materialisation-is-intrinsic)).
+A cursor that resets the same `BytesMut` across rows would have
+to coordinate with pgwire's `DataRow` ownership; the smaller
+allocation footprint isn't worth the pgwire-side change at
+current bench-driven priorities. Tracked in
+[performance.md](../performance.md).
+
+## 9. References
 
 - Parent: [planner-executor-direct-path.md](planner-executor-direct-path.md) — strategic SPI-vs-direct trade space and the survey of what's callable from `postgres.c`.
 - [backend-wire.md §6](../backend-wire.md#6-spi-bridge) — SPI bridge architecture (the default backend).
