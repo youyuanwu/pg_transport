@@ -18,6 +18,7 @@
 //!   └─ for each statement:
 //!        needs_snapshot = analyze_requires_snapshot(raw_stmt)
 //!        with_xact(needs_snapshot, |ctx| run_one_direct(ctx, raw_stmt, ...))
+//!         ├─ pgstat_report_{query,plan}_id(0, true)  (§6.7 reset)
 //!         ├─ CreateCommandTag(raw_stmt)
 //!         ├─ MemoryContextSwitchTo(parse_ctx)
 //!         ├─ pg_analyze_and_rewrite_fixedparams  (→ parse_ctx)
@@ -702,6 +703,10 @@ fn execute_with_implicit_block(parsed: &ParsedQuery<'_>) -> PgWireResult<Vec<Res
 /// only safe value (no snapshot has been Pushed and none is
 /// needed); for `PORTAL_ONE_SELECT` `PortalStart` falls back
 /// to `GetActiveSnapshot` internally.
+///
+/// Per-statement `pgstat_report_query_id(0, true)` /
+/// `pgstat_report_plan_id(0, true)` reset (step 0) closes review
+/// 2026-05-24 §6 item 7; see the body comment for the rationale.
 fn run_one_direct(
     ctx: &XactCtx,
     raw_stmt: *mut pg_sys::RawStmt,
@@ -709,6 +714,42 @@ fn run_one_direct(
     parse_ctx: pg_sys::MemoryContext,
     _needs_snapshot: bool,
 ) -> PgWireResult<Response> {
+    // 0. §6.7 — per-statement pg_stat_statements query_id /
+    //    plan_id reset. Mirrors vanilla `exec_simple_query` at
+    //    [postgres.c:1110-1111](../../../../../postgres/src/backend/tcop/postgres.c#L1110-L1111):
+    //
+    //    ```c
+    //    pgstat_report_query_id(0, true);
+    //    pgstat_report_plan_id(0, true);
+    //    ```
+    //
+    //    Both reporters bail out with `force=false` when
+    //    `st_query_id` / `st_plan_id` is already non-zero. So
+    //    once an extension (the canonical example:
+    //    `pg_stat_statements` via `post_parse_analyze_hook`)
+    //    installs statement N's id, statement N+1's hook can't
+    //    install its own unless we explicitly clear the slot
+    //    first. Without this call, multi-statement `'Q'` bodies
+    //    mis-attribute statement N+1's CPU/IO to statement N's
+    //    pg_stat_statements bucket.
+    //
+    //    Single-statement `'Q'` paths are already covered by
+    //    [`DebugQueryGuard::install`]'s
+    //    `pgstat_report_activity(STATE_RUNNING, ...)`, which
+    //    zeroes `st_query_id` as a documented side-effect
+    //    (`backend_status.c:660-668`). The explicit reset is
+    //    redundant on iter 1 of a multi-statement body but
+    //    load-bearing on iter 2+. Always issuing it keeps the
+    //    code shape uniform across single/multi callers.
+    //
+    //    SAFETY: both reporters are pure writes to MyBEEntry's
+    //    `st_query_id` / `st_plan_id` fields; safe from any
+    //    backend context after pgstat init.
+    unsafe {
+        pg_sys::pgstat_report_query_id(0, true);
+        pg_sys::pgstat_report_plan_id(0, true);
+    }
+
     // 1. Command tag from the raw parsetree. Matches
     //    exec_simple_query, which calls CreateCommandTag before
     //    analyze so it survives even if analyze raises.
@@ -1324,6 +1365,143 @@ mod tests {
              mis-attribute every direct-path query. Likely \
              cause: `DebugQueryGuard::install` was moved or \
              dropped before `with_xact` — check `execute_simple_query_direct`.",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Observability gap — pg_stat_statements query_id attribution
+    // (review 2026-05-24 §6 item 7)
+    // -----------------------------------------------------------------------
+
+    /// Regression guard for [`docs/design/reviews/2026-05-24-pg-code-findings.md`](../../../../docs/design/reviews/2026-05-24-pg-code-findings.md)
+    /// §6 item 7: vanilla `exec_simple_query` calls
+    /// `pgstat_report_query_id(0, true)` /
+    /// `pgstat_report_plan_id(0, true)` at the top of every
+    /// per-statement iteration so that an extension (the
+    /// canonical example: `pg_stat_statements` via
+    /// `post_parse_analyze_hook`) can install statement N+1's
+    /// jumble hash via the standard `(_, false)` call shape —
+    /// which bails out as long as `st_query_id` is non-zero.
+    /// Without the reset, statement N's id silently re-bills
+    /// statement N+1's CPU/IO. The fix lives at the top of
+    /// [`run_one_direct`] so both the single-statement path
+    /// (`execute_simple_query_direct`) and the multi-statement
+    /// path (`execute_with_implicit_block`) funnel through one
+    /// reset call.
+    ///
+    /// **Vanilla shape** at
+    /// [postgres.c:1110-1111](../../../../../postgres/src/backend/tcop/postgres.c#L1110-L1111):
+    ///
+    /// ```c
+    /// pgstat_report_query_id(0, true);
+    /// pgstat_report_plan_id(0, true);
+    /// ```
+    ///
+    /// The `force=true` second arg means "clobber whatever the
+    /// previous statement left behind". `pg_stat_statements`'s
+    /// `post_parse_analyze_hook` then computes the new statement's
+    /// jumble hash and calls `pgstat_report_query_id(hash, false)`
+    /// (non-force) to publish it.
+    ///
+    /// The reset is *invisible* in single-statement `'Q'` runs
+    /// because [`super::observability::DebugQueryGuard::install`]
+    /// (review §6 item 5) already calls
+    /// `pgstat_report_activity(STATE_RUNNING, ...)`, which itself
+    /// zeroes `st_query_id` as a documented side-effect (see PG
+    /// `backend_status.c:660-668`). The gap surfaces only in
+    /// multi-statement `'Q'` where statements 2+ have no
+    /// `pgstat_report_activity` in front of them — only the
+    /// per-iter reset that `run_one_direct` now issues.
+    ///
+    /// **Probe.** Install a `post_parse_analyze_hook` that
+    /// mimics `pg_stat_statements`: each invocation
+    ///
+    /// 1. *Records* the `st_query_id` value PG hands it (what
+    ///    the previous statement left behind).
+    /// 2. *Writes* a fresh sentinel via
+    ///    `pgstat_report_query_id(stmt_n_sentinel, false)` —
+    ///    the `false` mirrors the real extension's call shape.
+    ///
+    /// Then run a two-statement `'Q'`. Vanilla's per-iter reset
+    /// means each hook invocation observes `0` at entry.
+    /// Without the reset, the second invocation would observe
+    /// statement 1's sentinel — the leak this test guards
+    /// against.
+    ///
+    /// If this regresses (assertion fires with `observations[1]
+    /// == STMT1_SENTINEL`), the `pgstat_report_query_id(0, true)`
+    /// at the top of [`run_one_direct`] was removed or moved
+    /// past `pg_analyze_and_rewrite_fixedparams` (where
+    /// `post_parse_analyze_hook` runs).
+    #[pg_test]
+    fn pg_simple_direct_resets_query_id_between_statements() {
+        use super::super::observability::test_helpers::{
+            QUERY_ID_SENTINEL_BASE, capture_query_id_at_parse_analyze,
+        };
+
+        const SQL: &str = "SELECT 1 AS first; SELECT 2 AS second";
+        let stmt1_sentinel = QUERY_ID_SENTINEL_BASE + 1;
+
+        let (result, observations) =
+            capture_query_id_at_parse_analyze(|| execute_simple_query_direct(SQL));
+        result.expect("`SELECT 1; SELECT 2` should succeed");
+
+        // Sanity: the hook fired exactly once per statement.
+        // If this fails the next assertion is meaningless (we
+        // can't reason about a per-statement leak without one
+        // observation per statement).
+        assert_eq!(
+            observations.len(),
+            2,
+            "post_parse_analyze_hook should fire once per statement \
+             in a two-statement `'Q'`; got {} invocations: {:?}",
+            observations.len(),
+            observations,
+        );
+
+        // Statement 1's hook always observes `0` — both vanilla
+        // and pg_transport get this right because
+        // `DebugQueryGuard::install` (review §6 item 5) calls
+        // `pgstat_report_activity(STATE_RUNNING, ...)` which
+        // zeroes `st_query_id` as a side-effect. Anchor this so
+        // a regression of §6 item 5 surfaces as a clear
+        // separate failure instead of getting tangled with the
+        // §6 item 7 assertion below.
+        assert_eq!(
+            observations[0], 0,
+            "statement 1's post_parse_analyze_hook should see \
+             `st_query_id == 0` (cleared by \
+             `pgstat_report_activity(STATE_RUNNING)` in \
+             `DebugQueryGuard::install`); got {:#x}. This \
+             suggests a regression of review §6 item 5, not §6 \
+             item 7.",
+            observations[0],
+        );
+
+        // The actual §6 item 7 probe. The per-iter reset in
+        // `run_one_direct` clears statement 1's leftover before
+        // statement 2's `post_parse_analyze_hook` runs, so the
+        // hook observes `0` and successfully installs its own
+        // id via `(_, false)`. Without the reset, the hook
+        // would observe statement 1's sentinel and the
+        // `(_, false)` call would bail — the leak this test
+        // pins.
+        assert_eq!(
+            observations[1], 0,
+            "REGRESSION on review 2026-05-24 §6 item 7: \
+             statement 2's `post_parse_analyze_hook` observed \
+             `st_query_id == {:#x}` (statement 1's sentinel \
+             {:#x}) instead of the vanilla-expected 0. The \
+             `pgstat_report_query_id(0, true)` + \
+             `pgstat_report_plan_id(0, true)` call at the top \
+             of `run_one_direct` (step 0, mirroring vanilla \
+             postgres.c:1110-1111) is no longer clearing \
+             `st_query_id` before parse-analyze fires. Likely \
+             cause: the reset was removed, reordered past \
+             `pg_analyze_and_rewrite_fixedparams`, or moved \
+             behind a condition that skips it in the \
+             multi-statement path.",
+            observations[1], stmt1_sentinel,
         );
     }
 }

@@ -764,6 +764,42 @@ fn run_via_spi(
         None => FieldFormat::Text,
     };
 
+    // §6.7 — per-statement pg_stat_statements query_id / plan_id
+    // reset. Mirrors vanilla `exec_simple_query` at
+    // [postgres.c:1110-1111](../../../../../postgres/src/backend/tcop/postgres.c#L1110-L1111):
+    //
+    // ```c
+    // pgstat_report_query_id(0, true);
+    // pgstat_report_plan_id(0, true);
+    // ```
+    //
+    // Both reporters bail out with `force=false` when
+    // `st_query_id` / `st_plan_id` is already non-zero. So once
+    // an extension (the canonical example: `pg_stat_statements`
+    // via `post_parse_analyze_hook`) installs statement N's id,
+    // statement N+1's hook can't install its own unless we
+    // explicitly clear the slot first. Without this call,
+    // multi-statement `'Q'` bodies mis-attribute statement N+1's
+    // CPU/IO to statement N's pg_stat_statements bucket.
+    //
+    // Symmetric with [`super::simple_direct::run_one_direct`]'s
+    // step 0 — both per-statement workers funnel through one
+    // reset call so both backends match vanilla. Single-statement
+    // paths are also covered by [`super::observability::DebugQueryGuard::install`]'s
+    // `pgstat_report_activity(STATE_RUNNING, ...)` side-effect
+    // (`backend_status.c:660-668`); the explicit reset is
+    // load-bearing only on iter 2+ of a multi-statement body but
+    // issued uniformly to keep the code shape symmetric with
+    // the direct path.
+    //
+    // SAFETY: both reporters are pure writes to MyBEEntry's
+    // `st_query_id` / `st_plan_id` fields; safe from any backend
+    // context after pgstat init.
+    unsafe {
+        pg_sys::pgstat_report_query_id(0, true);
+        pg_sys::pgstat_report_plan_id(0, true);
+    }
+
     // SAFETY: inside an SPI session (proven by &SpiCtx); SPI_execute
     // is the documented entry point. `read_only=false` matches the
     // prior `Spi::connect_mut`-based behaviour (DDL/DML allowed);
@@ -1099,6 +1135,101 @@ mod tests {
              instead of the expected 4-byte big-endian int4 encoding \
              {expected_binary:?}. `fetch_result_format_for_spi` was \
              bypassed or returned Text incorrectly.",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Observability gap — pg_stat_statements query_id attribution
+    // (review 2026-05-24 §6 item 7)
+    // -----------------------------------------------------------------------
+
+    /// Mirror of the simple-direct backend's
+    /// `pg_simple_direct_resets_query_id_between_statements`
+    /// test for the SPI bridge. Verifies that
+    /// [`super::run_via_spi`] calls
+    /// `pgstat_report_query_id(0, true)` /
+    /// `pgstat_report_plan_id(0, true)` before `SPI_execute`
+    /// drives parse-analyze, so an extension installing a real
+    /// query_id at statement N's `post_parse_analyze_hook`
+    /// doesn't leak into statement N+1's attribution.
+    ///
+    /// See the direct-backend test's doc-comment for the full
+    /// rationale (why a `post_parse_analyze_hook`-based probe is
+    /// the only way to expose the gap; why the leak is invisible
+    /// for single-statement `'Q'` bodies; how the `(_, false)`
+    /// `pgstat_report_query_id` call shape mirrors
+    /// `pg_stat_statements`).
+    ///
+    /// Differences from the direct mirror:
+    /// - Routes through [`super::execute_simple_query`] / the
+    ///   per-iter `SPI_connect` + `SPI_execute` +
+    ///   `SPI_finish` chain inside
+    ///   [`super::execute_with_implicit_block_spi`] instead of
+    ///   [`super::super::simple_direct::run_one_direct`].
+    /// - Statement 1's hook may legitimately observe a non-zero
+    ///   id (whatever the outer pgrx-tests harness left in
+    ///   `st_query_id` before our `'Q'` started — the SPI
+    ///   per-iter path doesn't get its own
+    ///   `pgstat_report_activity(STATE_RUNNING)` clear inside
+    ///   the loop). We tolerate that and only assert on
+    ///   `observations[1]`, which is the strict §6.7 invariant.
+    #[pg_test]
+    fn pg_spi_bridge_resets_query_id_between_statements() {
+        use super::super::observability::test_helpers::{
+            QUERY_ID_SENTINEL_BASE, capture_query_id_at_parse_analyze,
+        };
+
+        const SQL: &str = "SELECT 1 AS first; SELECT 2 AS second";
+        let stmt1_sentinel = QUERY_ID_SENTINEL_BASE + 1;
+
+        let (result, observations) =
+            capture_query_id_at_parse_analyze(|| super::execute_simple_query(SQL));
+        result.expect("`SELECT 1; SELECT 2` should succeed");
+
+        // Sanity: the hook fired exactly once per statement.
+        assert_eq!(
+            observations.len(),
+            2,
+            "post_parse_analyze_hook should fire once per statement \
+             in a two-statement `'Q'`; got {} invocations: {:?}",
+            observations.len(),
+            observations,
+        );
+
+        // The §6 item 7 invariant. The per-iter reset in
+        // `run_via_spi` clears statement 1's leftover before
+        // statement 2's `post_parse_analyze_hook` runs, so the
+        // hook observes `0` and successfully installs its own
+        // id via `(_, false)`. Without the reset, the hook
+        // would observe statement 1's sentinel and the
+        // `(_, false)` call would bail — the leak this test
+        // pins on the SPI side.
+        //
+        // We do not assert on `observations[0]`: unlike the
+        // direct path (which has `DebugQueryGuard::install`'s
+        // implicit `pgstat_report_activity(STATE_RUNNING)`
+        // clearing the slot before iter 1), the SPI per-iter
+        // path inside `execute_with_implicit_block_spi` doesn't
+        // open the activity guard inside the loop, so iter 1
+        // sees whatever the outer harness left in
+        // `st_query_id`. That's not a regression of §6 item 5
+        // — it's a function of when the activity guard fires.
+        assert_eq!(
+            observations[1], 0,
+            "REGRESSION on review 2026-05-24 §6 item 7 (SPI \
+             backend): statement 2's `post_parse_analyze_hook` \
+             observed `st_query_id == {:#x}` (statement 1's \
+             sentinel {:#x}) instead of the vanilla-expected 0. \
+             The `pgstat_report_query_id(0, true)` + \
+             `pgstat_report_plan_id(0, true)` call at the top \
+             of `run_via_spi` (mirroring vanilla \
+             postgres.c:1110-1111) is no longer clearing \
+             `st_query_id` before `SPI_execute` drives \
+             parse-analyze. Likely cause: the reset was \
+             removed, reordered past `SPI_execute`, or moved \
+             behind a condition that skips it in the \
+             implicit-block path.",
+            observations[1], stmt1_sentinel,
         );
     }
 }

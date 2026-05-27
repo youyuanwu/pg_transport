@@ -365,4 +365,125 @@ pub(crate) mod test_helpers {
             Err(payload) => resume_unwind(payload),
         }
     }
+
+    // -----------------------------------------------------------------------
+    // post_parse_analyze_hook probe — review 2026-05-24 §6 item 7
+    // -----------------------------------------------------------------------
+
+    /// Sentinel base used by
+    /// [`capture_query_id_at_parse_analyze`]'s
+    /// fake-`pg_stat_statements` hook. Each hook invocation
+    /// writes `QUERY_ID_SENTINEL_BASE + n` to `st_query_id` via
+    /// `pgstat_report_query_id(..., false)` (n = 1-based
+    /// invocation index), so callers can compose the per-stmt
+    /// sentinel for failure messages and pin which statement
+    /// leaked an id forward.
+    pub(crate) const QUERY_ID_SENTINEL_BASE: i64 = 0x0BAD_BEEF_DEAD_0000;
+
+    static OBSERVED_QUERY_IDS: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());
+
+    /// `post_parse_analyze_hook` that mimics what
+    /// `pg_stat_statements` does for every parsed statement:
+    ///
+    /// 1. *Records* `pgstat_get_my_query_id()` at hook entry —
+    ///    the value PG hands us, i.e. whatever the previous
+    ///    statement left behind.
+    /// 2. *Writes* a fresh sentinel via
+    ///    `pgstat_report_query_id(SENTINEL_BASE + n, false)` —
+    ///    the `false` mirrors the real extension's call shape
+    ///    (`pg_stat_statements` never uses `force=true`).
+    ///
+    /// The recorded sequence is what the §6.7 regression tests
+    /// assert on: vanilla's per-statement reset makes every
+    /// invocation observe `0` at entry; without the reset,
+    /// statement N+1's invocation observes statement N's
+    /// sentinel.
+    unsafe extern "C-unwind" fn fake_pgss_post_parse_analyze_hook(
+        _pstate: *mut pg_sys::ParseState,
+        _query: *mut pg_sys::Query,
+        _jstate: *mut pg_sys::JumbleState,
+    ) {
+        // SAFETY: pgstat_get_my_query_id is a backend-local
+        // PgBackendStatus read; always safe after pgstat init.
+        let observed_at_entry = unsafe { pg_sys::pgstat_get_my_query_id() };
+        let mut log = OBSERVED_QUERY_IDS.lock().unwrap();
+        log.push(observed_at_entry);
+        let nth = log.len() as i64;
+        drop(log);
+        // SAFETY: pgstat_report_query_id is the documented
+        // installer; `force=false` mirrors real
+        // `pg_stat_statements` behaviour (and is the call shape
+        // the §6.7 reset has to clear for to work).
+        unsafe {
+            pg_sys::pgstat_report_query_id(QUERY_ID_SENTINEL_BASE + nth, false);
+        }
+    }
+
+    /// Run `body` with a `post_parse_analyze_hook` installed
+    /// that mimics `pg_stat_statements` (records `st_query_id`
+    /// at hook entry, then writes a per-invocation sentinel via
+    /// `pgstat_report_query_id(SENTINEL+n, false)`). Returns
+    /// the body's result and the vector of `st_query_id` values
+    /// observed at each hook entry, one per parsed statement in
+    /// invocation order.
+    ///
+    /// Used by the §6 item 7 regression tests on both the
+    /// direct and SPI backends. See those tests'
+    /// doc-comments for the full mechanism write-up — why a
+    /// `post_parse_analyze_hook`-based probe is the only way
+    /// to expose the gap, why the leak is invisible for
+    /// single-statement `'Q'` bodies, and how the `(_, false)`
+    /// call shape mirrors `pg_stat_statements`.
+    ///
+    /// Restores the previous hook and clears any sentinel left
+    /// in `st_query_id` / `st_plan_id` before returning, even
+    /// if `body` panics — `body` is wrapped in `catch_unwind`
+    /// and the panic is resumed after restore.
+    ///
+    /// Not safe for concurrent use across tests (single global
+    /// `OBSERVED_QUERY_IDS`, single global hook pointer). Pgrx's
+    /// pg_test framework runs tests one at a time per backend,
+    /// so this is fine in practice.
+    pub(crate) fn capture_query_id_at_parse_analyze<F, R>(body: F) -> (R, Vec<i64>)
+    where
+        F: FnOnce() -> R,
+    {
+        use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+
+        OBSERVED_QUERY_IDS.lock().unwrap().clear();
+
+        // SAFETY: post_parse_analyze_hook is a writable function-
+        // pointer global. Strict install / restore pair around
+        // body. Restore runs even if body panics.
+        let prev_hook = unsafe { pg_sys::post_parse_analyze_hook };
+        unsafe {
+            pg_sys::post_parse_analyze_hook = Some(fake_pgss_post_parse_analyze_hook);
+        }
+
+        let outcome = catch_unwind(AssertUnwindSafe(body));
+
+        // Restore the hook FIRST so an assertion failure in the
+        // caller can't leave the hook installed for subsequent
+        // tests.
+        unsafe {
+            pg_sys::post_parse_analyze_hook = prev_hook;
+        }
+        // Belt-and-braces clear any sentinel we left behind so
+        // subsequent pg_tests in this backend frame don't
+        // observe our injected ids.
+        //
+        // SAFETY: both reporters are pure writes to MyBEEntry;
+        // `force=true` makes them unconditional.
+        unsafe {
+            pg_sys::pgstat_report_query_id(0, true);
+            pg_sys::pgstat_report_plan_id(0, true);
+        }
+
+        let observations = std::mem::take(&mut *OBSERVED_QUERY_IDS.lock().unwrap());
+
+        match outcome {
+            Ok(value) => (value, observations),
+            Err(payload) => resume_unwind(payload),
+        }
+    }
 }

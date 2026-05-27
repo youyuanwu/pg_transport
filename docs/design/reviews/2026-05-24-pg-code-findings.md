@@ -154,7 +154,7 @@ deviate identically.
 
 ## 4.4 Status update — 2026-05-25
 
-Six of the nine §6 punch-list items have landed since the audit
+Eight of the nine §6 punch-list items have landed since the audit
 was written; the verification tables above describe the **pre-fix**
 state. For the post-fix state, see the per-item Status column in
 [§6 Suggested follow-ups](#6-suggested-follow-ups). Summary:
@@ -164,10 +164,10 @@ state. For the post-fix state, see the per-item Status column in
 | 1 | FETCH-binary cursor format | **CLOSED** | `b0dae62` (direct) + `a1802ae` (SPI) |
 | 2 | Implicit-block multi-statement | **CLOSED** | `0b41355` (direct) + `f508f61` (SPI) |
 | 3 | Aborted-block rejection (`25P02`) | **CLOSED** | `409915c` |
-| 4 | `analyze_requires_snapshot` gating | **CLOSED** | (pending) |
+| 4 | `analyze_requires_snapshot` gating | **CLOSED** | `b35374d` |
 | 5 | `debug_query_string` + pgstat | **CLOSED** | `97f1b1e` (direct) + `20cfb97` (extended + SPI) |
 | 6 | `statement_timeout` | **CLOSED** | `2e78127` |
-| 7 | `pg_stat_statements` query_id | open | — |
+| 7 | `pg_stat_statements` query_id | **CLOSED** | (pending; direct + SPI) |
 | 8 | Cache `FmgrInfo` (perf) | **CLOSED** | `245ad37` |
 | 9 | Per-row buffer reuse (perf) | open | — |
 
@@ -195,14 +195,13 @@ follow-up to consider:
   documented at [pg_code.md §2.2](../../../../../postgres/extdocs/background/pg_code.md)."
 - Or fixing the deviations and removing the qualifier.
 
-**Status update — 2026-05-25.** The deviation list has shrunk
-substantially: §6.1, §6.2, §6.3, §6.5, §6.6, §6.8 are all closed
-across the §6.2 + §6.3 commits. The remaining qualifier should
+**Status update — 2026-05-26.** The deviation list has shrunk
+further: §6.1, §6.2, §6.3, §6.4, §6.5, §6.6, §6.7, §6.8 are
+all closed on both backends. The remaining qualifier should
 now read along the lines of "Same semantics as the SPI bridge;
-both still differ from vanilla in §6.4, §6.7, §6.9 (snapshot
-gating, `pg_stat_statements` attribution, per-row buffer reuse)."
-The comment hasn't been rewritten in code yet — folded into the
-§6.7 pickup.
+both still differ from vanilla only in §6.9 (per-row buffer
+reuse)." The comment hasn't been rewritten in code yet —
+folded into the §6.9 pickup.
 
 ## 6. Suggested follow-ups
 
@@ -373,10 +372,43 @@ landed them; `open` items are still as written.
    per statement. Restores per-statement bucketing in
    `pg_stat_statements`.
 
-   **Status — open.** Single point of insertion (per-statement
-   in each backend's dispatch loop); the FFI surface is
-   straightforward. No correctness dependency on §6.4. Suggested
-   pick-up next.
+   **Status — CLOSED (2026-05-26).** Added at the top of
+   `run_one_direct`
+   ([`simple_direct.rs`](../../../crates/core/src/backend/simple_direct.rs))
+   for the direct backend and at the top of `run_via_spi`
+   ([`spi_bridge.rs`](../../../crates/core/src/backend/spi_bridge.rs))
+   for the SPI backend. Both per-statement workers funnel
+   every dispatch path through one reset call. Placed before
+   the analyze step on each side (`CreateCommandTag` →
+   `pg_analyze_and_rewrite_fixedparams` on direct;
+   `SPI_execute` — which internally runs parse-analyze — on
+   SPI), matching vanilla's ordering at
+   [postgres.c:1110-1111](../../../../../postgres/src/backend/tcop/postgres.c#L1110-L1111).
+   The reset is redundant on iter 1 of a single-statement
+   `'Q'` body (`DebugQueryGuard::install`'s
+   `pgstat_report_activity(STATE_RUNNING)` already zeroes
+   `st_query_id` as a documented side-effect — see PG
+   `backend_status.c:660-668`) but load-bearing on iter 2+:
+   without it, statement N's `post_parse_analyze_hook`-installed
+   query_id leaks into statement N+1's attribution because
+   `pgstat_report_query_id(_, false)` bails out while
+   `st_query_id != 0`.
+
+   Regression coverage: `pg_simple_direct_resets_query_id_between_statements`
+   in `simple_direct.rs` and
+   `pg_spi_bridge_resets_query_id_between_statements` in
+   `spi_bridge.rs`. Both tests install a
+   `post_parse_analyze_hook` that mimics `pg_stat_statements`:
+   each invocation records `st_query_id` at entry, then writes
+   a fresh sentinel via `pgstat_report_query_id(SENTINEL+n, false)`.
+   Running `SELECT 1; SELECT 2` exercises the leak window
+   between statements. Pre-fix: statement 2's hook observes
+   statement 1's leftover sentinel. Post-fix: statement 2's
+   hook observes `0`. (See the direct test's doc-comment for
+   the full mechanism write-up of why single-statement probes
+   can't expose the gap; the SPI mirror only asserts on
+   `observations[1]` because the per-iter SPI path doesn't
+   open its own activity guard inside the loop.)
 
 8. **Performance — cache `FmgrInfo` in `ColumnEncoder` (§3.1.1).**
    Highest perf payoff per LoC. Replace `TypeOutput { Oid }` with
@@ -404,10 +436,12 @@ closer to "same semantics as `exec_simple_query`". Items 6–7
 fill in the rest of the day-one GUC surface. Items 8–9 close
 the per-query perf gap quantified in §3.
 
-**Post-status footnote.** Of the original five correctness items
-(1, 2, 3) plus the observability headline (5) and the timeout /
-perf wins (6, 8), six have landed; §6.4 (snapshot gating + the
-companion `PortalStart` refactor) and §6.7 / §6.9 remain.
+**Post-status footnote.** Of the nine §6 punch-list items,
+eight have landed on both backends (correctness 1–4,
+observability 5, GUC 6, attribution 7, perf 8). §6.9 (per-row
+buffer reuse) is the only item still open by design — it
+touches pgwire `DataRow` ownership and likely needs a design
+discussion before a code change.
 
 ## 7. Source-doc spot-check summary
 
