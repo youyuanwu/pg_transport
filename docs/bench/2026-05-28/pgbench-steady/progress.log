@@ -1,0 +1,79 @@
+pgbench sweep — pg_transport vs vanilla PG
+  repo:      /home/azureuser/pg_transport
+  outdir:    /home/azureuser/pg_transport/docs/bench/pgbench-steady
+  pg:        pg18
+  modes:     select nupdate tpcb
+  backends:  spi direct
+  clients:   8
+  duration:  15s
+  connect:   0 (initial connection time)
+  script:    <none>
+  pool:      <default>
+  runs/cell: 3
+  started:   2026-05-28T03:27:20+00:00
+
+[2026-05-28T03:27:20+00:00] START [1/18] mode=select be=spi clients=8 run=1
+[2026-05-28T03:27:55+00:00] DONE  [1/18] mode=select be=spi clients=8 run=1  vanilla_tps=35468.661998 pgt_tps=35952.151219 ratio=1.01 35s ok
+[2026-05-28T03:27:55+00:00] START [2/18] mode=select be=spi clients=8 run=2
+[2026-05-28T03:28:29+00:00] DONE  [2/18] mode=select be=spi clients=8 run=2  vanilla_tps=35907.013075 pgt_tps=35208.146338 ratio=0.98 34s ok
+[2026-05-28T03:28:29+00:00] START [3/18] mode=select be=spi clients=8 run=3
+[2026-05-28T03:29:03+00:00] DONE  [3/18] mode=select be=spi clients=8 run=3  vanilla_tps=35850.802911 pgt_tps=35909.963096 ratio=1.00 34s ok
+[2026-05-28T03:29:03+00:00] START [4/18] mode=select be=direct clients=8 run=1
+[2026-05-28T03:29:37+00:00] DONE  [4/18] mode=select be=direct clients=8 run=1  vanilla_tps=35992.067194 pgt_tps=35886.287476 ratio=1.00 34s ok
+[2026-05-28T03:29:37+00:00] START [5/18] mode=select be=direct clients=8 run=2
+[2026-05-28T03:30:11+00:00] DONE  [5/18] mode=select be=direct clients=8 run=2  vanilla_tps=36108.057409 pgt_tps=35797.647306 ratio=0.99 34s ok
+[2026-05-28T03:30:11+00:00] START [6/18] mode=select be=direct clients=8 run=3
+[2026-05-28T03:30:45+00:00] DONE  [6/18] mode=select be=direct clients=8 run=3  vanilla_tps=36395.310727 pgt_tps=35818.270618 ratio=0.98 34s ok
+[2026-05-28T03:30:45+00:00] START [7/18] mode=nupdate be=spi clients=8 run=1
+[2026-05-28T03:31:20+00:00] DONE  [7/18] mode=nupdate be=spi clients=8 run=1  vanilla_tps=2385.841266 pgt_tps=2282.529851 ratio=0.96 35s ok
+[2026-05-28T03:31:20+00:00] START [8/18] mode=nupdate be=spi clients=8 run=2
+[2026-05-28T03:31:54+00:00] DONE  [8/18] mode=nupdate be=spi clients=8 run=2  vanilla_tps=2386.402373 pgt_tps=2442.099664 ratio=1.02 34s ok
+[2026-05-28T03:31:54+00:00] START [9/18] mode=nupdate be=spi clients=8 run=3
+[2026-05-28T03:32:28+00:00] DONE  [9/18] mode=nupdate be=spi clients=8 run=3  vanilla_tps=2419.509833 pgt_tps=2371.320379 ratio=0.98 34s ok
+[2026-05-28T03:32:28+00:00] START [10/18] mode=nupdate be=direct clients=8 run=1
+[2026-05-28T03:33:02+00:00] DONE  [10/18] mode=nupdate be=direct clients=8 run=1  vanilla_tps=2292.355162 pgt_tps=2381.212787 ratio=1.04 34s ok
+[2026-05-28T03:33:02+00:00] START [11/18] mode=nupdate be=direct clients=8 run=2
+[2026-05-28T03:33:36+00:00] DONE  [11/18] mode=nupdate be=direct clients=8 run=2  vanilla_tps=2279.459676 pgt_tps=2154.989599 ratio=0.95 34s ok
+[2026-05-28T03:33:36+00:00] START [12/18] mode=nupdate be=direct clients=8 run=3
+[2026-05-28T03:34:11+00:00] DONE  [12/18] mode=nupdate be=direct clients=8 run=3  vanilla_tps=2214.626267 pgt_tps=2272.507501 ratio=1.03 35s ok
+[2026-05-28T03:34:11+00:00] START [13/18] mode=tpcb be=spi clients=8 run=1
+[2026-05-28T03:34:45+00:00] DONE  [13/18] mode=tpcb be=spi clients=8 run=1  vanilla_tps=488.549753 pgt_tps=504.442270 ratio=1.03 34s ok
+[2026-05-28T03:34:45+00:00] START [14/18] mode=tpcb be=spi clients=8 run=2
+[2026-05-28T03:35:19+00:00] DONE  [14/18] mode=tpcb be=spi clients=8 run=2  vanilla_tps=477.464514 pgt_tps=505.079649 ratio=1.06 34s ok
+[2026-05-28T03:35:19+00:00] START [15/18] mode=tpcb be=spi clients=8 run=3
+[2026-05-28T03:35:53+00:00] DONE  [15/18] mode=tpcb be=spi clients=8 run=3  vanilla_tps=483.115313 pgt_tps=514.176265 ratio=1.06 34s ok
+[2026-05-28T03:35:53+00:00] START [16/18] mode=tpcb be=direct clients=8 run=1
+[2026-05-28T03:36:27+00:00] DONE  [16/18] mode=tpcb be=direct clients=8 run=1  vanilla_tps=512.457870 pgt_tps=533.188431 ratio=1.04 34s ok
+[2026-05-28T03:36:27+00:00] START [17/18] mode=tpcb be=direct clients=8 run=2
+[2026-05-28T03:37:01+00:00] DONE  [17/18] mode=tpcb be=direct clients=8 run=2  vanilla_tps=498.494755 pgt_tps=522.077237 ratio=1.05 34s ok
+[2026-05-28T03:37:01+00:00] START [18/18] mode=tpcb be=direct clients=8 run=3
+[2026-05-28T03:37:36+00:00] DONE  [18/18] mode=tpcb be=direct clients=8 run=3  vanilla_tps=485.776367 pgt_tps=519.637333 ratio=1.07 35s ok
+
+[2026-05-28T03:37:36+00:00] SWEEP COMPLETE in 616s
+
+results.tsv:
+mode     backend  clients  run  vanilla_tps   pgt_tps       vanilla_lat_ms  pgt_lat_ms  vanilla_conn_ms  pgt_conn_ms  vanilla_failed  pgt_failed
+select   spi      8        1    35468.661998  35952.151219  0.226           0.223       6.029            7.771        0               0
+select   spi      8        2    35907.013075  35208.146338  0.223           0.227       6.315            7.832        0               0
+select   spi      8        3    35850.802911  35909.963096  0.223           0.223       5.915            7.793        0               0
+select   direct   8        1    35992.067194  35886.287476  0.222           0.223       5.887            7.715        0               0
+select   direct   8        2    36108.057409  35797.647306  0.222           0.223       5.823            7.627        0               0
+select   direct   8        3    36395.310727  35818.270618  0.220           0.223       5.974            8.618        0               0
+nupdate  spi      8        1    2385.841266   2282.529851   3.353           3.505       5.951            7.651        0               0
+nupdate  spi      8        2    2386.402373   2442.099664   3.352           3.276       5.944            7.609        0               0
+nupdate  spi      8        3    2419.509833   2371.320379   3.306           3.374       6.197            7.884        0               0
+nupdate  direct   8        1    2292.355162   2381.212787   3.490           3.360       5.931            7.837        0               0
+nupdate  direct   8        2    2279.459676   2154.989599   3.510           3.712       5.868            8.090        0               0
+nupdate  direct   8        3    2214.626267   2272.507501   3.612           3.520       6.006            7.690        0               0
+tpcb     spi      8        1    488.549753    504.442270    16.375          15.859      6.601            7.653        0               0
+tpcb     spi      8        2    477.464514    505.079649    16.755          15.839      5.989            7.716        0               0
+tpcb     spi      8        3    483.115313    514.176265    16.559          15.559      5.989            7.801        0               0
+tpcb     direct   8        1    512.457870    533.188431    15.611          15.004      5.931            7.467        0               0
+tpcb     direct   8        2    498.494755    522.077237    16.048          15.323      6.017            7.562        0               0
+tpcb     direct   8        3    485.776367    519.637333    16.468          15.395      5.939            7.751        0               0
+
+Outputs:
+  /home/azureuser/pg_transport/docs/bench/pgbench-steady/results.tsv
+  /home/azureuser/pg_transport/docs/bench/pgbench-steady/results.md
+  /home/azureuser/pg_transport/docs/bench/pgbench-steady/run.log
+  /home/azureuser/pg_transport/docs/bench/pgbench-steady/progress.log

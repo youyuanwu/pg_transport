@@ -1,0 +1,27 @@
+sysbench sweep — pg_transport vs vanilla PG
+  repo:       /home/azureuser/pg_transport
+  outdir:     /home/azureuser/pg_transport/docs/bench/sysbench-retry-final-3
+  pg:         pg18
+  workloads:  oltp_update_index
+  backends:   direct
+  threads:    32
+  tables:     16
+  table_size: 100000
+  duration:   20s
+  pool:       <default>
+  started:    2026-05-28T04:34:06+00:00
+
+[2026-05-28T04:34:06+00:00] START [1/1] oltp_update_index be=direct threads=32
+[2026-05-28T04:35:33+00:00] DONE  [1/1] oltp_update_index be=direct threads=32  vanilla=6433.23 pgt=6063.69 ratio=0.943 87s ok
+
+[2026-05-28T04:35:33+00:00] SWEEP COMPLETE in 87s
+
+results.tsv:
+workload           backend  threads  vanilla_tps  pgt_tps  ratio
+oltp_update_index  direct   32       6433.23      6063.69  0.943
+
+Outputs:
+  /home/azureuser/pg_transport/docs/bench/sysbench-retry-final-3/results.tsv
+  /home/azureuser/pg_transport/docs/bench/sysbench-retry-final-3/results.md
+  /home/azureuser/pg_transport/docs/bench/sysbench-retry-final-3/run.log
+  /home/azureuser/pg_transport/docs/bench/sysbench-retry-final-3/progress.log

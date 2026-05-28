@@ -1,0 +1,2 @@
+workload	backend	threads	vanilla_tps	pgt_tps	ratio
+oltp_read_only	spi	32	706.05	1770.67	2.508

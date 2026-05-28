@@ -1,0 +1,94 @@
+bench sweep — pg_transport vs vanilla PG (SELECT 1, extended-query)
+  repo:        /home/azureuser/pg_transport
+  outdir:      /home/azureuser/pg_transport/docs/bench/bench
+  pg:          pg18
+  connections: 1 4 8 16
+  backends:    spi direct
+  iters:       <autoscaled per cell>
+  pool:        <default>
+  runs/cell:   3
+  started:     2026-05-28T03:24:41+00:00
+
+[2026-05-28T03:24:41+00:00] START [1/24] connections=1 be=spi iters=2000 run=1
+[2026-05-28T03:25:17+00:00] DONE  [1/24] connections=1 be=spi iters=2000 run=1  vanilla_p50=151.0 pgt_p50=140.6 vanilla_qps=6416.3 pgt_qps=6434.2 qps_ratio=1.00 36s ok
+[2026-05-28T03:25:17+00:00] START [2/24] connections=1 be=spi iters=2000 run=2
+[2026-05-28T03:25:22+00:00] DONE  [2/24] connections=1 be=spi iters=2000 run=2  vanilla_p50=146.2 pgt_p50=140.4 vanilla_qps=6722.4 pgt_qps=7009.1 qps_ratio=1.04 5s ok
+[2026-05-28T03:25:22+00:00] START [3/24] connections=1 be=spi iters=2000 run=3
+[2026-05-28T03:25:26+00:00] DONE  [3/24] connections=1 be=spi iters=2000 run=3  vanilla_p50=148.1 pgt_p50=138.3 vanilla_qps=6677.0 pgt_qps=7139.1 qps_ratio=1.07 4s ok
+[2026-05-28T03:25:26+00:00] START [4/24] connections=1 be=direct iters=2000 run=1
+[2026-05-28T03:25:30+00:00] DONE  [4/24] connections=1 be=direct iters=2000 run=1  vanilla_p50=151.3 pgt_p50=135.3 vanilla_qps=6459.9 pgt_qps=7292.5 qps_ratio=1.13 4s ok
+[2026-05-28T03:25:30+00:00] START [5/24] connections=1 be=direct iters=2000 run=2
+[2026-05-28T03:25:35+00:00] DONE  [5/24] connections=1 be=direct iters=2000 run=2  vanilla_p50=149.7 pgt_p50=190.9 vanilla_qps=6280.8 pgt_qps=5510.8 qps_ratio=0.88 5s ok
+[2026-05-28T03:25:35+00:00] START [6/24] connections=1 be=direct iters=2000 run=3
+[2026-05-28T03:25:40+00:00] DONE  [6/24] connections=1 be=direct iters=2000 run=3  vanilla_p50=151.8 pgt_p50=136.5 vanilla_qps=6321.0 pgt_qps=7170.7 qps_ratio=1.13 5s ok
+[2026-05-28T03:25:40+00:00] START [7/24] connections=4 be=spi iters=4000 run=1
+[2026-05-28T03:25:44+00:00] DONE  [7/24] connections=4 be=spi iters=4000 run=1  vanilla_p50=232.2 pgt_p50=203.5 vanilla_qps=16379.4 pgt_qps=18797.7 qps_ratio=1.15 4s ok
+[2026-05-28T03:25:44+00:00] START [8/24] connections=4 be=spi iters=4000 run=2
+[2026-05-28T03:25:48+00:00] DONE  [8/24] connections=4 be=spi iters=4000 run=2  vanilla_p50=226.2 pgt_p50=199.4 vanilla_qps=17199.2 pgt_qps=19855.9 qps_ratio=1.15 4s ok
+[2026-05-28T03:25:48+00:00] START [9/24] connections=4 be=spi iters=4000 run=3
+[2026-05-28T03:25:52+00:00] DONE  [9/24] connections=4 be=spi iters=4000 run=3  vanilla_p50=227.8 pgt_p50=200.5 vanilla_qps=16740.2 pgt_qps=19701.0 qps_ratio=1.18 4s ok
+[2026-05-28T03:25:52+00:00] START [10/24] connections=4 be=direct iters=4000 run=1
+[2026-05-28T03:25:57+00:00] DONE  [10/24] connections=4 be=direct iters=4000 run=1  vanilla_p50=230.6 pgt_p50=190.8 vanilla_qps=16705.7 pgt_qps=20733.8 qps_ratio=1.24 5s ok
+[2026-05-28T03:25:57+00:00] START [11/24] connections=4 be=direct iters=4000 run=2
+[2026-05-28T03:26:01+00:00] DONE  [11/24] connections=4 be=direct iters=4000 run=2  vanilla_p50=223.3 pgt_p50=189.7 vanilla_qps=17001.9 pgt_qps=21083.9 qps_ratio=1.24 4s ok
+[2026-05-28T03:26:01+00:00] START [12/24] connections=4 be=direct iters=4000 run=3
+[2026-05-28T03:26:05+00:00] DONE  [12/24] connections=4 be=direct iters=4000 run=3  vanilla_p50=212.9 pgt_p50=197.1 vanilla_qps=18168.3 pgt_qps=19476.7 qps_ratio=1.07 4s ok
+[2026-05-28T03:26:05+00:00] START [13/24] connections=8 be=spi iters=8000 run=1
+[2026-05-28T03:26:10+00:00] DONE  [13/24] connections=8 be=spi iters=8000 run=1  vanilla_p50=333.4 pgt_p50=288.6 vanilla_qps=22613.9 pgt_qps=26395.9 qps_ratio=1.17 5s ok
+[2026-05-28T03:26:10+00:00] START [14/24] connections=8 be=spi iters=8000 run=2
+[2026-05-28T03:26:14+00:00] DONE  [14/24] connections=8 be=spi iters=8000 run=2  vanilla_p50=338.1 pgt_p50=279.6 vanilla_qps=22465.3 pgt_qps=27578.3 qps_ratio=1.23 4s ok
+[2026-05-28T03:26:14+00:00] START [15/24] connections=8 be=spi iters=8000 run=3
+[2026-05-28T03:26:19+00:00] DONE  [15/24] connections=8 be=spi iters=8000 run=3  vanilla_p50=341.5 pgt_p50=282.1 vanilla_qps=22264.3 pgt_qps=27169.3 qps_ratio=1.22 5s ok
+[2026-05-28T03:26:19+00:00] START [16/24] connections=8 be=direct iters=8000 run=1
+[2026-05-28T03:26:24+00:00] DONE  [16/24] connections=8 be=direct iters=8000 run=1  vanilla_p50=337.4 pgt_p50=269.8 vanilla_qps=22285.9 pgt_qps=28314.3 qps_ratio=1.27 5s ok
+[2026-05-28T03:26:24+00:00] START [17/24] connections=8 be=direct iters=8000 run=2
+[2026-05-28T03:26:28+00:00] DONE  [17/24] connections=8 be=direct iters=8000 run=2  vanilla_p50=338.6 pgt_p50=266.9 vanilla_qps=22467.5 pgt_qps=28391.9 qps_ratio=1.26 4s ok
+[2026-05-28T03:26:28+00:00] START [18/24] connections=8 be=direct iters=8000 run=3
+[2026-05-28T03:26:33+00:00] DONE  [18/24] connections=8 be=direct iters=8000 run=3  vanilla_p50=334.2 pgt_p50=266.9 vanilla_qps=22745.6 pgt_qps=28762.8 qps_ratio=1.26 5s ok
+[2026-05-28T03:26:33+00:00] START [19/24] connections=16 be=spi iters=16000 run=1
+[2026-05-28T03:26:38+00:00] DONE  [19/24] connections=16 be=spi iters=16000 run=1  vanilla_p50=500.4 pgt_p50=411.7 vanilla_qps=29214.2 pgt_qps=35654.5 qps_ratio=1.22 5s ok
+[2026-05-28T03:26:38+00:00] START [20/24] connections=16 be=spi iters=16000 run=2
+[2026-05-28T03:26:43+00:00] DONE  [20/24] connections=16 be=spi iters=16000 run=2  vanilla_p50=496.4 pgt_p50=404.6 vanilla_qps=28737.8 pgt_qps=35854.1 qps_ratio=1.25 5s ok
+[2026-05-28T03:26:43+00:00] START [21/24] connections=16 be=spi iters=16000 run=3
+[2026-05-28T03:26:48+00:00] DONE  [21/24] connections=16 be=spi iters=16000 run=3  vanilla_p50=501.0 pgt_p50=430.3 vanilla_qps=28959.1 pgt_qps=34358.9 qps_ratio=1.19 5s ok
+[2026-05-28T03:26:48+00:00] START [22/24] connections=16 be=direct iters=16000 run=1
+[2026-05-28T03:26:53+00:00] DONE  [22/24] connections=16 be=direct iters=16000 run=1  vanilla_p50=482.7 pgt_p50=410.1 vanilla_qps=29983.2 pgt_qps=35957.3 qps_ratio=1.20 5s ok
+[2026-05-28T03:26:53+00:00] START [23/24] connections=16 be=direct iters=16000 run=2
+[2026-05-28T03:26:58+00:00] DONE  [23/24] connections=16 be=direct iters=16000 run=2  vanilla_p50=499.1 pgt_p50=409.2 vanilla_qps=28802.2 pgt_qps=35946.3 qps_ratio=1.25 5s ok
+[2026-05-28T03:26:58+00:00] START [24/24] connections=16 be=direct iters=16000 run=3
+[2026-05-28T03:27:03+00:00] DONE  [24/24] connections=16 be=direct iters=16000 run=3  vanilla_p50=469.5 pgt_p50=390.6 vanilla_qps=30084.4 pgt_qps=37282.1 qps_ratio=1.24 5s ok
+
+[2026-05-28T03:27:03+00:00] SWEEP COMPLETE in 142s
+
+results.tsv:
+connections  backend  run  iters  vanilla_p50_us  pgt_p50_us  vanilla_p95_us  pgt_p95_us  vanilla_mean_us  pgt_mean_us  vanilla_qps  pgt_qps
+1            spi      1    2000   151.0           140.6       170.4           212.6       155.7            155.3        6416.3       6434.2
+1            spi      2    2000   146.2           140.4       157.6           155.4       148.7            142.6        6722.4       7009.1
+1            spi      3    2000   148.1           138.3       160.2           151.7       149.7            140.0        6677.0       7139.1
+1            direct   1    2000   151.3           135.3       170.7           152.4       154.7            137.0        6459.9       7292.5
+1            direct   2    2000   149.7           190.9       224.3           212.2       159.1            181.3        6280.8       5510.8
+1            direct   3    2000   151.8           136.5       187.9           154.6       158.0            139.3        6321.0       7170.7
+4            spi      1    4000   232.2           203.5       299.7           261.7       230.4            209.2        16379.4      18797.7
+4            spi      2    4000   226.2           199.4       298.1           231.9       227.7            199.4        17199.2      19855.9
+4            spi      3    4000   227.8           200.5       302.8           232.5       230.6            199.9        16740.2      19701.0
+4            direct   1    4000   230.6           190.8       295.3           226.2       227.0            191.6        16705.7      20733.8
+4            direct   2    4000   223.3           189.7       297.6           222.0       224.0            189.2        17001.9      21083.9
+4            direct   3    4000   212.9           197.1       271.6           259.0       212.1            202.3        18168.3      19476.7
+8            spi      1    8000   333.4           288.6       496.6           433.8       347.8            299.9        22613.9      26395.9
+8            spi      2    8000   338.1           279.6       507.2           407.6       352.0            286.5        22465.3      27578.3
+8            spi      3    8000   341.5           282.1       510.8           415.7       354.6            291.2        22264.3      27169.3
+8            direct   1    8000   337.4           269.8       505.0           408.3       352.6            279.9        22285.9      28314.3
+8            direct   2    8000   338.6           266.9       504.6           402.3       351.1            276.6        22467.5      28391.9
+8            direct   3    8000   334.2           266.9       494.3           393.8       347.9            276.0        22745.6      28762.8
+16           spi      1    16000  500.4           411.7       817.3           683.4       526.3            434.4        29214.2      35654.5
+16           spi      2    16000  496.4           404.6       812.5           669.6       527.3            427.9        28737.8      35854.1
+16           spi      3    16000  501.0           430.3       825.1           735.9       531.9            457.9        28959.1      34358.9
+16           direct   1    16000  482.7           410.1       783.8           708.4       514.0            436.9        29983.2      35957.3
+16           direct   2    16000  499.1           409.2       816.2           690.5       528.8            433.5        28802.2      35946.3
+16           direct   3    16000  469.5           390.6       773.6           647.9       509.9            413.0        30084.4      37282.1
+
+Outputs:
+  /home/azureuser/pg_transport/docs/bench/bench/results.tsv
+  /home/azureuser/pg_transport/docs/bench/bench/results.md
+  /home/azureuser/pg_transport/docs/bench/bench/run.log
+  /home/azureuser/pg_transport/docs/bench/bench/progress.log

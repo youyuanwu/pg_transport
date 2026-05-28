@@ -1,0 +1,78 @@
+sysbench sweep — pg_transport vs vanilla PG
+  repo:       /home/azureuser/pg_transport
+  outdir:     /home/azureuser/pg_transport/docs/bench/sysbench
+  pg:         pg18
+  workloads:  oltp_point_select oltp_read_only oltp_update_index
+  backends:   spi direct
+  threads:    4 16 32
+  tables:     16
+  table_size: 100000
+  duration:   20s
+  pool:       <default>
+  started:    2026-05-28T03:46:17+00:00
+
+[2026-05-28T03:46:17+00:00] START [1/18] oltp_point_select be=spi threads=4
+[2026-05-28T03:47:43+00:00] DONE  [1/18] oltp_point_select be=spi threads=4  vanilla=22592.69 pgt=27199.90 ratio=1.204 86s ok
+[2026-05-28T03:47:43+00:00] START [2/18] oltp_point_select be=spi threads=16
+[2026-05-28T03:49:08+00:00] DONE  [2/18] oltp_point_select be=spi threads=16  vanilla=35445.53 pgt=44633.92 ratio=1.259 85s ok
+[2026-05-28T03:49:08+00:00] START [3/18] oltp_point_select be=spi threads=32
+[2026-05-28T03:50:19+00:00] DONE  [3/18] oltp_point_select be=spi threads=32  vanilla=NA pgt=NA ratio=NA 71s rc=1
+[2026-05-28T03:50:19+00:00] START [4/18] oltp_point_select be=direct threads=4
+[2026-05-28T03:51:46+00:00] DONE  [4/18] oltp_point_select be=direct threads=4  vanilla=21971.49 pgt=27298.11 ratio=1.242 87s ok
+[2026-05-28T03:51:46+00:00] START [5/18] oltp_point_select be=direct threads=16
+[2026-05-28T03:53:11+00:00] DONE  [5/18] oltp_point_select be=direct threads=16  vanilla=36556.20 pgt=44882.06 ratio=1.228 85s ok
+[2026-05-28T03:53:11+00:00] START [6/18] oltp_point_select be=direct threads=32
+[2026-05-28T03:54:44+00:00] DONE  [6/18] oltp_point_select be=direct threads=32  vanilla=31596.13 pgt=43552.94 ratio=1.378 93s ok
+[2026-05-28T03:54:44+00:00] START [7/18] oltp_read_only be=spi threads=4
+[2026-05-28T03:56:11+00:00] DONE  [7/18] oltp_read_only be=spi threads=4  vanilla=755.78 pgt=1156.01 ratio=1.530 87s ok
+[2026-05-28T03:56:11+00:00] START [8/18] oltp_read_only be=spi threads=16
+[2026-05-28T03:57:22+00:00] DONE  [8/18] oltp_read_only be=spi threads=16  vanilla=NA pgt=NA ratio=NA 71s rc=1
+[2026-05-28T03:57:22+00:00] START [9/18] oltp_read_only be=spi threads=32
+[2026-05-28T03:58:33+00:00] DONE  [9/18] oltp_read_only be=spi threads=32  vanilla=NA pgt=NA ratio=NA 71s rc=1
+[2026-05-28T03:58:33+00:00] START [10/18] oltp_read_only be=direct threads=4
+[2026-05-28T03:59:59+00:00] DONE  [10/18] oltp_read_only be=direct threads=4  vanilla=765.26 pgt=1170.82 ratio=1.530 86s ok
+[2026-05-28T03:59:59+00:00] START [11/18] oltp_read_only be=direct threads=16
+[2026-05-28T04:01:25+00:00] DONE  [11/18] oltp_read_only be=direct threads=16  vanilla=1115.68 pgt=1763.16 ratio=1.580 86s ok
+[2026-05-28T04:01:25+00:00] START [12/18] oltp_read_only be=direct threads=32
+[2026-05-28T04:02:50+00:00] DONE  [12/18] oltp_read_only be=direct threads=32  vanilla=681.68 pgt=1803.93 ratio=2.646 85s ok
+[2026-05-28T04:02:50+00:00] START [13/18] oltp_update_index be=spi threads=4
+[2026-05-28T04:04:15+00:00] DONE  [13/18] oltp_update_index be=spi threads=4  vanilla=1223.53 pgt=1173.56 ratio=0.959 85s ok
+[2026-05-28T04:04:15+00:00] START [14/18] oltp_update_index be=spi threads=16
+[2026-05-28T04:05:26+00:00] DONE  [14/18] oltp_update_index be=spi threads=16  vanilla=NA pgt=NA ratio=NA 71s rc=1
+[2026-05-28T04:05:26+00:00] START [15/18] oltp_update_index be=spi threads=32
+[2026-05-28T04:06:37+00:00] DONE  [15/18] oltp_update_index be=spi threads=32  vanilla=NA pgt=NA ratio=NA 71s rc=1
+[2026-05-28T04:06:37+00:00] START [16/18] oltp_update_index be=direct threads=4
+[2026-05-28T04:08:03+00:00] DONE  [16/18] oltp_update_index be=direct threads=4  vanilla=1168.76 pgt=1151.00 ratio=0.985 86s ok
+[2026-05-28T04:08:03+00:00] START [17/18] oltp_update_index be=direct threads=16
+[2026-05-28T04:09:29+00:00] DONE  [17/18] oltp_update_index be=direct threads=16  vanilla=4058.87 pgt=382.42 ratio=0.094 86s ok
+[2026-05-28T04:09:29+00:00] START [18/18] oltp_update_index be=direct threads=32
+[2026-05-28T04:10:41+00:00] DONE  [18/18] oltp_update_index be=direct threads=32  vanilla=NA pgt=NA ratio=NA 72s rc=1
+
+[2026-05-28T04:10:41+00:00] SWEEP COMPLETE in 1464s
+
+results.tsv:
+workload           backend  threads  vanilla_tps  pgt_tps   ratio
+oltp_point_select  spi      4        22592.69     27199.90  1.204
+oltp_point_select  spi      16       35445.53     44633.92  1.259
+oltp_point_select  spi      32       NA           NA        NA
+oltp_point_select  direct   4        21971.49     27298.11  1.242
+oltp_point_select  direct   16       36556.20     44882.06  1.228
+oltp_point_select  direct   32       31596.13     43552.94  1.378
+oltp_read_only     spi      4        755.78       1156.01   1.530
+oltp_read_only     spi      16       NA           NA        NA
+oltp_read_only     spi      32       NA           NA        NA
+oltp_read_only     direct   4        765.26       1170.82   1.530
+oltp_read_only     direct   16       1115.68      1763.16   1.580
+oltp_read_only     direct   32       681.68       1803.93   2.646
+oltp_update_index  spi      4        1223.53      1173.56   0.959
+oltp_update_index  spi      16       NA           NA        NA
+oltp_update_index  spi      32       NA           NA        NA
+oltp_update_index  direct   4        1168.76      1151.00   0.985
+oltp_update_index  direct   16       4058.87      382.42    0.094
+oltp_update_index  direct   32       NA           NA        NA
+
+Outputs:
+  /home/azureuser/pg_transport/docs/bench/sysbench/results.tsv
+  /home/azureuser/pg_transport/docs/bench/sysbench/results.md
+  /home/azureuser/pg_transport/docs/bench/sysbench/run.log
+  /home/azureuser/pg_transport/docs/bench/sysbench/progress.log

@@ -1,0 +1,13 @@
+workload	backend	threads	vanilla_tps	pgt_tps	ratio
+oltp_point_select	spi	16	36249.15	45695.28	1.261
+oltp_point_select	spi	32	32936.22	43661.09	1.326
+oltp_point_select	direct	16	36429.37	45841.43	1.258
+oltp_point_select	direct	32	33300.80	44644.27	1.341
+oltp_read_only	spi	16	1112.35	1800.58	1.619
+oltp_read_only	spi	32	NA	NA	NA
+oltp_read_only	direct	16	1076.26	1780.09	1.654
+oltp_read_only	direct	32	NA	NA	NA
+oltp_update_index	spi	16	4119.39	3234.33	0.785
+oltp_update_index	spi	32	NA	NA	NA
+oltp_update_index	direct	16	4036.65	3208.50	0.795
+oltp_update_index	direct	32	NA	NA	NA

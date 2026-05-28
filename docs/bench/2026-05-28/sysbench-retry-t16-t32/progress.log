@@ -1,0 +1,60 @@
+sysbench sweep — pg_transport vs vanilla PG
+  repo:       /home/azureuser/pg_transport
+  outdir:     /home/azureuser/pg_transport/docs/bench/sysbench-retry-t16-t32
+  pg:         pg18
+  workloads:  oltp_point_select oltp_read_only oltp_update_index
+  backends:   spi direct
+  threads:    16 32
+  tables:     16
+  table_size: 100000
+  duration:   20s
+  pool:       <default>
+  started:    2026-05-28T04:12:06+00:00
+
+[2026-05-28T04:12:06+00:00] START [1/12] oltp_point_select be=spi threads=16
+[2026-05-28T04:13:32+00:00] DONE  [1/12] oltp_point_select be=spi threads=16  vanilla=36249.15 pgt=45695.28 ratio=1.261 86s ok
+[2026-05-28T04:13:32+00:00] START [2/12] oltp_point_select be=spi threads=32
+[2026-05-28T04:14:56+00:00] DONE  [2/12] oltp_point_select be=spi threads=32  vanilla=32936.22 pgt=43661.09 ratio=1.326 84s ok
+[2026-05-28T04:14:56+00:00] START [3/12] oltp_point_select be=direct threads=16
+[2026-05-28T04:16:27+00:00] DONE  [3/12] oltp_point_select be=direct threads=16  vanilla=36429.37 pgt=45841.43 ratio=1.258 91s ok
+[2026-05-28T04:16:27+00:00] START [4/12] oltp_point_select be=direct threads=32
+[2026-05-28T04:18:11+00:00] DONE  [4/12] oltp_point_select be=direct threads=32  vanilla=33300.80 pgt=44644.27 ratio=1.341 104s ok
+[2026-05-28T04:18:11+00:00] START [5/12] oltp_read_only be=spi threads=16
+[2026-05-28T04:19:46+00:00] DONE  [5/12] oltp_read_only be=spi threads=16  vanilla=1112.35 pgt=1800.58 ratio=1.619 95s ok
+[2026-05-28T04:19:46+00:00] START [6/12] oltp_read_only be=spi threads=32
+[2026-05-28T04:20:57+00:00] DONE  [6/12] oltp_read_only be=spi threads=32  vanilla=NA pgt=NA ratio=NA 71s rc=1
+[2026-05-28T04:20:57+00:00] START [7/12] oltp_read_only be=direct threads=16
+[2026-05-28T04:22:27+00:00] DONE  [7/12] oltp_read_only be=direct threads=16  vanilla=1076.26 pgt=1780.09 ratio=1.654 90s ok
+[2026-05-28T04:22:27+00:00] START [8/12] oltp_read_only be=direct threads=32
+[2026-05-28T04:23:38+00:00] DONE  [8/12] oltp_read_only be=direct threads=32  vanilla=NA pgt=NA ratio=NA 71s rc=1
+[2026-05-28T04:23:38+00:00] START [9/12] oltp_update_index be=spi threads=16
+[2026-05-28T04:25:04+00:00] DONE  [9/12] oltp_update_index be=spi threads=16  vanilla=4119.39 pgt=3234.33 ratio=0.785 86s ok
+[2026-05-28T04:25:04+00:00] START [10/12] oltp_update_index be=spi threads=32
+[2026-05-28T04:26:16+00:00] DONE  [10/12] oltp_update_index be=spi threads=32  vanilla=NA pgt=NA ratio=NA 72s rc=1
+[2026-05-28T04:26:16+00:00] START [11/12] oltp_update_index be=direct threads=16
+[2026-05-28T04:27:42+00:00] DONE  [11/12] oltp_update_index be=direct threads=16  vanilla=4036.65 pgt=3208.50 ratio=0.795 86s ok
+[2026-05-28T04:27:42+00:00] START [12/12] oltp_update_index be=direct threads=32
+[2026-05-28T04:28:54+00:00] DONE  [12/12] oltp_update_index be=direct threads=32  vanilla=NA pgt=NA ratio=NA 72s rc=1
+
+[2026-05-28T04:28:54+00:00] SWEEP COMPLETE in 1008s
+
+results.tsv:
+workload           backend  threads  vanilla_tps  pgt_tps   ratio
+oltp_point_select  spi      16       36249.15     45695.28  1.261
+oltp_point_select  spi      32       32936.22     43661.09  1.326
+oltp_point_select  direct   16       36429.37     45841.43  1.258
+oltp_point_select  direct   32       33300.80     44644.27  1.341
+oltp_read_only     spi      16       1112.35      1800.58   1.619
+oltp_read_only     spi      32       NA           NA        NA
+oltp_read_only     direct   16       1076.26      1780.09   1.654
+oltp_read_only     direct   32       NA           NA        NA
+oltp_update_index  spi      16       4119.39      3234.33   0.785
+oltp_update_index  spi      32       NA           NA        NA
+oltp_update_index  direct   16       4036.65      3208.50   0.795
+oltp_update_index  direct   32       NA           NA        NA
+
+Outputs:
+  /home/azureuser/pg_transport/docs/bench/sysbench-retry-t16-t32/results.tsv
+  /home/azureuser/pg_transport/docs/bench/sysbench-retry-t16-t32/results.md
+  /home/azureuser/pg_transport/docs/bench/sysbench-retry-t16-t32/run.log
+  /home/azureuser/pg_transport/docs/bench/sysbench-retry-t16-t32/progress.log

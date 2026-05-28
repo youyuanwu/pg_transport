@@ -1,0 +1,1704 @@
+=========================================================
+=== [1/18] oltp_point_select be=spi threads=4 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+sysbench: preparing 16 tables × 100000 rows in 'postgres' DB ...
+Creating table 'sbtest16'...
+Inserting 100000 records into 'sbtest16'
+Creating a secondary index on 'sbtest16'...
+
+sysbench: workload=oltp_point_select threads=4 duration=20s tables=16 table_size=100000 backend=spi skip_trx=off pool_ceiling=
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 4
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            451918
+        write:                           0
+        other:                           0
+        total:                           451918
+    transactions:                        451918 (22592.69 per sec.)
+    queries:                             451918 (22592.69 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+General statistics:
+    total time:                          20.0009s
+    total number of events:              451918
+
+Latency (ms):
+         min:                                    0.12
+         avg:                                    0.18
+         max:                                    7.45
+         95th percentile:                        0.24
+         sum:                                79801.19
+
+Threads fairness:
+    events (avg/stddev):           112979.5000/350.37
+    execution time (avg/stddev):   19.9503/0.00
+
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 4
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            544063
+        write:                           0
+        other:                           0
+        total:                           544063
+    transactions:                        544063 (27199.90 per sec.)
+    queries:                             544063 (27199.90 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+General statistics:
+    total time:                          20.0007s
+    total number of events:              544063
+
+Latency (ms):
+         min:                                    0.08
+         avg:                                    0.15
+         max:                                    4.75
+         95th percentile:                        0.18
+         sum:                                79806.71
+
+Threads fairness:
+    events (avg/stddev):           136015.7500/818.62
+    execution time (avg/stddev):   19.9517/0.00
+=========================================================
+=== [2/18] oltp_point_select be=spi threads=16 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+sysbench: preparing 16 tables × 100000 rows in 'postgres' DB ...
+Creating table 'sbtest16'...
+Inserting 100000 records into 'sbtest16'
+Creating a secondary index on 'sbtest16'...
+
+sysbench: workload=oltp_point_select threads=16 duration=20s tables=16 table_size=100000 backend=spi skip_trx=off pool_ceiling=
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 16
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            709382
+        write:                           0
+        other:                           0
+        total:                           709382
+    transactions:                        709382 (35445.53 per sec.)
+    queries:                             709382 (35445.53 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+General statistics:
+    total time:                          20.0114s
+    total number of events:              709382
+
+Latency (ms):
+         min:                                    0.15
+         avg:                                    0.45
+         max:                                   14.15
+         95th percentile:                        0.68
+         sum:                               319603.50
+
+Threads fairness:
+    events (avg/stddev):           44336.3750/2733.94
+    execution time (avg/stddev):   19.9752/0.00
+
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 16
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            892849
+        write:                           0
+        other:                           0
+        total:                           892849
+    transactions:                        892849 (44633.92 per sec.)
+    queries:                             892849 (44633.92 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+General statistics:
+    total time:                          20.0023s
+    total number of events:              892849
+
+Latency (ms):
+         min:                                    0.09
+         avg:                                    0.36
+         max:                                    8.23
+         95th percentile:                        0.56
+         sum:                               319600.91
+
+Threads fairness:
+    events (avg/stddev):           55803.0625/2670.34
+    execution time (avg/stddev):   19.9751/0.00
+=========================================================
+=== [3/18] oltp_point_select be=spi threads=32 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+sysbench: preparing 16 tables × 100000 rows in 'postgres' DB ...
+Creating table 'sbtest16'...
+Inserting 100000 records into 'sbtest16'
+Creating a secondary index on 'sbtest16'...
+
+sysbench: workload=oltp_point_select threads=32 duration=20s tables=16 table_size=100000 backend=spi skip_trx=off pool_ceiling=
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 32
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            627640
+        write:                           0
+        other:                           0
+        total:                           627640
+    transactions:                        627640 (31335.87 per sec.)
+    queries:                             627640 (31335.87 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+General statistics:
+    total time:                          20.0278s
+    total number of events:              627640
+
+Latency (ms):
+         min:                                    0.17
+         avg:                                    1.02
+         max:                                   39.42
+         95th percentile:                        1.76
+         sum:                               639311.79
+
+Threads fairness:
+    events (avg/stddev):           19613.7500/1160.94
+    execution time (avg/stddev):   19.9785/0.01
+
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 32
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+FATAL: Connection to database failed: connection to server at "127.0.0.1", port 5454 failed: server closed the connection unexpectedly
+	This probably means the server terminated abnormally
+	before or while processing the request.
+
+FATAL: `thread_init' function failed: /usr/share/sysbench/oltp_common.lua:349: connection creation failed
+FATAL: Thread initialization failed!
+sysbench: FAILED — server log tail follows ----
+2026-05-28 03:50:18.255 UTC [161116] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 03:50:18.255 UTC [161116] LOG:  pg_transport slot: clean exit
+2026-05-28 03:50:18.255 UTC [161128] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 03:50:18.255 UTC [161128] LOG:  pg_transport slot: clean exit
+2026-05-28 03:50:18.255 UTC [161123] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 03:50:18.255 UTC [161123] LOG:  pg_transport slot: clean exit
+2026-05-28 03:50:18.256 UTC [161127] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 03:50:18.256 UTC [161127] LOG:  pg_transport slot: clean exit
+2026-05-28 03:50:18.256 UTC [161126] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 03:50:18.256 UTC [161126] LOG:  pg_transport slot: clean exit
+2026-05-28 03:50:18.256 UTC [161130] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 03:50:18.256 UTC [161109] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 03:50:18.256 UTC [161130] LOG:  pg_transport slot: clean exit
+2026-05-28 03:50:18.256 UTC [161109] LOG:  pg_transport slot: clean exit
+2026-05-28 03:50:18.258 UTC [161115] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 03:50:18.258 UTC [161115] LOG:  pg_transport slot: clean exit
+2026-05-28 03:50:18.261 UTC [160723] LOG:  shutting down
+2026-05-28 03:50:18.265 UTC [160723] LOG:  checkpoint starting: shutdown immediate
+2026-05-28 03:50:19.764 UTC [160723] LOG:  checkpoint complete: wrote 7543 buffers (46.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 31 recycled; write=0.640 s, sync=0.759 s, total=1.504 s; sync files=137, longest=0.111 s, average=0.006 s; distance=513700 kB, estimate=513700 kB; lsn=0/20D060F8, redo lsn=0/20D060F8
+2026-05-28 03:50:19.791 UTC [160719] LOG:  database system is shut down
+sysbench: ---- end server log
+error: Recipe `sysbench` failed with exit code 1
+=========================================================
+=== [4/18] oltp_point_select be=direct threads=4 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+sysbench: preparing 16 tables × 100000 rows in 'postgres' DB ...
+Creating table 'sbtest16'...
+Inserting 100000 records into 'sbtest16'
+Creating a secondary index on 'sbtest16'...
+
+sysbench: workload=oltp_point_select threads=4 duration=20s tables=16 table_size=100000 backend=direct skip_trx=off pool_ceiling=
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 4
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            439528
+        write:                           0
+        other:                           0
+        total:                           439528
+    transactions:                        439528 (21971.49 per sec.)
+    queries:                             439528 (21971.49 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+General statistics:
+    total time:                          20.0027s
+    total number of events:              439528
+
+Latency (ms):
+         min:                                    0.10
+         avg:                                    0.18
+         max:                                    7.03
+         95th percentile:                        0.24
+         sum:                                79786.35
+
+Threads fairness:
+    events (avg/stddev):           109882.0000/1087.00
+    execution time (avg/stddev):   19.9466/0.00
+
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 4
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            546024
+        write:                           0
+        other:                           0
+        total:                           546024
+    transactions:                        546024 (27298.11 per sec.)
+    queries:                             546024 (27298.11 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+General statistics:
+    total time:                          20.0006s
+    total number of events:              546024
+
+Latency (ms):
+         min:                                    0.08
+         avg:                                    0.15
+         max:                                    3.61
+         95th percentile:                        0.18
+         sum:                                79813.92
+
+Threads fairness:
+    events (avg/stddev):           136506.0000/362.27
+    execution time (avg/stddev):   19.9535/0.00
+=========================================================
+=== [5/18] oltp_point_select be=direct threads=16 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+sysbench: preparing 16 tables × 100000 rows in 'postgres' DB ...
+Creating table 'sbtest16'...
+Inserting 100000 records into 'sbtest16'
+Creating a secondary index on 'sbtest16'...
+
+sysbench: workload=oltp_point_select threads=16 duration=20s tables=16 table_size=100000 backend=direct skip_trx=off pool_ceiling=
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 16
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            731415
+        write:                           0
+        other:                           0
+        total:                           731415
+    transactions:                        731415 (36556.20 per sec.)
+    queries:                             731415 (36556.20 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+General statistics:
+    total time:                          20.0061s
+    total number of events:              731415
+
+Latency (ms):
+         min:                                    0.13
+         avg:                                    0.44
+         max:                                    9.37
+         95th percentile:                        1.01
+         sum:                               319633.47
+
+Threads fairness:
+    events (avg/stddev):           45713.4375/11034.52
+    execution time (avg/stddev):   19.9771/0.01
+
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 16
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            897828
+        write:                           0
+        other:                           0
+        total:                           897828
+    transactions:                        897828 (44882.06 per sec.)
+    queries:                             897828 (44882.06 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+General statistics:
+    total time:                          20.0025s
+    total number of events:              897828
+
+Latency (ms):
+         min:                                    0.09
+         avg:                                    0.36
+         max:                                    8.40
+         95th percentile:                        0.57
+         sum:                               319620.30
+
+Threads fairness:
+    events (avg/stddev):           56114.2500/3360.54
+    execution time (avg/stddev):   19.9763/0.00
+=========================================================
+=== [6/18] oltp_point_select be=direct threads=32 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+sysbench: preparing 16 tables × 100000 rows in 'postgres' DB ...
+Creating table 'sbtest16'...
+Inserting 100000 records into 'sbtest16'
+Creating a secondary index on 'sbtest16'...
+
+sysbench: workload=oltp_point_select threads=32 duration=20s tables=16 table_size=100000 backend=direct skip_trx=off pool_ceiling=
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 32
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            632883
+        write:                           0
+        other:                           0
+        total:                           632883
+    transactions:                        632883 (31596.13 per sec.)
+    queries:                             632883 (31596.13 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+General statistics:
+    total time:                          20.0285s
+    total number of events:              632883
+
+Latency (ms):
+         min:                                    0.17
+         avg:                                    1.01
+         max:                                   38.05
+         95th percentile:                        1.70
+         sum:                               639371.29
+
+Threads fairness:
+    events (avg/stddev):           19777.5938/803.69
+    execution time (avg/stddev):   19.9804/0.01
+
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 32
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            871295
+        write:                           0
+        other:                           0
+        total:                           871295
+    transactions:                        871295 (43552.94 per sec.)
+    queries:                             871295 (43552.94 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+General statistics:
+    total time:                          20.0038s
+    total number of events:              871295
+
+Latency (ms):
+         min:                                    0.10
+         avg:                                    0.73
+         max:                                   15.15
+         95th percentile:                        1.25
+         sum:                               639499.54
+
+Threads fairness:
+    events (avg/stddev):           27227.9688/684.10
+    execution time (avg/stddev):   19.9844/0.01
+=========================================================
+=== [7/18] oltp_read_only be=spi threads=4 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+sysbench: preparing 16 tables × 100000 rows in 'postgres' DB ...
+Creating table 'sbtest16'...
+Inserting 100000 records into 'sbtest16'
+Creating a secondary index on 'sbtest16'...
+
+sysbench: workload=oltp_read_only threads=4 duration=20s tables=16 table_size=100000 backend=spi skip_trx=off pool_ceiling=
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 4
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            211708
+        write:                           0
+        other:                           30244
+        total:                           241952
+    transactions:                        15122  (755.78 per sec.)
+    queries:                             241952 (12092.53 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+General statistics:
+    total time:                          20.0066s
+    total number of events:              15122
+
+Latency (ms):
+         min:                                    4.15
+         avg:                                    5.29
+         max:                                   11.92
+         95th percentile:                        6.55
+         sum:                                79978.88
+
+Threads fairness:
+    events (avg/stddev):           3780.5000/28.81
+    execution time (avg/stddev):   19.9947/0.00
+
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 4
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            323764
+        write:                           0
+        other:                           46252
+        total:                           370016
+    transactions:                        23126  (1156.01 per sec.)
+    queries:                             370016 (18496.21 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+General statistics:
+    total time:                          20.0033s
+    total number of events:              23126
+
+Latency (ms):
+         min:                                    2.50
+         avg:                                    3.46
+         max:                                    8.49
+         95th percentile:                        4.25
+         sum:                                79962.67
+
+Threads fairness:
+    events (avg/stddev):           5781.5000/20.72
+    execution time (avg/stddev):   19.9907/0.00
+=========================================================
+=== [8/18] oltp_read_only be=spi threads=16 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.13s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+sysbench: preparing 16 tables × 100000 rows in 'postgres' DB ...
+Creating table 'sbtest16'...
+Inserting 100000 records into 'sbtest16'
+Creating a secondary index on 'sbtest16'...
+
+sysbench: workload=oltp_read_only threads=16 duration=20s tables=16 table_size=100000 backend=spi skip_trx=off pool_ceiling=
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 16
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            271670
+        write:                           0
+        other:                           38810
+        total:                           310480
+    transactions:                        19405  (969.25 per sec.)
+    queries:                             310480 (15507.93 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+General statistics:
+    total time:                          20.0190s
+    total number of events:              19405
+
+Latency (ms):
+         min:                                    5.99
+         avg:                                   16.49
+         max:                                   44.45
+         95th percentile:                       20.00
+         sum:                               320053.21
+
+Threads fairness:
+    events (avg/stddev):           1212.8125/21.08
+    execution time (avg/stddev):   20.0033/0.01
+
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 16
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+FATAL: Connection to database failed: connection to server at "127.0.0.1", port 5454 failed: server closed the connection unexpectedly
+	This probably means the server terminated abnormally
+	before or while processing the request.
+
+FATAL: `thread_init' function failed: /usr/share/sysbench/oltp_common.lua:349: connection creation failed
+FATAL: Thread initialization failed!
+sysbench: FAILED — server log tail follows ----
+2026-05-28 03:57:21.027 UTC [163273] LOG:  pg_transport slot: clean exit
+2026-05-28 03:57:21.028 UTC [163278] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 03:57:21.028 UTC [163278] LOG:  pg_transport slot: clean exit
+2026-05-28 03:57:21.028 UTC [163020] LOG:  background worker "logical replication launcher" (PID 163030) exited with exit code 1
+2026-05-28 03:57:21.028 UTC [163275] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 03:57:21.028 UTC [163275] LOG:  pg_transport slot: clean exit
+2026-05-28 03:57:21.028 UTC [163279] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 03:57:21.028 UTC [163279] LOG:  pg_transport slot: clean exit
+2026-05-28 03:57:21.029 UTC [163272] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 03:57:21.029 UTC [163272] LOG:  pg_transport slot: clean exit
+2026-05-28 03:57:21.029 UTC [163274] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 03:57:21.029 UTC [163274] LOG:  pg_transport slot: clean exit
+2026-05-28 03:57:21.030 UTC [163283] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 03:57:21.031 UTC [163283] LOG:  pg_transport slot: clean exit
+2026-05-28 03:57:21.031 UTC [163284] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 03:57:21.031 UTC [163284] LOG:  pg_transport slot: clean exit
+2026-05-28 03:57:21.034 UTC [163024] LOG:  shutting down
+2026-05-28 03:57:21.039 UTC [163024] LOG:  checkpoint starting: shutdown immediate
+2026-05-28 03:57:22.627 UTC [163024] LOG:  checkpoint complete: wrote 8351 buffers (51.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 31 recycled; write=0.350 s, sync=1.121 s, total=1.593 s; sync files=137, longest=0.467 s, average=0.009 s; distance=513828 kB, estimate=513828 kB; lsn=0/20D26238, redo lsn=0/20D26238
+2026-05-28 03:57:22.655 UTC [163020] LOG:  database system is shut down
+sysbench: ---- end server log
+error: Recipe `sysbench` failed with exit code 1
+=========================================================
+=== [9/18] oltp_read_only be=spi threads=32 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+sysbench: preparing 16 tables × 100000 rows in 'postgres' DB ...
+Creating table 'sbtest16'...
+Inserting 100000 records into 'sbtest16'
+Creating a secondary index on 'sbtest16'...
+
+sysbench: workload=oltp_read_only threads=32 duration=20s tables=16 table_size=100000 backend=spi skip_trx=off pool_ceiling=
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 32
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            166992
+        write:                           0
+        other:                           23856
+        total:                           190848
+    transactions:                        11928  (594.82 per sec.)
+    queries:                             190848 (9517.13 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+General statistics:
+    total time:                          20.0512s
+    total number of events:              11928
+
+Latency (ms):
+         min:                                    6.43
+         avg:                                   53.71
+         max:                                   93.92
+         95th percentile:                       62.19
+         sum:                               640673.95
+
+Threads fairness:
+    events (avg/stddev):           372.7500/7.31
+    execution time (avg/stddev):   20.0211/0.02
+
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 32
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+FATAL: Connection to database failed: connection to server at "127.0.0.1", port 5454 failed: server closed the connection unexpectedly
+	This probably means the server terminated abnormally
+	before or while processing the request.
+
+FATAL: `thread_init' function failed: /usr/share/sysbench/oltp_common.lua:349: connection creation failed
+FATAL: Thread initialization failed!
+sysbench: FAILED — server log tail follows ----
+2026-05-28 03:58:31.880 UTC [163697] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 03:58:31.880 UTC [163697] LOG:  pg_transport slot: clean exit
+2026-05-28 03:58:31.880 UTC [163698] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 03:58:31.880 UTC [163698] LOG:  pg_transport slot: clean exit
+2026-05-28 03:58:31.880 UTC [163690] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 03:58:31.880 UTC [163690] LOG:  pg_transport slot: clean exit
+2026-05-28 03:58:31.881 UTC [163683] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 03:58:31.881 UTC [163683] LOG:  pg_transport slot: clean exit
+2026-05-28 03:58:31.881 UTC [163682] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 03:58:31.881 UTC [163682] LOG:  pg_transport slot: clean exit
+2026-05-28 03:58:31.882 UTC [163693] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 03:58:31.882 UTC [163693] LOG:  pg_transport slot: clean exit
+2026-05-28 03:58:31.882 UTC [163681] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 03:58:31.882 UTC [163681] LOG:  pg_transport slot: clean exit
+2026-05-28 03:58:31.882 UTC [163696] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 03:58:31.882 UTC [163696] LOG:  pg_transport slot: clean exit
+2026-05-28 03:58:31.886 UTC [163382] LOG:  shutting down
+2026-05-28 03:58:31.889 UTC [163382] LOG:  checkpoint starting: shutdown immediate
+2026-05-28 03:58:33.229 UTC [163382] LOG:  checkpoint complete: wrote 8050 buffers (49.1%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 31 recycled; write=0.564 s, sync=0.658 s, total=1.344 s; sync files=137, longest=0.144 s, average=0.005 s; distance=513709 kB, estimate=513709 kB; lsn=0/20D08638, redo lsn=0/20D08638
+2026-05-28 03:58:33.259 UTC [163378] LOG:  database system is shut down
+sysbench: ---- end server log
+error: Recipe `sysbench` failed with exit code 1
+=========================================================
+=== [10/18] oltp_read_only be=direct threads=4 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+sysbench: preparing 16 tables × 100000 rows in 'postgres' DB ...
+Creating table 'sbtest16'...
+Inserting 100000 records into 'sbtest16'
+Creating a secondary index on 'sbtest16'...
+
+sysbench: workload=oltp_read_only threads=4 duration=20s tables=16 table_size=100000 backend=direct skip_trx=off pool_ceiling=
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 4
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            214326
+        write:                           0
+        other:                           30618
+        total:                           244944
+    transactions:                        15309  (765.26 per sec.)
+    queries:                             244944 (12244.09 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+General statistics:
+    total time:                          20.0033s
+    total number of events:              15309
+
+Latency (ms):
+         min:                                    4.09
+         avg:                                    5.22
+         max:                                   13.18
+         95th percentile:                        6.55
+         sum:                                79968.92
+
+Threads fairness:
+    events (avg/stddev):           3827.2500/30.39
+    execution time (avg/stddev):   19.9922/0.00
+
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 4
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            327908
+        write:                           0
+        other:                           46844
+        total:                           374752
+    transactions:                        23422  (1170.82 per sec.)
+    queries:                             374752 (18733.10 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+General statistics:
+    total time:                          20.0032s
+    total number of events:              23422
+
+Latency (ms):
+         min:                                    2.45
+         avg:                                    3.41
+         max:                                   13.09
+         95th percentile:                        4.18
+         sum:                                79967.10
+
+Threads fairness:
+    events (avg/stddev):           5855.5000/8.85
+    execution time (avg/stddev):   19.9918/0.00
+=========================================================
+=== [11/18] oltp_read_only be=direct threads=16 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+sysbench: preparing 16 tables × 100000 rows in 'postgres' DB ...
+Creating table 'sbtest16'...
+Inserting 100000 records into 'sbtest16'
+Creating a secondary index on 'sbtest16'...
+
+sysbench: workload=oltp_read_only threads=16 duration=20s tables=16 table_size=100000 backend=direct skip_trx=off pool_ceiling=
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 16
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            312746
+        write:                           0
+        other:                           44678
+        total:                           357424
+    transactions:                        22339  (1115.68 per sec.)
+    queries:                             357424 (17850.81 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+General statistics:
+    total time:                          20.0213s
+    total number of events:              22339
+
+Latency (ms):
+         min:                                    5.89
+         avg:                                   14.33
+         max:                                   37.10
+         95th percentile:                       16.12
+         sum:                               320052.02
+
+Threads fairness:
+    events (avg/stddev):           1396.1875/27.16
+    execution time (avg/stddev):   20.0033/0.01
+
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 16
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            493920
+        write:                           0
+        other:                           70560
+        total:                           564480
+    transactions:                        35280  (1763.16 per sec.)
+    queries:                             564480 (28210.62 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+General statistics:
+    total time:                          20.0080s
+    total number of events:              35280
+
+Latency (ms):
+         min:                                    3.28
+         avg:                                    9.07
+         max:                                   23.45
+         95th percentile:                       13.22
+         sum:                               319958.02
+
+Threads fairness:
+    events (avg/stddev):           2205.0000/75.29
+    execution time (avg/stddev):   19.9974/0.00
+=========================================================
+=== [12/18] oltp_read_only be=direct threads=32 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.13s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+sysbench: preparing 16 tables × 100000 rows in 'postgres' DB ...
+Creating table 'sbtest16'...
+Inserting 100000 records into 'sbtest16'
+Creating a secondary index on 'sbtest16'...
+
+sysbench: workload=oltp_read_only threads=32 duration=20s tables=16 table_size=100000 backend=direct skip_trx=off pool_ceiling=
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 32
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            191352
+        write:                           0
+        other:                           27336
+        total:                           218688
+    transactions:                        13668  (681.68 per sec.)
+    queries:                             218688 (10906.90 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+General statistics:
+    total time:                          20.0487s
+    total number of events:              13668
+
+Latency (ms):
+         min:                                    6.26
+         avg:                                   46.87
+         max:                                  100.95
+         95th percentile:                       57.87
+         sum:                               640575.44
+
+Threads fairness:
+    events (avg/stddev):           427.1250/14.04
+    execution time (avg/stddev):   20.0180/0.02
+
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 32
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            505568
+        write:                           0
+        other:                           72224
+        total:                           577792
+    transactions:                        36112  (1803.93 per sec.)
+    queries:                             577792 (28862.92 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+General statistics:
+    total time:                          20.0170s
+    total number of events:              36112
+
+Latency (ms):
+         min:                                    3.91
+         avg:                                   17.72
+         max:                                   56.84
+         95th percentile:                       22.69
+         sum:                               640044.60
+
+Threads fairness:
+    events (avg/stddev):           1128.5000/29.29
+    execution time (avg/stddev):   20.0014/0.01
+=========================================================
+=== [13/18] oltp_update_index be=spi threads=4 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+sysbench: preparing 16 tables × 100000 rows in 'postgres' DB ...
+Creating table 'sbtest16'...
+Inserting 100000 records into 'sbtest16'
+Creating a secondary index on 'sbtest16'...
+
+sysbench: workload=oltp_update_index threads=4 duration=20s tables=16 table_size=100000 backend=spi skip_trx=off pool_ceiling=
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 4
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            0
+        write:                           24476
+        other:                           0
+        total:                           24476
+    transactions:                        24476  (1223.53 per sec.)
+    queries:                             24476  (1223.53 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+General statistics:
+    total time:                          20.0026s
+    total number of events:              24476
+
+Latency (ms):
+         min:                                    1.53
+         avg:                                    3.27
+         max:                                  244.71
+         95th percentile:                        4.10
+         sum:                                79984.59
+
+Threads fairness:
+    events (avg/stddev):           6119.0000/0.00
+    execution time (avg/stddev):   19.9961/0.00
+
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 4
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            0
+        write:                           23478
+        other:                           0
+        total:                           23478
+    transactions:                        23478  (1173.56 per sec.)
+    queries:                             23478  (1173.56 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+General statistics:
+    total time:                          20.0042s
+    total number of events:              23478
+
+Latency (ms):
+         min:                                    1.58
+         avg:                                    3.41
+         max:                                  573.41
+         95th percentile:                        4.33
+         sum:                                79992.55
+
+Threads fairness:
+    events (avg/stddev):           5869.5000/0.87
+    execution time (avg/stddev):   19.9981/0.00
+=========================================================
+=== [14/18] oltp_update_index be=spi threads=16 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+sysbench: preparing 16 tables × 100000 rows in 'postgres' DB ...
+Creating table 'sbtest16'...
+Inserting 100000 records into 'sbtest16'
+Creating a secondary index on 'sbtest16'...
+
+sysbench: workload=oltp_update_index threads=16 duration=20s tables=16 table_size=100000 backend=spi skip_trx=off pool_ceiling=
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 16
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            0
+        write:                           81405
+        other:                           0
+        total:                           81405
+    transactions:                        81405  (4066.05 per sec.)
+    queries:                             81405  (4066.05 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+General statistics:
+    total time:                          20.0190s
+    total number of events:              81405
+
+Latency (ms):
+         min:                                    2.18
+         avg:                                    3.93
+         max:                                  166.41
+         95th percentile:                        5.88
+         sum:                               320058.82
+
+Threads fairness:
+    events (avg/stddev):           5087.8125/1.59
+    execution time (avg/stddev):   20.0037/0.00
+
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 16
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+FATAL: Connection to database failed: connection to server at "127.0.0.1", port 5454 failed: server closed the connection unexpectedly
+	This probably means the server terminated abnormally
+	before or while processing the request.
+
+FATAL: `thread_init' function failed: /usr/share/sysbench/oltp_common.lua:349: connection creation failed
+FATAL: Thread initialization failed!
+sysbench: FAILED — server log tail follows ----
+2026-05-28 04:05:24.102 UTC [165648] LOG:  pg_transport slot: clean exit
+2026-05-28 04:05:24.103 UTC [165650] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 04:05:24.103 UTC [165650] LOG:  pg_transport slot: clean exit
+2026-05-28 04:05:24.104 UTC [165646] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 04:05:24.104 UTC [165646] LOG:  pg_transport slot: clean exit
+2026-05-28 04:05:24.104 UTC [165645] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 04:05:24.104 UTC [165645] LOG:  pg_transport slot: clean exit
+2026-05-28 04:05:24.105 UTC [165644] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 04:05:24.105 UTC [165644] LOG:  pg_transport slot: clean exit
+2026-05-28 04:05:24.105 UTC [165651] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 04:05:24.105 UTC [165651] LOG:  pg_transport slot: clean exit
+2026-05-28 04:05:24.105 UTC [165655] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 04:05:24.105 UTC [165649] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 04:05:24.105 UTC [165655] LOG:  pg_transport slot: clean exit
+2026-05-28 04:05:24.105 UTC [165649] LOG:  pg_transport slot: clean exit
+2026-05-28 04:05:25.631 UTC [165388] LOG:  checkpoint complete: wrote 13634 buffers (83.2%), wrote 35 SLRU buffers; 0 WAL file(s) added, 0 removed, 33 recycled; write=11.462 s, sync=0.865 s, total=12.505 s; sync files=130, longest=0.302 s, average=0.007 s; distance=533136 kB, estimate=533136 kB; lsn=0/2C7521A8, redo lsn=0/22000FF8
+2026-05-28 04:05:25.631 UTC [165388] LOG:  shutting down
+2026-05-28 04:05:25.635 UTC [165388] LOG:  checkpoint starting: shutdown immediate
+2026-05-28 04:05:26.604 UTC [165388] LOG:  checkpoint complete: wrote 6023 buffers (36.8%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 10 recycled; write=0.525 s, sync=0.400 s, total=0.973 s; sync files=62, longest=0.352 s, average=0.007 s; distance=171332 kB, estimate=496955 kB; lsn=0/2C752220, redo lsn=0/2C752220
+2026-05-28 04:05:26.629 UTC [165384] LOG:  database system is shut down
+sysbench: ---- end server log
+error: Recipe `sysbench` failed with exit code 1
+=========================================================
+=== [15/18] oltp_update_index be=spi threads=32 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+sysbench: preparing 16 tables × 100000 rows in 'postgres' DB ...
+Creating table 'sbtest16'...
+Inserting 100000 records into 'sbtest16'
+Creating a secondary index on 'sbtest16'...
+
+sysbench: workload=oltp_update_index threads=32 duration=20s tables=16 table_size=100000 backend=spi skip_trx=off pool_ceiling=
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 32
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            0
+        write:                           127295
+        other:                           0
+        total:                           127295
+    transactions:                        127295 (6355.54 per sec.)
+    queries:                             127295 (6355.54 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+General statistics:
+    total time:                          20.0272s
+    total number of events:              127295
+
+Latency (ms):
+         min:                                    2.09
+         avg:                                    5.03
+         max:                                  207.55
+         95th percentile:                        7.17
+         sum:                               639992.58
+
+Threads fairness:
+    events (avg/stddev):           3977.9688/2.49
+    execution time (avg/stddev):   19.9998/0.01
+
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 32
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+FATAL: Connection to database failed: connection to server at "127.0.0.1", port 5454 failed: server closed the connection unexpectedly
+	This probably means the server terminated abnormally
+	before or while processing the request.
+
+FATAL: `thread_init' function failed: /usr/share/sysbench/oltp_common.lua:349: connection creation failed
+FATAL: Thread initialization failed!
+sysbench: FAILED — server log tail follows ----
+2026-05-28 04:06:34.977 UTC [166091] LOG:  pg_transport slot: clean exit
+2026-05-28 04:06:34.977 UTC [166102] LOG:  pg_transport slot: clean exit
+2026-05-28 04:06:34.977 UTC [166099] LOG:  pg_transport slot: clean exit
+2026-05-28 04:06:34.978 UTC [166095] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 04:06:34.978 UTC [166095] LOG:  pg_transport slot: clean exit
+2026-05-28 04:06:34.978 UTC [166097] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 04:06:34.978 UTC [166097] LOG:  pg_transport slot: clean exit
+2026-05-28 04:06:34.978 UTC [166093] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 04:06:34.978 UTC [166093] LOG:  pg_transport slot: clean exit
+2026-05-28 04:06:34.979 UTC [166100] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 04:06:34.979 UTC [166100] LOG:  pg_transport slot: clean exit
+2026-05-28 04:06:34.979 UTC [166108] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 04:06:34.979 UTC [166108] LOG:  pg_transport slot: clean exit
+2026-05-28 04:06:34.980 UTC [166104] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 04:06:34.980 UTC [166104] LOG:  pg_transport slot: clean exit
+2026-05-28 04:06:36.263 UTC [165784] LOG:  checkpoint complete: wrote 11246 buffers (68.6%), wrote 35 SLRU buffers; 0 WAL file(s) added, 0 removed, 33 recycled; write=16.940 s, sync=0.830 s, total=17.976 s; sync files=130, longest=0.303 s, average=0.007 s; distance=533140 kB, estimate=533140 kB; lsn=0/2F974540, redo lsn=0/22002278
+2026-05-28 04:06:36.263 UTC [165784] LOG:  shutting down
+2026-05-28 04:06:36.267 UTC [165784] LOG:  checkpoint starting: shutdown immediate
+2026-05-28 04:06:37.571 UTC [165784] LOG:  checkpoint complete: wrote 8360 buffers (51.0%), wrote 4 SLRU buffers; 0 WAL file(s) added, 0 removed, 13 recycled; write=0.887 s, sync=0.366 s, total=1.309 s; sync files=69, longest=0.353 s, average=0.006 s; distance=222664 kB, estimate=502093 kB; lsn=0/2F9745B8, redo lsn=0/2F9745B8
+2026-05-28 04:06:37.596 UTC [165780] LOG:  database system is shut down
+sysbench: ---- end server log
+error: Recipe `sysbench` failed with exit code 1
+=========================================================
+=== [16/18] oltp_update_index be=direct threads=4 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+sysbench: preparing 16 tables × 100000 rows in 'postgres' DB ...
+Creating table 'sbtest16'...
+Inserting 100000 records into 'sbtest16'
+Creating a secondary index on 'sbtest16'...
+
+sysbench: workload=oltp_update_index threads=4 duration=20s tables=16 table_size=100000 backend=direct skip_trx=off pool_ceiling=
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 4
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            0
+        write:                           23381
+        other:                           0
+        total:                           23381
+    transactions:                        23381  (1168.76 per sec.)
+    queries:                             23381  (1168.76 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+General statistics:
+    total time:                          20.0032s
+    total number of events:              23381
+
+Latency (ms):
+         min:                                    1.65
+         avg:                                    3.42
+         max:                                  227.25
+         95th percentile:                        4.74
+         sum:                                79988.37
+
+Threads fairness:
+    events (avg/stddev):           5845.2500/0.43
+    execution time (avg/stddev):   19.9971/0.00
+
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 4
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            0
+        write:                           23025
+        other:                           0
+        total:                           23025
+    transactions:                        23025  (1151.00 per sec.)
+    queries:                             23025  (1151.00 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+General statistics:
+    total time:                          20.0026s
+    total number of events:              23025
+
+Latency (ms):
+         min:                                    1.72
+         avg:                                    3.47
+         max:                                  482.54
+         95th percentile:                        4.57
+         sum:                                79984.42
+
+Threads fairness:
+    events (avg/stddev):           5756.2500/0.43
+    execution time (avg/stddev):   19.9961/0.00
+=========================================================
+=== [17/18] oltp_update_index be=direct threads=16 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+sysbench: preparing 16 tables × 100000 rows in 'postgres' DB ...
+Creating table 'sbtest16'...
+Inserting 100000 records into 'sbtest16'
+Creating a secondary index on 'sbtest16'...
+
+sysbench: workload=oltp_update_index threads=16 duration=20s tables=16 table_size=100000 backend=direct skip_trx=off pool_ceiling=
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 16
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            0
+        write:                           81254
+        other:                           0
+        total:                           81254
+    transactions:                        81254  (4058.87 per sec.)
+    queries:                             81254  (4058.87 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+General statistics:
+    total time:                          20.0174s
+    total number of events:              81254
+
+Latency (ms):
+         min:                                    2.29
+         avg:                                    3.94
+         max:                                  164.73
+         95th percentile:                        5.99
+         sum:                               319993.03
+
+Threads fairness:
+    events (avg/stddev):           5078.3750/1.17
+    execution time (avg/stddev):   19.9996/0.00
+
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 16
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            0
+        write:                           7677
+        other:                           0
+        total:                           7677
+    transactions:                        7677   (382.42 per sec.)
+    queries:                             7677   (382.42 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+General statistics:
+    total time:                          20.0731s
+    total number of events:              7677
+
+Latency (ms):
+         min:                                    2.36
+         avg:                                   41.77
+         max:                                12551.30
+         95th percentile:                       50.11
+         sum:                               320645.87
+
+Threads fairness:
+    events (avg/stddev):           479.8125/0.39
+    execution time (avg/stddev):   20.0404/0.02
+=========================================================
+=== [18/18] oltp_update_index be=direct threads=32 ===
+=========================================================
+[32m[1m       Using[0m[39m [37m[1mPgConfig("pg18")[0m[39m and `pg_config` from [36m/home/azureuser/.pgrx/18.4/pgrx-install/bin/pg_config[39m
+    Finished `release` profile [optimized] target(s) in 0.12s
+[32m[1m  Discovered[0m[39m [36m[1m1[0m[39m SQL entities: [36m[1m0[0m[39m schemas ([36m[1m0[0m[39m unique), [36m[1m1[0m[39m functions, [36m[1m0[0m[39m types, [36m[1m0[0m[39m enums, [36m[1m0[0m[39m sqls, [36m[1m0[0m[39m ords, [36m[1m0[0m[39m hashes, [36m[1m0[0m[39m aggregates, [36m[1m0[0m[39m triggers
+[32m[1m     Writing[0m[39m SQL entities to /home/azureuser/.pgrx/18.4/pgrx-install/share/postgresql/extension/pg_transport--0.0.1.sql
+sysbench: preparing 16 tables × 100000 rows in 'postgres' DB ...
+Creating table 'sbtest16'...
+Inserting 100000 records into 'sbtest16'
+Creating a secondary index on 'sbtest16'...
+
+sysbench: workload=oltp_update_index threads=32 duration=20s tables=16 table_size=100000 backend=direct skip_trx=off pool_ceiling=
+
+==================================================
+  vanilla PG (127.0.0.1:54329)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 32
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+Threads started!
+
+SQL statistics:
+    queries performed:
+        read:                            0
+        write:                           123726
+        other:                           0
+        total:                           123726
+    transactions:                        123726 (6178.30 per sec.)
+    queries:                             123726 (6178.30 per sec.)
+    ignored errors:                      0      (0.00 per sec.)
+    reconnects:                          0      (0.00 per sec.)
+
+General statistics:
+    total time:                          20.0241s
+    total number of events:              123726
+
+Latency (ms):
+         min:                                    2.19
+         avg:                                    5.17
+         max:                                  267.72
+         95th percentile:                        7.43
+         sum:                               640014.68
+
+Threads fairness:
+    events (avg/stddev):           3866.4375/1.89
+    execution time (avg/stddev):   20.0005/0.01
+
+
+==================================================
+  pg_transport (127.0.0.1:5454)
+==================================================
+sysbench 1.0.20 (using system LuaJIT 2.1.0-beta3)
+
+Running the test with following options:
+Number of threads: 32
+Initializing random number generator from current time
+
+
+Initializing worker threads...
+
+FATAL: Connection to database failed: connection to server at "127.0.0.1", port 5454 failed: server closed the connection unexpectedly
+	This probably means the server terminated abnormally
+	before or while processing the request.
+
+FATAL: `thread_init' function failed: /usr/share/sysbench/oltp_common.lua:349: connection creation failed
+FATAL: Thread initialization failed!
+sysbench: FAILED — server log tail follows ----
+2026-05-28 04:10:38.447 UTC [167307] LOG:  pg_transport slot: clean exit
+2026-05-28 04:10:38.447 UTC [167319] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 04:10:38.447 UTC [167319] LOG:  pg_transport slot: clean exit
+2026-05-28 04:10:38.447 UTC [167311] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 04:10:38.447 UTC [167317] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 04:10:38.447 UTC [167311] LOG:  pg_transport slot: clean exit
+2026-05-28 04:10:38.447 UTC [167317] LOG:  pg_transport slot: clean exit
+2026-05-28 04:10:38.448 UTC [167306] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 04:10:38.448 UTC [167306] LOG:  pg_transport slot: clean exit
+2026-05-28 04:10:38.449 UTC [167332] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 04:10:38.449 UTC [167332] LOG:  pg_transport slot: clean exit
+2026-05-28 04:10:38.449 UTC [167339] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 04:10:38.449 UTC [167339] LOG:  pg_transport slot: clean exit
+2026-05-28 04:10:38.450 UTC [167308] LOG:  pg_transport slot: FE closed UDS, exiting
+2026-05-28 04:10:38.450 UTC [167308] LOG:  pg_transport slot: clean exit
+2026-05-28 04:10:39.998 UTC [167007] LOG:  checkpoint complete: wrote 11327 buffers (69.1%), wrote 35 SLRU buffers; 0 WAL file(s) added, 0 removed, 33 recycled; write=16.556 s, sync=1.126 s, total=17.873 s; sync files=130, longest=0.361 s, average=0.009 s; distance=533141 kB, estimate=533141 kB; lsn=0/30049598, redo lsn=0/220024F0
+2026-05-28 04:10:39.998 UTC [167007] LOG:  shutting down
+2026-05-28 04:10:40.001 UTC [167007] LOG:  checkpoint starting: shutdown immediate
+2026-05-28 04:10:41.267 UTC [167007] LOG:  checkpoint complete: wrote 8544 buffers (52.1%), wrote 4 SLRU buffers; 0 WAL file(s) added, 0 removed, 14 recycled; write=0.913 s, sync=0.298 s, total=1.269 s; sync files=70, longest=0.289 s, average=0.005 s; distance=229660 kB, estimate=502793 kB; lsn=0/30049610, redo lsn=0/30049610
+2026-05-28 04:10:41.293 UTC [167003] LOG:  database system is shut down
+sysbench: ---- end server log
+error: Recipe `sysbench` failed with exit code 1
